@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.5
+pytest>=8.0
+fastapi>=0.116
+uvicorn>=0.35
