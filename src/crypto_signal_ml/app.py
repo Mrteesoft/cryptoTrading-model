@@ -647,10 +647,17 @@ class WalkForwardValidationApp(TrainingApp):
     ) -> pd.DataFrame:
         """Average feature importance across all walk-forward folds."""
 
-        if not feature_importance_frames:
+        valid_feature_importance_frames = [
+            feature_importance_df
+            for feature_importance_df in feature_importance_frames
+            if not feature_importance_df.empty
+            and {"feature", "importance"}.issubset(feature_importance_df.columns)
+        ]
+
+        if not valid_feature_importance_frames:
             return pd.DataFrame(columns=["feature", "importance"])
 
-        combined_feature_importance_df = pd.concat(feature_importance_frames, ignore_index=True)
+        combined_feature_importance_df = pd.concat(valid_feature_importance_frames, ignore_index=True)
         return (
             combined_feature_importance_df.groupby("feature", as_index=False)
             .agg(importance=("importance", "mean"))
