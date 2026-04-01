@@ -13,23 +13,63 @@ FEATURE_COLUMNS = [
     "return_1",
     "return_3",
     "return_5",
+    "return_12",
+    "return_24",
     "momentum_10",
     "candle_body_pct",
     "range_pct",
     "volume_change_1",
+    "volume_change_5",
+    "volume_vs_sma_20",
+    "volume_vs_sma_50",
+    "volume_zscore_20",
+    "volume_trend_5_20",
     "volatility_5",
+    "volatility_20",
+    "atr_pct_14",
     "close_vs_sma_5",
     "close_vs_sma_10",
+    "close_vs_sma_20",
+    "close_vs_sma_50",
     "close_vs_ema_5",
     "rsi_14",
+    "close_vs_ema_20",
+    "close_vs_ema_50",
+    "trend_acceleration_5_20",
+    "trend_acceleration_10_50",
+    "positive_close_ratio_10",
     "market_return_1",
     "relative_strength_1",
     "market_return_5",
     "relative_strength_5",
+    "market_return_24",
+    "relative_strength_24",
+    "market_breadth_1",
+    "market_breadth_5",
+    "market_breadth_24",
+    "market_dispersion_1",
+    "market_dispersion_5",
+    "relative_strength_rank_1",
+    "relative_strength_rank_5",
+    "relative_strength_rank_24",
+    "market_volatility_5",
+    "market_trend_strength_20",
+    "benchmark_btc_return_1",
+    "benchmark_btc_return_5",
+    "benchmark_btc_return_24",
+    "asset_vs_btc_return_1",
+    "asset_vs_btc_return_5",
+    "asset_vs_btc_return_24",
     "breakout_up_20",
     "breakout_down_20",
     "range_position_20",
+    "drawdown_from_high_20",
+    "rebound_from_low_20",
     "volatility_compression_5_20",
+    "hour_of_day_sin",
+    "hour_of_day_cos",
+    "day_of_week_sin",
+    "day_of_week_cos",
     "cmc_context_available",
     "cmc_rank_score",
     "cmc_market_cap_log",
@@ -152,6 +192,59 @@ class BaseFeatureEngineer(ABC):
         safe_denominator = denominator.replace(0, np.nan)
         return numerator / safe_denominator
 
+    @staticmethod
+    def _rolling_zscore(series: pd.Series, window: int) -> pd.Series:
+        """Calculate a rolling z-score for anomaly-style features."""
+
+        rolling_mean = series.rolling(window=window).mean()
+        rolling_std = series.rolling(window=window).std().replace(0, np.nan)
+        return (series - rolling_mean) / rolling_std
+
+    @staticmethod
+    def _rolling_positive_ratio(series: pd.Series, window: int) -> pd.Series:
+        """Measure how often returns have been positive inside a rolling window."""
+
+        return series.gt(0).rolling(window=window).mean()
+
+    @staticmethod
+    def _rank_percentile(series: pd.Series) -> pd.Series:
+        """Turn a cross-sectional value into a 0..1 percentile rank."""
+
+        return series.rank(method="average", pct=True).fillna(0.5)
+
+    def _broadcast_product_feature(
+        self,
+        feature_df: pd.DataFrame,
+        product_id: str,
+        source_column: str,
+        default_value: float = 0.0,
+    ) -> pd.Series:
+        """
+        Broadcast one benchmark asset feature across all rows at each timestamp.
+
+        This lets every altcoin row see what the market leader is doing at the
+        same market moment without leaking future information.
+        """
+
+        if (
+            "timestamp" not in feature_df.columns
+            or "product_id" not in feature_df.columns
+            or source_column not in feature_df.columns
+        ):
+            return pd.Series(default_value, index=feature_df.index, dtype=float)
+
+        benchmark_rows = feature_df.loc[
+            feature_df["product_id"].astype(str).str.upper() == str(product_id).upper(),
+            ["timestamp", source_column],
+        ].drop_duplicates(subset=["timestamp"], keep="last")
+
+        if benchmark_rows.empty:
+            return pd.Series(default_value, index=feature_df.index, dtype=float)
+
+        benchmark_series = benchmark_rows.set_index("timestamp")[source_column]
+        broadcast_series = pd.to_numeric(feature_df["timestamp"].map(benchmark_series), errors="coerce")
+        return broadcast_series.fillna(default_value)
+
     def _add_return_features(self, feature_df: pd.DataFrame) -> None:
         """Add return and momentum features."""
 
@@ -169,6 +262,16 @@ class BaseFeatureEngineer(ABC):
             feature_df,
             "close",
             lambda close_series: close_series.pct_change(5),
+        )
+        feature_df["return_12"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.pct_change(12),
+        )
+        feature_df["return_24"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.pct_change(24),
         )
         feature_df["momentum_10"] = self._transform_by_asset(
             feature_df,
@@ -190,6 +293,43 @@ class BaseFeatureEngineer(ABC):
             "volume",
             lambda volume_series: volume_series.pct_change(1),
         )
+        feature_df["volume_change_5"] = self._transform_by_asset(
+            feature_df,
+            "volume",
+            lambda volume_series: volume_series.pct_change(5),
+        )
+        feature_df["volume_sma_5"] = self._transform_by_asset(
+            feature_df,
+            "volume",
+            lambda volume_series: volume_series.rolling(window=5).mean(),
+        )
+        feature_df["volume_sma_20"] = self._transform_by_asset(
+            feature_df,
+            "volume",
+            lambda volume_series: volume_series.rolling(window=20).mean(),
+        )
+        feature_df["volume_sma_50"] = self._transform_by_asset(
+            feature_df,
+            "volume",
+            lambda volume_series: volume_series.rolling(window=50).mean(),
+        )
+        feature_df["volume_vs_sma_20"] = self._safe_ratio(
+            feature_df["volume"],
+            feature_df["volume_sma_20"],
+        ) - 1
+        feature_df["volume_vs_sma_50"] = self._safe_ratio(
+            feature_df["volume"],
+            feature_df["volume_sma_50"],
+        ) - 1
+        feature_df["volume_zscore_20"] = self._transform_by_asset(
+            feature_df,
+            "volume",
+            lambda volume_series: self._rolling_zscore(volume_series, window=20),
+        )
+        feature_df["volume_trend_5_20"] = self._safe_ratio(
+            feature_df["volume_sma_5"],
+            feature_df["volume_sma_20"],
+        ) - 1
 
     def _add_trend_features(self, feature_df: pd.DataFrame) -> None:
         """Add moving-average and volatility features."""
@@ -198,6 +338,11 @@ class BaseFeatureEngineer(ABC):
             feature_df,
             "return_1",
             lambda return_series: return_series.rolling(window=5).std(),
+        )
+        feature_df["volatility_20"] = self._transform_by_asset(
+            feature_df,
+            "return_1",
+            lambda return_series: return_series.rolling(window=20).std(),
         )
         feature_df["sma_5"] = self._transform_by_asset(
             feature_df,
@@ -209,14 +354,49 @@ class BaseFeatureEngineer(ABC):
             "close",
             lambda close_series: close_series.rolling(window=10).mean(),
         )
+        feature_df["sma_20"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.rolling(window=20).mean(),
+        )
+        feature_df["sma_50"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.rolling(window=50).mean(),
+        )
         feature_df["ema_5"] = self._transform_by_asset(
             feature_df,
             "close",
             lambda close_series: close_series.ewm(span=5, adjust=False).mean(),
         )
+        feature_df["ema_20"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.ewm(span=20, adjust=False).mean(),
+        )
+        feature_df["ema_50"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.ewm(span=50, adjust=False).mean(),
+        )
         feature_df["close_vs_sma_5"] = (feature_df["close"] / feature_df["sma_5"]) - 1
         feature_df["close_vs_sma_10"] = (feature_df["close"] / feature_df["sma_10"]) - 1
+        feature_df["close_vs_sma_20"] = (feature_df["close"] / feature_df["sma_20"]) - 1
+        feature_df["close_vs_sma_50"] = (feature_df["close"] / feature_df["sma_50"]) - 1
         feature_df["close_vs_ema_5"] = (feature_df["close"] / feature_df["ema_5"]) - 1
+        feature_df["close_vs_ema_20"] = (feature_df["close"] / feature_df["ema_20"]) - 1
+        feature_df["close_vs_ema_50"] = (feature_df["close"] / feature_df["ema_50"]) - 1
+        feature_df["trend_acceleration_5_20"] = (
+            feature_df["close_vs_ema_5"] - feature_df["close_vs_ema_20"]
+        )
+        feature_df["trend_acceleration_10_50"] = (
+            feature_df["close_vs_sma_10"] - feature_df["close_vs_ema_50"]
+        )
+        feature_df["positive_close_ratio_10"] = self._transform_by_asset(
+            feature_df,
+            "return_1",
+            lambda return_series: self._rolling_positive_ratio(return_series, window=10),
+        )
 
     def _add_momentum_features(self, feature_df: pd.DataFrame) -> None:
         """Add momentum indicators such as RSI."""
@@ -225,6 +405,33 @@ class BaseFeatureEngineer(ABC):
             feature_df,
             "close",
             lambda close_series: self.calculate_rsi(close_series, period=14),
+        )
+
+    def _add_risk_features(self, feature_df: pd.DataFrame) -> None:
+        """Add risk and range features such as ATR."""
+
+        feature_df["prev_close"] = self._transform_by_asset(
+            feature_df,
+            "close",
+            lambda close_series: close_series.shift(1),
+        )
+        true_range_components = pd.concat(
+            [
+                feature_df["high"] - feature_df["low"],
+                (feature_df["high"] - feature_df["prev_close"]).abs(),
+                (feature_df["low"] - feature_df["prev_close"]).abs(),
+            ],
+            axis=1,
+        )
+        feature_df["true_range"] = true_range_components.max(axis=1)
+        feature_df["atr_14"] = self._transform_by_asset(
+            feature_df,
+            "true_range",
+            lambda true_range_series: true_range_series.rolling(window=14).mean(),
+        )
+        feature_df["atr_pct_14"] = self._safe_ratio(
+            feature_df["atr_14"],
+            feature_df["close"],
         )
 
     def _add_market_relative_features(self, feature_df: pd.DataFrame) -> None:
@@ -239,14 +446,86 @@ class BaseFeatureEngineer(ABC):
         if "timestamp" in feature_df.columns:
             feature_df["market_return_1"] = feature_df.groupby("timestamp")["return_1"].transform("mean")
             feature_df["market_return_5"] = feature_df.groupby("timestamp")["return_5"].transform("mean")
+            feature_df["market_return_24"] = feature_df.groupby("timestamp")["return_24"].transform("mean")
+            feature_df["market_breadth_1"] = feature_df.groupby("timestamp")["return_1"].transform(
+                lambda return_series: (return_series > 0).mean()
+            )
+            feature_df["market_breadth_5"] = feature_df.groupby("timestamp")["return_5"].transform(
+                lambda return_series: (return_series > 0).mean()
+            )
+            feature_df["market_breadth_24"] = feature_df.groupby("timestamp")["return_24"].transform(
+                lambda return_series: (return_series > 0).mean()
+            )
+            feature_df["market_dispersion_1"] = feature_df.groupby("timestamp")["return_1"].transform("std")
+            feature_df["market_dispersion_5"] = feature_df.groupby("timestamp")["return_5"].transform("std")
+            feature_df["relative_strength_rank_1"] = feature_df.groupby("timestamp")["return_1"].transform(
+                self._rank_percentile
+            )
+            feature_df["relative_strength_rank_5"] = feature_df.groupby("timestamp")["return_5"].transform(
+                self._rank_percentile
+            )
+            feature_df["relative_strength_rank_24"] = feature_df.groupby("timestamp")["return_24"].transform(
+                self._rank_percentile
+            )
+            feature_df["market_volatility_5"] = feature_df.groupby("timestamp")["volatility_5"].transform("mean")
+            feature_df["market_trend_strength_20"] = feature_df.groupby("timestamp")["close_vs_ema_20"].transform(
+                "mean"
+            )
         else:
             feature_df["market_return_1"] = feature_df["return_1"]
             feature_df["market_return_5"] = feature_df["return_5"]
+            feature_df["market_return_24"] = feature_df["return_24"]
+            feature_df["market_breadth_1"] = 0.5
+            feature_df["market_breadth_5"] = 0.5
+            feature_df["market_breadth_24"] = 0.5
+            feature_df["market_dispersion_1"] = 0.0
+            feature_df["market_dispersion_5"] = 0.0
+            feature_df["relative_strength_rank_1"] = 0.5
+            feature_df["relative_strength_rank_5"] = 0.5
+            feature_df["relative_strength_rank_24"] = 0.5
+            feature_df["market_volatility_5"] = feature_df["volatility_5"]
+            feature_df["market_trend_strength_20"] = feature_df["close_vs_ema_20"]
 
         feature_df["market_return_1"] = feature_df["market_return_1"].fillna(0.0)
         feature_df["market_return_5"] = feature_df["market_return_5"].fillna(0.0)
+        feature_df["market_return_24"] = feature_df["market_return_24"].fillna(0.0)
+        feature_df["market_breadth_1"] = feature_df["market_breadth_1"].fillna(0.5)
+        feature_df["market_breadth_5"] = feature_df["market_breadth_5"].fillna(0.5)
+        feature_df["market_breadth_24"] = feature_df["market_breadth_24"].fillna(0.5)
+        feature_df["market_dispersion_1"] = feature_df["market_dispersion_1"].fillna(0.0)
+        feature_df["market_dispersion_5"] = feature_df["market_dispersion_5"].fillna(0.0)
+        feature_df["relative_strength_rank_1"] = feature_df["relative_strength_rank_1"].fillna(0.5)
+        feature_df["relative_strength_rank_5"] = feature_df["relative_strength_rank_5"].fillna(0.5)
+        feature_df["relative_strength_rank_24"] = feature_df["relative_strength_rank_24"].fillna(0.5)
+        feature_df["market_volatility_5"] = feature_df["market_volatility_5"].fillna(0.0)
+        feature_df["market_trend_strength_20"] = feature_df["market_trend_strength_20"].fillna(0.0)
         feature_df["relative_strength_1"] = feature_df["return_1"] - feature_df["market_return_1"]
         feature_df["relative_strength_5"] = feature_df["return_5"] - feature_df["market_return_5"]
+        feature_df["relative_strength_24"] = feature_df["return_24"] - feature_df["market_return_24"]
+
+    def _add_benchmark_context_features(self, feature_df: pd.DataFrame) -> None:
+        """Add BTC-relative features so altcoin moves are grounded in market leadership."""
+
+        feature_df["benchmark_btc_return_1"] = self._broadcast_product_feature(
+            feature_df,
+            product_id="BTC-USD",
+            source_column="return_1",
+        )
+        feature_df["benchmark_btc_return_5"] = self._broadcast_product_feature(
+            feature_df,
+            product_id="BTC-USD",
+            source_column="return_5",
+        )
+        feature_df["benchmark_btc_return_24"] = self._broadcast_product_feature(
+            feature_df,
+            product_id="BTC-USD",
+            source_column="return_24",
+        )
+        feature_df["asset_vs_btc_return_1"] = feature_df["return_1"].fillna(0.0) - feature_df["benchmark_btc_return_1"]
+        feature_df["asset_vs_btc_return_5"] = feature_df["return_5"].fillna(0.0) - feature_df["benchmark_btc_return_5"]
+        feature_df["asset_vs_btc_return_24"] = (
+            feature_df["return_24"].fillna(0.0) - feature_df["benchmark_btc_return_24"]
+        )
 
     def _add_chart_pattern_features(self, feature_df: pd.DataFrame) -> None:
         """
@@ -297,10 +576,40 @@ class BaseFeatureEngineer(ABC):
             rolling_low_20_prev,
         ) - 1
         feature_df["range_position_20"] = (feature_df["close"] - rolling_low_20) / recent_range_width
+        feature_df["drawdown_from_high_20"] = self._safe_ratio(
+            feature_df["close"],
+            rolling_high_20,
+        ) - 1
+        feature_df["rebound_from_low_20"] = self._safe_ratio(
+            feature_df["close"],
+            rolling_low_20,
+        ) - 1
         feature_df["volatility_compression_5_20"] = self._safe_ratio(
             feature_df["volatility_5"],
             volatility_20,
         ) - 1
+
+    def _add_time_context_features(self, feature_df: pd.DataFrame) -> None:
+        """Add cyclical time features so the model can learn session behaviour."""
+
+        if "timestamp" not in feature_df.columns:
+            feature_df["hour_of_day_sin"] = 0.0
+            feature_df["hour_of_day_cos"] = 1.0
+            feature_df["day_of_week_sin"] = 0.0
+            feature_df["day_of_week_cos"] = 1.0
+            return
+
+        timestamp_series = pd.to_datetime(feature_df["timestamp"], errors="coerce", utc=True)
+        hour_fraction = (
+            timestamp_series.dt.hour.fillna(0).astype(float)
+            + timestamp_series.dt.minute.fillna(0).astype(float) / 60.0
+        ) / 24.0
+        day_fraction = timestamp_series.dt.dayofweek.fillna(0).astype(float) / 7.0
+
+        feature_df["hour_of_day_sin"] = np.sin(2 * np.pi * hour_fraction)
+        feature_df["hour_of_day_cos"] = np.cos(2 * np.pi * hour_fraction)
+        feature_df["day_of_week_sin"] = np.sin(2 * np.pi * day_fraction)
+        feature_df["day_of_week_cos"] = np.cos(2 * np.pi * day_fraction)
 
     def _add_coinmarketcap_context_features(self, feature_df: pd.DataFrame) -> None:
         """
@@ -372,6 +681,7 @@ class TechnicalFeatureEngineer(BaseFeatureEngineer):
         - volatility describes instability
         - RSI describes momentum
         - candle range/body describe the current candle shape
+        - market/benchmark context describes regime and leadership
         """
 
         self._add_return_features(feature_df)
@@ -379,8 +689,11 @@ class TechnicalFeatureEngineer(BaseFeatureEngineer):
         self._add_volume_features(feature_df)
         self._add_trend_features(feature_df)
         self._add_momentum_features(feature_df)
+        self._add_risk_features(feature_df)
         self._add_market_relative_features(feature_df)
+        self._add_benchmark_context_features(feature_df)
         self._add_chart_pattern_features(feature_df)
+        self._add_time_context_features(feature_df)
         self._add_coinmarketcap_context_features(feature_df)
 
 

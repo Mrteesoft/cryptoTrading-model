@@ -2,7 +2,10 @@
 
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, List, Type
 
 import pandas as pd
@@ -11,7 +14,7 @@ from .backtesting import BaseSignalBacktester, EqualWeightSignalBacktester
 from .config import MODELS_DIR, OUTPUTS_DIR, PROCESSED_DATA_DIR, TrainingConfig, config_to_dict, ensure_project_directories
 from .data import CoinbaseExchangePriceDataLoader, CoinMarketCapContextEnricher
 from .frontend import build_frontend_signal_snapshot
-from .labels import FutureReturnSignalLabeler
+from .labels import create_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .signals import (
@@ -72,13 +75,156 @@ class BaseSignalApp:
     def save_dataframe(self, dataframe: pd.DataFrame, file_path: Path) -> None:
         """Save a DataFrame to CSV."""
 
-        dataframe.to_csv(file_path, index=False)
+        self._write_file_atomically(
+            file_path=file_path,
+            writer=lambda temp_path: dataframe.to_csv(temp_path, index=False),
+        )
 
     def save_json(self, payload: Dict[str, Any], file_path: Path) -> None:
         """Save a dictionary to JSON with readable indentation."""
 
-        with file_path.open("w", encoding="utf-8") as output_file:
-            json.dump(payload, output_file, indent=2)
+        def write_json(temp_path: Path) -> None:
+            with temp_path.open("w", encoding="utf-8") as output_file:
+                json.dump(payload, output_file, indent=2)
+
+        self._write_file_atomically(file_path=file_path, writer=write_json)
+
+    def _write_file_atomically(
+        self,
+        file_path: Path,
+        writer,
+    ) -> None:
+        """Write one output file through a temp file before replacing the target."""
+
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file_descriptor, temp_file_name = tempfile.mkstemp(
+            dir=file_path.parent,
+            prefix=f".{file_path.stem}-",
+            suffix=".tmp",
+        )
+        os.close(temp_file_descriptor)
+        temp_path = Path(temp_file_name)
+
+        try:
+            writer(temp_path)
+            temp_path.replace(file_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    @staticmethod
+    def model_metadata_path(model_path: Path) -> Path:
+        """Return the JSON sidecar path for a saved model artifact."""
+
+        return model_path.with_suffix(".metadata.json")
+
+    @staticmethod
+    def _file_timestamp_to_isoformat(file_path: Path) -> str | None:
+        """Return the file's modified timestamp as a UTC ISO string when it exists."""
+
+        if not file_path.exists():
+            return None
+
+        return datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+    @staticmethod
+    def _resolve_walkforward_purge_gap(config: TrainingConfig) -> int:
+        """Choose the gap that purges train rows nearest the validation window."""
+
+        if config.walkforward_purge_gap_timestamps is not None:
+            return int(config.walkforward_purge_gap_timestamps)
+
+        return int(config.prediction_horizon)
+
+    def _ensure_market_data_available(self) -> None:
+        """
+        Bootstrap the raw market CSV when a training-style workflow starts empty.
+
+        This lets the CLI recover from a missing `marketPrices.csv` by
+        refreshing market data once and recording that bootstrap step.
+        """
+
+        if self.config.data_file.exists():
+            return
+
+        print(
+            f"Raw market data not found at {self.config.data_file}. "
+            "Refreshing market data before continuing."
+        )
+        refresh_result = MarketDataRefreshApp(config=self.config).run()
+        self.save_json(
+            {
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "trigger": "automatic_training_bootstrap",
+                "refresh": refresh_result,
+            },
+            OUTPUTS_DIR / "marketDataRefreshOnDemand.json",
+        )
+
+        if not self.config.data_file.exists():
+            raise FileNotFoundError(
+                f"Expected market data after refresh, but the file is still missing: {self.config.data_file}"
+            )
+
+    def save_model_artifact_outputs(
+        self,
+        model: BaseSignalModel,
+        metrics: Dict[str, Any],
+        prediction_df: pd.DataFrame,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        dataset_path: Path,
+        model_path: Path,
+        metrics_path: Path,
+        predictions_path: Path,
+        feature_importance_path: Path,
+    ) -> Dict[str, str]:
+        """Persist the model bundle plus a JSON sidecar for operations metadata."""
+
+        model.save(model_path)
+        self.save_json(metrics, metrics_path)
+        self.save_dataframe(prediction_df, predictions_path)
+        self.save_dataframe(model.get_feature_importance_frame(), feature_importance_path)
+
+        metadata_path = self.model_metadata_path(model_path)
+        metadata_payload = {
+            "artifactCreatedAt": datetime.now(timezone.utc).isoformat(),
+            "artifactPath": str(model_path),
+            "modelType": model.model_type,
+            "featureCount": len(model.feature_columns),
+            "featurePreview": list(model.feature_columns[:10]),
+            "labeling": {
+                "strategy": model.config.labeling_strategy,
+                "predictionHorizon": int(model.config.prediction_horizon),
+                "buyThreshold": float(model.config.buy_threshold),
+                "sellThreshold": float(model.config.sell_threshold),
+                "walkForwardPurgeGapTimestamps": int(self._resolve_walkforward_purge_gap(model.config)),
+            },
+            "datasetPath": str(dataset_path),
+            "trainingDataPath": str(model.config.data_file),
+            "trainingDataLastModified": self._file_timestamp_to_isoformat(Path(model.config.data_file)),
+            "trainRows": int(len(train_df)),
+            "testRows": int(len(test_df)),
+            "metrics": {
+                "accuracy": float(metrics["accuracy"]),
+                "balancedAccuracy": float(metrics["balanced_accuracy"]),
+            },
+            "artifacts": {
+                "metricsPath": str(metrics_path),
+                "predictionsPath": str(predictions_path),
+                "featureImportancePath": str(feature_importance_path),
+            },
+            "config": config_to_dict(model.config),
+        }
+        self.save_json(metadata_payload, metadata_path)
+
+        return {
+            "modelPath": str(model_path),
+            "metricsPath": str(metrics_path),
+            "predictionsPath": str(predictions_path),
+            "featureImportancePath": str(feature_importance_path),
+            "metadataPath": str(metadata_path),
+        }
 
     def build_market_data_loader(self) -> CoinbaseExchangePriceDataLoader:
         """
@@ -171,6 +317,7 @@ class TrainingApp(BaseSignalApp):
         Build and save the labeled dataset used for training.
         """
 
+        self._ensure_market_data_available()
         dataset, feature_columns = self.dataset_builder.build_labeled_dataset()
         self.save_dataframe(dataset, self.dataset_path)
         return dataset, feature_columns
@@ -254,19 +401,23 @@ class TrainingApp(BaseSignalApp):
         metrics = training_result["metrics"]
         train_df = training_result["train_df"]
         test_df = training_result["test_df"]
-
-        self.model.save(self.model_path)
-        self.save_json(metrics, OUTPUTS_DIR / "trainingMetrics.json")
-        self.save_dataframe(prediction_df, OUTPUTS_DIR / "testPredictions.csv")
-        self.save_dataframe(self.model.get_feature_importance_frame(), OUTPUTS_DIR / "featureImportance.csv")
+        output_paths = self.save_model_artifact_outputs(
+            model=self.model,
+            metrics=metrics,
+            prediction_df=prediction_df,
+            train_df=train_df,
+            test_df=test_df,
+            dataset_path=self.dataset_path,
+            model_path=self.model_path,
+            metrics_path=OUTPUTS_DIR / "trainingMetrics.json",
+            predictions_path=OUTPUTS_DIR / "testPredictions.csv",
+            feature_importance_path=OUTPUTS_DIR / "featureImportance.csv",
+        )
 
         return {
             "modelType": self.model.model_type,
             "datasetPath": str(self.dataset_path),
-            "modelPath": str(self.model_path),
-            "metricsPath": str(OUTPUTS_DIR / "trainingMetrics.json"),
-            "predictionsPath": str(OUTPUTS_DIR / "testPredictions.csv"),
-            "featureImportancePath": str(OUTPUTS_DIR / "featureImportance.csv"),
+            **output_paths,
             "trainRows": len(train_df),
             "testRows": len(test_df),
             "accuracy": metrics["accuracy"],
@@ -344,6 +495,7 @@ class WalkForwardValidationApp(TrainingApp):
             min_train_size=validation_config.walkforward_min_train_size,
             test_size=validation_config.walkforward_test_size,
             step_size=validation_config.walkforward_step_size,
+            purge_gap_timestamps=self._resolve_walkforward_purge_gap(validation_config),
         )
 
         fold_metric_rows = []
@@ -379,9 +531,16 @@ class WalkForwardValidationApp(TrainingApp):
                     "trainEndTimestamp": str(fold_split["train_end_timestamp"]),
                     "testStartTimestamp": str(fold_split["test_start_timestamp"]),
                     "testEndTimestamp": str(fold_split["test_end_timestamp"]),
+                    "purgeGapTimestamps": int(fold_split["purgeGapTimestamps"]),
+                    "purgedTimestampCount": int(fold_split["purgedTimestampCount"]),
                     "accuracy": metrics["accuracy"],
                     "balancedAccuracy": metrics["balanced_accuracy"],
                 }
+            )
+            self._save_walk_forward_progress(
+                fold_metric_rows=fold_metric_rows,
+                prediction_frames=prediction_frames,
+                feature_importance_frames=feature_importance_frames,
             )
 
         walk_forward_predictions_df = pd.concat(prediction_frames, ignore_index=True)
@@ -411,6 +570,7 @@ class WalkForwardValidationApp(TrainingApp):
                     "minTrainSize": float(validation_config.walkforward_min_train_size),
                     "testSize": float(validation_config.walkforward_test_size),
                     "stepSize": float(validation_config.walkforward_step_size),
+                    "purgeGapTimestamps": int(self._resolve_walkforward_purge_gap(validation_config)),
                 },
                 "config": config_to_dict(validation_config),
             }
@@ -498,6 +658,44 @@ class WalkForwardValidationApp(TrainingApp):
             .reset_index(drop=True)
         )
 
+    def _save_walk_forward_progress(
+        self,
+        fold_metric_rows: List[Dict[str, Any]],
+        prediction_frames: List[pd.DataFrame],
+        feature_importance_frames: List[pd.DataFrame],
+    ) -> None:
+        """Persist partial walk-forward results while the folds are still running."""
+
+        if not fold_metric_rows:
+            return
+
+        self.save_dataframe(
+            pd.DataFrame(fold_metric_rows),
+            OUTPUTS_DIR / "walkForwardFoldMetrics.partial.csv",
+        )
+
+        if prediction_frames:
+            partial_predictions_df = pd.concat(prediction_frames, ignore_index=True)
+            partial_predictions_df = partial_predictions_df.sort_values(
+                by=["timestamp", "product_id"] if "product_id" in partial_predictions_df.columns else ["timestamp"]
+            ).reset_index(drop=True)
+            self.save_dataframe(
+                partial_predictions_df,
+                OUTPUTS_DIR / "walkForwardPredictions.partial.csv",
+            )
+
+        self.save_dataframe(
+            self._average_feature_importance(feature_importance_frames),
+            OUTPUTS_DIR / "walkForwardFeatureImportance.partial.csv",
+        )
+        self.save_json(
+            {
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "completedFolds": int(len(fold_metric_rows)),
+            },
+            OUTPUTS_DIR / "walkForwardProgress.json",
+        )
+
 
 class SignalParameterTuningApp(WalkForwardValidationApp):
     """Tune label thresholds and backtest confidence with walk-forward scoring."""
@@ -515,6 +713,7 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
         generated out-of-sample predictions.
         """
 
+        self._ensure_market_data_available()
         feature_df = self.dataset_builder.build_feature_table()
         feature_columns = list(self.dataset_builder.feature_columns)
 
@@ -523,50 +722,59 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
 
         for prediction_horizon in self.config.tuning_prediction_horizon_candidates:
             for buy_threshold in self.config.tuning_buy_threshold_candidates:
-                candidate_config = replace(
-                    self.config,
-                    prediction_horizon=prediction_horizon,
-                    buy_threshold=buy_threshold,
-                    sell_threshold=-buy_threshold,
-                )
-                tuned_dataset = self._build_tuned_dataset(
-                    feature_df=feature_df,
-                    feature_columns=feature_columns,
-                    tuning_config=candidate_config,
-                )
-                walk_forward_result = self._run_walk_forward_validation(
-                    dataset=tuned_dataset,
-                    feature_columns=feature_columns,
-                    validation_config=candidate_config,
-                )
+                for sell_threshold in self.config.tuning_sell_threshold_candidates:
+                    candidate_config = replace(
+                        self.config,
+                        prediction_horizon=prediction_horizon,
+                        buy_threshold=buy_threshold,
+                        sell_threshold=sell_threshold,
+                    )
+                    tuned_dataset = self._build_tuned_dataset(
+                        feature_df=feature_df,
+                        feature_columns=feature_columns,
+                        tuning_config=candidate_config,
+                    )
+                    walk_forward_result = self._run_walk_forward_validation(
+                        dataset=tuned_dataset,
+                        feature_columns=feature_columns,
+                        validation_config=candidate_config,
+                    )
 
-                summary = walk_forward_result["summary"]
-                backtest_summary = walk_forward_result["backtest_result"]["summary"]
-                label_result_row = {
-                    "predictionHorizon": prediction_horizon,
-                    "buyThreshold": buy_threshold,
-                    "sellThreshold": -buy_threshold,
-                    "datasetRows": int(len(tuned_dataset)),
-                    "takeProfitRows": int(summary["test_class_distribution"]["TAKE_PROFIT"]),
-                    "holdRows": int(summary["test_class_distribution"]["HOLD"]),
-                    "buyRows": int(summary["test_class_distribution"]["BUY"]),
-                    "foldCount": int(summary["fold_count"]),
-                    "accuracy": float(summary["accuracy"]),
-                    "balancedAccuracy": float(summary["balanced_accuracy"]),
-                    "averageFoldBalancedAccuracy": float(summary["average_fold_balanced_accuracy"]),
-                    "strategyTotalReturn": float(backtest_summary["strategyTotalReturn"]),
-                    "benchmarkTotalReturn": float(backtest_summary["benchmarkTotalReturn"]),
-                    "maxDrawdown": float(backtest_summary["maxDrawdown"]),
-                    "tradeCount": int(backtest_summary["tradeCount"]),
-                }
-                label_result_rows.append(label_result_row)
-
-                if self._is_better_label_candidate(label_result_row, best_label_result):
-                    best_label_result = {
-                        "config": candidate_config,
-                        "row": label_result_row,
-                        "walk_forward_result": walk_forward_result,
+                    summary = walk_forward_result["summary"]
+                    backtest_summary = walk_forward_result["backtest_result"]["summary"]
+                    label_result_row = {
+                        "labelingStrategy": candidate_config.labeling_strategy,
+                        "predictionHorizon": prediction_horizon,
+                        "buyThreshold": buy_threshold,
+                        "sellThreshold": sell_threshold,
+                        "purgeGapTimestamps": int(self._resolve_walkforward_purge_gap(candidate_config)),
+                        "datasetRows": int(len(tuned_dataset)),
+                        "takeProfitRows": int(summary["test_class_distribution"]["TAKE_PROFIT"]),
+                        "holdRows": int(summary["test_class_distribution"]["HOLD"]),
+                        "buyRows": int(summary["test_class_distribution"]["BUY"]),
+                        "foldCount": int(summary["fold_count"]),
+                        "accuracy": float(summary["accuracy"]),
+                        "balancedAccuracy": float(summary["balanced_accuracy"]),
+                        "averageFoldBalancedAccuracy": float(summary["average_fold_balanced_accuracy"]),
+                        "strategyTotalReturn": float(backtest_summary["strategyTotalReturn"]),
+                        "benchmarkTotalReturn": float(backtest_summary["benchmarkTotalReturn"]),
+                        "maxDrawdown": float(backtest_summary["maxDrawdown"]),
+                        "tradeCount": int(backtest_summary["tradeCount"]),
                     }
+                    label_result_rows.append(label_result_row)
+
+                    if self._is_better_label_candidate(label_result_row, best_label_result):
+                        best_label_result = {
+                            "config": candidate_config,
+                            "row": label_result_row,
+                            "walk_forward_result": walk_forward_result,
+                        }
+                    self._save_tuning_progress(
+                        label_result_rows=label_result_rows,
+                        confidence_result_rows=[],
+                        best_label_result=best_label_result,
+                        best_confidence_result=None,
+                    )
 
         if best_label_result is None:
             raise ValueError("Signal parameter tuning could not evaluate any label candidates.")
@@ -605,6 +813,12 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
                     "row": confidence_result_row,
                     "backtest_result": backtest_result,
                 }
+            self._save_tuning_progress(
+                label_result_rows=label_result_rows,
+                confidence_result_rows=confidence_result_rows,
+                best_label_result=best_label_result,
+                best_confidence_result=best_confidence_result,
+            )
 
         if best_confidence_result is None:
             raise ValueError("Signal parameter tuning could not evaluate any confidence candidates.")
@@ -617,9 +831,11 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
         tuning_summary = {
             "modelType": self.config.model_type,
             "bestLabelConfig": {
+                "labelingStrategy": best_label_result["config"].labeling_strategy,
                 "predictionHorizon": int(best_label_result["config"].prediction_horizon),
                 "buyThreshold": float(best_label_result["config"].buy_threshold),
                 "sellThreshold": float(best_label_result["config"].sell_threshold),
+                "purgeGapTimestamps": int(self._resolve_walkforward_purge_gap(best_label_result["config"])),
             },
             "bestConfidenceConfig": {
                 "backtestMinConfidence": float(best_confidence_result["config"].backtest_min_confidence),
@@ -663,13 +879,41 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
     ) -> pd.DataFrame:
         """Apply candidate label settings to one shared feature table."""
 
-        labeler = FutureReturnSignalLabeler(
-            prediction_horizon=tuning_config.prediction_horizon,
-            buy_threshold=tuning_config.buy_threshold,
-            sell_threshold=tuning_config.sell_threshold,
-        )
+        labeler = create_labeler_from_config(tuning_config)
         labeled_df = labeler.add_labels(feature_df.copy())
         return labeled_df.dropna(subset=feature_columns + ["future_return"]).reset_index(drop=True)
+
+    def _save_tuning_progress(
+        self,
+        label_result_rows: List[Dict[str, Any]],
+        confidence_result_rows: List[Dict[str, Any]],
+        best_label_result: Dict[str, Any] | None,
+        best_confidence_result: Dict[str, Any] | None,
+    ) -> None:
+        """Persist partial tuning outputs so long searches are resumable to inspect."""
+
+        if label_result_rows:
+            self.save_dataframe(
+                pd.DataFrame(label_result_rows),
+                OUTPUTS_DIR / "signalParameterTuningResults.partial.csv",
+            )
+
+        if confidence_result_rows:
+            self.save_dataframe(
+                pd.DataFrame(confidence_result_rows),
+                OUTPUTS_DIR / "signalConfidenceTuningResults.partial.csv",
+            )
+
+        self.save_json(
+            {
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "labelCandidatesEvaluated": int(len(label_result_rows)),
+                "confidenceCandidatesEvaluated": int(len(confidence_result_rows)),
+                "bestLabelRow": best_label_result["row"] if best_label_result is not None else None,
+                "bestConfidenceRow": best_confidence_result["row"] if best_confidence_result is not None else None,
+            },
+            OUTPUTS_DIR / "signalParameterTuningProgress.json",
+        )
 
     def _is_better_label_candidate(
         self,
@@ -746,10 +990,18 @@ class ModelComparisonApp(TrainingApp):
             test_df = training_result["test_df"]
             output_paths = self._comparison_output_paths(model_type)
 
-            model.save(output_paths["modelPath"])
-            self.save_json(metrics, output_paths["metricsPath"])
-            self.save_dataframe(prediction_df, output_paths["predictionsPath"])
-            self.save_dataframe(model.get_feature_importance_frame(), output_paths["featureImportancePath"])
+            saved_artifact_paths = self.save_model_artifact_outputs(
+                model=model,
+                metrics=metrics,
+                prediction_df=prediction_df,
+                train_df=train_df,
+                test_df=test_df,
+                dataset_path=self.dataset_path,
+                model_path=output_paths["modelPath"],
+                metrics_path=output_paths["metricsPath"],
+                predictions_path=output_paths["predictionsPath"],
+                feature_importance_path=output_paths["featureImportancePath"],
+            )
 
             comparison_row = {
                 "modelType": model.model_type,
@@ -763,10 +1015,7 @@ class ModelComparisonApp(TrainingApp):
             comparison_details.append(
                 {
                     **comparison_row,
-                    "modelPath": str(output_paths["modelPath"]),
-                    "metricsPath": str(output_paths["metricsPath"]),
-                    "predictionsPath": str(output_paths["predictionsPath"]),
-                    "featureImportancePath": str(output_paths["featureImportancePath"]),
+                    **saved_artifact_paths,
                 }
             )
 
@@ -810,7 +1059,7 @@ class SignalGenerationApp(BaseSignalApp):
         if self.model is None:
             if not self.model_path.exists():
                 raise FileNotFoundError(
-                    "No trained model was found. Run `python scripts/trainModel.py` first."
+                    "No trained model was found. Run `python model-service/scripts/trainModel.py` first."
                 )
 
             self.model = BaseSignalModel.load(self.model_path)
@@ -823,6 +1072,7 @@ class SignalGenerationApp(BaseSignalApp):
                 feature_columns=self.model.feature_columns,
             )
 
+        self._ensure_market_data_available()
         feature_df = self.dataset_builder.build_feature_table()
         prediction_df = self.model.predict(feature_df)
         latest_signals = build_latest_signal_summaries(prediction_df)
@@ -853,6 +1103,27 @@ class SignalGenerationApp(BaseSignalApp):
             "signalName": top_signal["signal_name"],
             "confidence": top_signal["confidence"],
             "signalChat": top_signal["signalChat"],
+        }
+
+
+class ProductionCycleApp(BaseSignalApp):
+    """Run the continuous refresh, retrain, and publish cycle in one command."""
+
+    def run(self) -> Dict[str, Any]:
+        """Refresh data, train the current model, and regenerate the frontend snapshot."""
+
+        market_refresh_result = MarketDataRefreshApp(config=self.config).run()
+        training_result = TrainingApp(config=self.config).run()
+        signal_generation_result = SignalGenerationApp(config=self.config).run()
+
+        return {
+            "marketRefresh": market_refresh_result,
+            "training": training_result,
+            "signalGeneration": signal_generation_result,
+            "modelType": training_result["modelType"],
+            "modelPath": training_result["modelPath"],
+            "metadataPath": training_result["metadataPath"],
+            "frontendSignalSnapshotPath": signal_generation_result["frontendSignalSnapshotPath"],
         }
 
 

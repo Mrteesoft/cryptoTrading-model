@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
+from .config import TrainingConfig
+
 
 SIGNAL_NAME_MAP = {
     -1: "TAKE_PROFIT",
@@ -114,6 +116,170 @@ class FutureReturnSignalLabeler(BaseSignalLabeler):
         ).astype(int)
 
         return self._attach_target_names(labeled_df)
+
+
+class TripleBarrierSignalLabeler(BaseSignalLabeler):
+    """
+    Label candles from the first barrier hit inside a vertical time window.
+
+    For spot trading, that means:
+    - upper barrier -> BUY-quality path
+    - lower barrier -> TAKE_PROFIT / stop-out path
+    - no barrier hit before timeout -> HOLD
+    """
+
+    def __init__(
+        self,
+        prediction_horizon: int,
+        buy_threshold: float,
+        sell_threshold: float,
+        use_high_low: bool = True,
+        tie_break: str = "stop_loss",
+    ) -> None:
+        if prediction_horizon < 1:
+            raise ValueError("prediction_horizon must be at least 1.")
+        if buy_threshold <= 0:
+            raise ValueError("buy_threshold must be positive for triple-barrier labeling.")
+        if sell_threshold >= 0:
+            raise ValueError("sell_threshold must be negative for triple-barrier labeling.")
+
+        self.prediction_horizon = prediction_horizon
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.use_high_low = use_high_low
+        self.tie_break = tie_break
+
+    def add_labels(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """Label rows by scanning the realized path candle by candle."""
+
+        labeled_df = feature_df.copy()
+        labeled_df["future_close"] = np.nan
+        labeled_df["future_return"] = np.nan
+        labeled_df["target_signal"] = 0
+        labeled_df["label_barrier"] = None
+        labeled_df["label_holding_period"] = np.nan
+
+        if self.asset_key_column in labeled_df.columns:
+            grouped_indices = labeled_df.groupby(self.asset_key_column, sort=False).groups.values()
+        else:
+            grouped_indices = [labeled_df.index]
+
+        for asset_index in grouped_indices:
+            asset_df = labeled_df.loc[list(asset_index)]
+            self._label_asset_rows(labeled_df=labeled_df, asset_df=asset_df)
+
+        labeled_df["target_signal"] = labeled_df["target_signal"].astype(int)
+        return self._attach_target_names(labeled_df)
+
+    def _label_asset_rows(
+        self,
+        labeled_df: pd.DataFrame,
+        asset_df: pd.DataFrame,
+    ) -> None:
+        """Apply the barrier scan to one asset history without mixing symbols."""
+
+        close_values = asset_df["close"].astype(float).to_numpy()
+        high_values = close_values
+        low_values = close_values
+
+        if self.use_high_low and "high" in asset_df.columns:
+            high_values = asset_df["high"].astype(float).to_numpy()
+        if self.use_high_low and "low" in asset_df.columns:
+            low_values = asset_df["low"].astype(float).to_numpy()
+
+        row_indices = list(asset_df.index)
+
+        for start_position, row_index in enumerate(row_indices):
+            vertical_position = start_position + self.prediction_horizon
+            if vertical_position >= len(row_indices):
+                continue
+
+            entry_close = close_values[start_position]
+            if pd.isna(entry_close) or entry_close <= 0:
+                continue
+
+            realized_return = np.nan
+            realized_close = np.nan
+            target_signal = 0
+            barrier_name = "vertical"
+            holding_period = self.prediction_horizon
+
+            for forward_offset in range(1, self.prediction_horizon + 1):
+                scan_position = start_position + forward_offset
+                upper_return = (high_values[scan_position] / entry_close) - 1
+                lower_return = (low_values[scan_position] / entry_close) - 1
+                upper_hit = upper_return >= self.buy_threshold
+                lower_hit = lower_return <= self.sell_threshold
+
+                if not upper_hit and not lower_hit:
+                    continue
+
+                barrier_name = self._resolve_barrier_name(upper_hit=upper_hit, lower_hit=lower_hit)
+                holding_period = forward_offset
+
+                if barrier_name == "upper":
+                    target_signal = 1
+                    realized_return = self.buy_threshold
+                    realized_close = entry_close * (1 + self.buy_threshold)
+                else:
+                    target_signal = -1
+                    realized_return = self.sell_threshold
+                    realized_close = entry_close * (1 + self.sell_threshold)
+                break
+
+            if pd.isna(realized_return):
+                realized_close = close_values[vertical_position]
+                realized_return = (realized_close / entry_close) - 1
+                target_signal = 0
+                barrier_name = "vertical"
+
+            labeled_df.at[row_index, "future_close"] = realized_close
+            labeled_df.at[row_index, "future_return"] = realized_return
+            labeled_df.at[row_index, "target_signal"] = target_signal
+            labeled_df.at[row_index, "label_barrier"] = barrier_name
+            labeled_df.at[row_index, "label_holding_period"] = holding_period
+
+    def _resolve_barrier_name(
+        self,
+        upper_hit: bool,
+        lower_hit: bool,
+    ) -> str:
+        """Resolve ambiguous candles whose high and low cross both barriers."""
+
+        if upper_hit and lower_hit:
+            if self.tie_break == "take_profit":
+                return "upper"
+            return "both_stop_loss"
+
+        if upper_hit:
+            return "upper"
+
+        return "lower"
+
+
+def create_labeler_from_config(config: TrainingConfig) -> BaseSignalLabeler:
+    """Build the configured labeling strategy from one config object."""
+
+    if config.labeling_strategy == "future_return":
+        return FutureReturnSignalLabeler(
+            prediction_horizon=config.prediction_horizon,
+            buy_threshold=config.buy_threshold,
+            sell_threshold=config.sell_threshold,
+        )
+
+    if config.labeling_strategy == "triple_barrier":
+        return TripleBarrierSignalLabeler(
+            prediction_horizon=config.prediction_horizon,
+            buy_threshold=config.buy_threshold,
+            sell_threshold=config.sell_threshold,
+            use_high_low=config.triple_barrier_use_high_low,
+            tie_break=config.triple_barrier_tie_break,
+        )
+
+    raise ValueError(
+        "Unsupported labeling_strategy. "
+        "Currently supported: future_return, triple_barrier"
+    )
 
 
 def signal_to_text(signal_value: int) -> str:

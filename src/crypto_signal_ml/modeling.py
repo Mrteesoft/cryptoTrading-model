@@ -1,13 +1,15 @@
 """Model training, evaluation, prediction, and persistence utilities."""
 
 from abc import ABC, abstractmethod
+import os
 from pathlib import Path
 import pickle
+import tempfile
 from typing import Any, Dict, List, Tuple, Type
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -105,6 +107,7 @@ class BaseSignalModel(ABC):
         min_train_size: float,
         test_size: float,
         step_size: float,
+        purge_gap_timestamps: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Build expanding walk-forward folds using whole timestamps.
@@ -125,6 +128,8 @@ class BaseSignalModel(ABC):
         }.items():
             if not 0 < field_value < 1:
                 raise ValueError(f"{field_name} must be between 0 and 1.")
+        if purge_gap_timestamps < 0:
+            raise ValueError("purge_gap_timestamps must be 0 or greater.")
 
         prepared_df = dataset.copy()
         prepared_df["timestamp"] = pd.to_datetime(prepared_df["timestamp"], errors="coerce", utc=True)
@@ -156,7 +161,14 @@ class BaseSignalModel(ABC):
         train_end_index = min_train_timestamp_count
 
         while train_end_index + test_timestamp_count <= total_timestamp_count:
-            train_end_timestamp = unique_timestamps[train_end_index - 1]
+            effective_train_end_index = train_end_index - purge_gap_timestamps
+            if effective_train_end_index <= 0:
+                raise ValueError(
+                    "purge_gap_timestamps is too large for the current walk-forward settings. "
+                    "Reduce the purge gap or increase the minimum train size."
+                )
+
+            train_end_timestamp = unique_timestamps[effective_train_end_index - 1]
             test_start_timestamp = unique_timestamps[train_end_index]
             test_end_timestamp = unique_timestamps[train_end_index + test_timestamp_count - 1]
 
@@ -185,6 +197,8 @@ class BaseSignalModel(ABC):
                     "train_end_timestamp": train_end_timestamp,
                     "test_start_timestamp": test_start_timestamp,
                     "test_end_timestamp": test_end_timestamp,
+                    "purgeGapTimestamps": int(purge_gap_timestamps),
+                    "purgedTimestampCount": int(purge_gap_timestamps),
                 }
             )
 
@@ -252,7 +266,14 @@ class BaseSignalModel(ABC):
 
         self._validate_feature_columns()
         self.estimator = self._build_estimator()
-        self.estimator.fit(train_df[self.feature_columns], train_df["target_signal"])
+        feature_frame = train_df[self.feature_columns]
+        target_series = train_df["target_signal"]
+        sample_weight = self._build_sample_weight(train_df)
+        self._fit_estimator(
+            feature_frame=feature_frame,
+            target_series=target_series,
+            sample_weight=sample_weight,
+        )
         return self
 
     def evaluate(
@@ -371,8 +392,22 @@ class BaseSignalModel(ABC):
             "config": config_to_dict(self.config),
         }
 
-        with model_path.open("wb") as model_file:
-            pickle.dump(model_bundle, model_file)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file_descriptor, temp_file_name = tempfile.mkstemp(
+            dir=model_path.parent,
+            prefix=f".{model_path.stem}-",
+            suffix=".tmp",
+        )
+        os.close(temp_file_descriptor)
+        temp_path = Path(temp_file_name)
+
+        try:
+            with temp_path.open("wb") as model_file:
+                pickle.dump(model_bundle, model_file)
+            temp_path.replace(model_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
     @classmethod
     def load(cls, model_path: Path) -> "BaseSignalModel":
@@ -462,6 +497,47 @@ class BaseSignalModel(ABC):
         if self.estimator is None:
             raise ValueError("The model has not been trained or loaded yet.")
 
+    def _fit_estimator(
+        self,
+        feature_frame: pd.DataFrame,
+        target_series: pd.Series,
+        sample_weight: np.ndarray | None = None,
+    ) -> None:
+        """Fit the underlying estimator, passing sample weights when supported."""
+
+        if sample_weight is None:
+            self.estimator.fit(feature_frame, target_series)
+            return
+
+        try:
+            self.estimator.fit(feature_frame, target_series, sample_weight=sample_weight)
+        except TypeError:
+            self.estimator.fit(feature_frame, target_series)
+
+    def _build_sample_weight(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """
+        Weight recent rows more heavily so the model tracks current market regimes.
+
+        Crypto changes fast, so older observations should still contribute but
+        gradually matter less than newer candles.
+        """
+
+        if not self.config.recency_weighting_enabled:
+            return None
+        if "timestamp" not in train_df.columns:
+            return None
+
+        timestamp_series = pd.to_datetime(train_df["timestamp"], errors="coerce", utc=True)
+        if timestamp_series.isna().all():
+            return None
+
+        latest_timestamp = timestamp_series.max()
+        halflife_hours = max(float(self.config.recency_weighting_halflife_hours), 1.0)
+        age_hours = (latest_timestamp - timestamp_series).dt.total_seconds().fillna(0.0) / 3600.0
+        recency_weights = np.power(0.5, age_hours / halflife_hours)
+
+        return recency_weights.to_numpy(dtype=float)
+
 
 @register_model
 class RandomForestSignalModel(BaseSignalModel):
@@ -493,6 +569,52 @@ class RandomForestSignalModel(BaseSignalModel):
             random_state=self.config.random_state,
             class_weight="balanced_subsample",
         )
+
+
+@register_model
+class HistGradientBoostingSignalModel(BaseSignalModel):
+    """
+    Histogram gradient boosting tuned for tabular market features.
+
+    This is usually a stronger default than plain logistic regression and often
+    more adaptive than a basic random forest on structured data.
+    """
+
+    model_type = "histGradientBoostingSignalModel"
+    default_model_filename = "histGradientBoostingSignalModel.pkl"
+
+    def _build_estimator(self) -> HistGradientBoostingClassifier:
+        """Create the boosted-tree estimator from the project config."""
+
+        return HistGradientBoostingClassifier(
+            learning_rate=self.config.hist_gradient_learning_rate,
+            max_iter=self.config.hist_gradient_max_iter,
+            max_depth=self.config.hist_gradient_max_depth,
+            min_samples_leaf=self.config.hist_gradient_min_samples_leaf,
+            l2_regularization=self.config.hist_gradient_l2_regularization,
+            random_state=self.config.random_state,
+        )
+
+    def _build_sample_weight(self, train_df: pd.DataFrame) -> np.ndarray | None:
+        """
+        Combine recency weighting with simple class balancing for boosted trees.
+
+        HistGradientBoostingClassifier does not expose a class_weight argument,
+        so sample weights carry both effects.
+        """
+
+        recency_weight = super()._build_sample_weight(train_df)
+        target_series = pd.Series(train_df["target_signal"])
+        class_counts = target_series.value_counts()
+        class_count_total = max(len(class_counts), 1)
+        class_weight = target_series.map(
+            lambda class_label: len(target_series) / (class_count_total * class_counts[class_label])
+        ).to_numpy(dtype=float)
+
+        if recency_weight is None:
+            return class_weight
+
+        return class_weight * recency_weight
 
 
 @register_model
@@ -528,6 +650,24 @@ class LogisticRegressionSignalModel(BaseSignalModel):
                     ),
                 ),
             ]
+        )
+
+    def _fit_estimator(
+        self,
+        feature_frame: pd.DataFrame,
+        target_series: pd.Series,
+        sample_weight: np.ndarray | None = None,
+    ) -> None:
+        """Fit the pipeline, routing sample weights to the classifier step."""
+
+        if sample_weight is None:
+            self.estimator.fit(feature_frame, target_series)
+            return
+
+        self.estimator.fit(
+            feature_frame,
+            target_series,
+            classifier__sample_weight=sample_weight,
         )
 
     def get_feature_importance(self) -> Dict[str, float]:
@@ -583,6 +723,7 @@ def split_walk_forward_by_time(
     min_train_size: float,
     test_size: float,
     step_size: float,
+    purge_gap_timestamps: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Backward-compatible helper that delegates to the base model class.
@@ -593,4 +734,5 @@ def split_walk_forward_by_time(
         min_train_size=min_train_size,
         test_size=test_size,
         step_size=step_size,
+        purge_gap_timestamps=purge_gap_timestamps,
     )

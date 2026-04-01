@@ -14,7 +14,7 @@ from .data import (
     EnrichedCsvPriceDataLoader,
 )
 from .features import BaseFeatureEngineer, FEATURE_COLUMNS, TechnicalFeatureEngineer
-from .labels import BaseSignalLabeler, FutureReturnSignalLabeler
+from .labels import BaseSignalLabeler, create_labeler_from_config
 
 
 class BaseDatasetBuilder(ABC):
@@ -77,7 +77,8 @@ class BaseDatasetBuilder(ABC):
         Remove rows that are unusable for supervised learning.
 
         Rolling indicators create NaN values at the beginning of the dataset.
-        Future-return labels create NaN values at the end of the dataset.
+        Labelers still create NaN values at the end of the dataset when there
+        are not enough future candles to score a row.
         We drop both sections here once, in one shared place.
         """
 
@@ -93,7 +94,7 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
     The subclass wires together:
     - CSV loading
     - technical indicator feature engineering
-    - future-return labeling
+    - configurable labeling, defaulting to triple barrier
     """
 
     def __init__(
@@ -132,11 +133,7 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
         feature_engineer = feature_engineer or TechnicalFeatureEngineer(
             feature_columns=selected_feature_columns,
         )
-        labeler = labeler or FutureReturnSignalLabeler(
-            prediction_horizon=config.prediction_horizon,
-            buy_threshold=config.buy_threshold,
-            sell_threshold=config.sell_threshold,
-        )
+        labeler = labeler or create_labeler_from_config(config)
 
         super().__init__(
             config=config,

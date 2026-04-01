@@ -93,7 +93,7 @@ class SignalSnapshotStore:
         if self._cached_snapshot is None:
             raise FileNotFoundError(
                 f"Frontend signal snapshot not found: {self.snapshot_path}. "
-                "Run `python scripts/generateSignals.py` first."
+                "Run `python model-service/scripts/generateSignals.py` first."
             )
 
         return self._cached_snapshot

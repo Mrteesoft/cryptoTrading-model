@@ -19,6 +19,7 @@ from crypto_signal_ml.app import (  # noqa: E402
     MarketDataRefreshApp,
     MarketUniverseRefreshApp,
     SignalParameterTuningApp,
+    TrainingApp,
     WalkForwardValidationApp,
 )
 from crypto_signal_ml.backtesting import EqualWeightSignalBacktester  # noqa: E402
@@ -26,14 +27,16 @@ from crypto_signal_ml.data import CoinbaseExchangePriceDataLoader, CoinMarketCap
 from crypto_signal_ml.environment import load_env_file  # noqa: E402
 from crypto_signal_ml.features import TechnicalFeatureEngineer  # noqa: E402
 from crypto_signal_ml.frontend import SignalSnapshotStore, build_frontend_signal_snapshot  # noqa: E402
-from crypto_signal_ml.labels import FutureReturnSignalLabeler  # noqa: E402
+from crypto_signal_ml.labels import FutureReturnSignalLabeler, TripleBarrierSignalLabeler  # noqa: E402
 from crypto_signal_ml.modeling import (  # noqa: E402
     BaseSignalModel,
+    HistGradientBoostingSignalModel,
     LogisticRegressionSignalModel,
     RandomForestSignalModel,
     create_model_from_config,
 )
 from crypto_signal_ml.pipeline import CryptoDatasetBuilder  # noqa: E402
+from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
 from crypto_signal_ml.signals import build_actionable_signal_summaries, build_latest_signal_summaries  # noqa: E402
 
 
@@ -142,6 +145,15 @@ def test_config_can_create_logistic_regression_model() -> None:
     assert isinstance(model, LogisticRegressionSignalModel)
 
 
+def test_config_can_create_hist_gradient_boosting_model() -> None:
+    """The config model_type should map to the gradient-boosting subclass."""
+
+    config = TrainingConfig(model_type="histGradientBoostingSignalModel")
+    model = create_model_from_config(config=config, feature_columns=["return_1"])
+
+    assert isinstance(model, HistGradientBoostingSignalModel)
+
+
 def test_comparison_model_types_can_create_registered_models() -> None:
     """Every configured comparison model type should map to a concrete subclass."""
 
@@ -154,8 +166,32 @@ def test_comparison_model_types_can_create_registered_models() -> None:
         for model_type in config.comparison_model_types
     ]
 
+    assert any(isinstance(model, HistGradientBoostingSignalModel) for model in created_models)
     assert any(isinstance(model, RandomForestSignalModel) for model in created_models)
     assert any(isinstance(model, LogisticRegressionSignalModel) for model in created_models)
+
+
+def test_recency_weighting_prioritizes_newer_training_rows() -> None:
+    """Recency weighting should make newer candles count more than older ones."""
+
+    model = HistGradientBoostingSignalModel(
+        config=TrainingConfig(
+            recency_weighting_enabled=True,
+            recency_weighting_halflife_hours=24.0,
+        ),
+        feature_columns=["return_1"],
+    )
+    train_df = pd.DataFrame(
+        [
+            {"timestamp": "2026-01-01T00:00:00Z", "return_1": 0.01, "target_signal": 0},
+            {"timestamp": "2026-01-03T00:00:00Z", "return_1": 0.02, "target_signal": 1},
+        ]
+    )
+
+    sample_weight = model._build_sample_weight(train_df)
+
+    assert sample_weight is not None
+    assert sample_weight[1] > sample_weight[0]
 
 
 def test_base_model_can_build_walk_forward_splits_without_timestamp_leakage() -> None:
@@ -173,6 +209,26 @@ def test_base_model_can_build_walk_forward_splits_without_timestamp_leakage() ->
     assert walk_forward_splits[0]["train_end_timestamp"] < walk_forward_splits[0]["test_start_timestamp"]
     assert walk_forward_splits[0]["test_df"]["timestamp"].nunique() == 6
     assert len(walk_forward_splits[0]["test_df"]) == 12
+
+
+def test_walk_forward_splits_can_purge_recent_training_timestamps() -> None:
+    """The purge gap should remove the timestamps nearest the test block."""
+
+    dataset = _build_sample_market_frame(total_hours=24)
+    walk_forward_splits = BaseSignalModel.split_walk_forward_by_time(
+        dataset=dataset,
+        min_train_size=0.50,
+        test_size=0.25,
+        step_size=0.25,
+        purge_gap_timestamps=2,
+    )
+
+    first_split = walk_forward_splits[0]
+
+    assert first_split["purgeGapTimestamps"] == 2
+    assert first_split["purgedTimestampCount"] == 2
+    assert first_split["train_df"]["timestamp"].nunique() == 10
+    assert first_split["train_df"]["timestamp"].max() < first_split["test_df"]["timestamp"].min()
 
 
 def test_coinbase_loader_can_normalize_candle_rows() -> None:
@@ -649,6 +705,36 @@ def test_labeler_shifts_future_returns_within_each_coin() -> None:
     assert pd.isna(labeled_df.iloc[3]["future_return"])
 
 
+def test_triple_barrier_labeler_uses_first_barrier_hit_per_coin() -> None:
+    """Triple-barrier labels should react to the first path event for each asset."""
+
+    feature_df = pd.DataFrame(
+        [
+            {"timestamp": "2026-01-01T00:00:00Z", "product_id": "BTC-USD", "close": 100.0, "high": 101.0, "low": 99.0},
+            {"timestamp": "2026-01-01T01:00:00Z", "product_id": "BTC-USD", "close": 101.0, "high": 106.0, "low": 100.0},
+            {"timestamp": "2026-01-01T02:00:00Z", "product_id": "BTC-USD", "close": 103.0, "high": 104.0, "low": 102.0},
+            {"timestamp": "2026-01-01T03:00:00Z", "product_id": "BTC-USD", "close": 104.0, "high": 105.0, "low": 103.0},
+            {"timestamp": "2026-01-01T00:00:00Z", "product_id": "ETH-USD", "close": 200.0, "high": 201.0, "low": 199.0},
+            {"timestamp": "2026-01-01T01:00:00Z", "product_id": "ETH-USD", "close": 198.0, "high": 199.0, "low": 188.0},
+            {"timestamp": "2026-01-01T02:00:00Z", "product_id": "ETH-USD", "close": 197.0, "high": 198.0, "low": 196.0},
+            {"timestamp": "2026-01-01T03:00:00Z", "product_id": "ETH-USD", "close": 201.0, "high": 202.0, "low": 200.0},
+        ]
+    )
+
+    labeled_df = TripleBarrierSignalLabeler(
+        prediction_horizon=2,
+        buy_threshold=0.05,
+        sell_threshold=-0.05,
+    ).add_labels(feature_df)
+
+    assert labeled_df.iloc[0]["target_name"] == "BUY"
+    assert labeled_df.iloc[0]["future_return"] == pytest.approx(0.05)
+    assert labeled_df.iloc[0]["label_barrier"] == "upper"
+    assert labeled_df.iloc[4]["target_name"] == "TAKE_PROFIT"
+    assert labeled_df.iloc[4]["future_return"] == pytest.approx(-0.05)
+    assert labeled_df.iloc[4]["label_barrier"] == "lower"
+
+
 def test_market_data_refresh_app_reports_context_failure_without_aborting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -683,6 +769,145 @@ def test_market_data_refresh_app_reports_context_failure_without_aborting(
     assert result["rowsDownloaded"] > 0
     assert result["coinMarketCapContextStatus"] == "refresh_failed"
     assert "simulated CoinMarketCap failure" in result["coinMarketCapContextError"]
+
+
+def test_training_app_writes_model_metadata_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Primary training should publish a JSON sidecar for deployment metadata."""
+
+    raw_data_path = tmp_path / "marketPrices.csv"
+    _build_sample_market_frame(total_hours=12).to_csv(raw_data_path, index=False)
+
+    import crypto_signal_ml.app as app_module  # noqa: WPS433
+
+    monkeypatch.setattr(app_module, "PROCESSED_DATA_DIR", tmp_path / "processed")
+    monkeypatch.setattr(app_module, "MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(app_module, "OUTPUTS_DIR", tmp_path / "outputs")
+
+    training_df = pd.DataFrame(
+        [
+            {"return_1": -0.04, "momentum_3": -0.09, "target_signal": -1},
+            {"return_1": -0.01, "momentum_3": -0.02, "target_signal": 0},
+            {"return_1": 0.05, "momentum_3": 0.08, "target_signal": 1},
+            {"return_1": -0.03, "momentum_3": -0.04, "target_signal": -1},
+            {"return_1": 0.00, "momentum_3": 0.01, "target_signal": 0},
+            {"return_1": 0.04, "momentum_3": 0.07, "target_signal": 1},
+        ]
+    )
+
+    class StubDatasetBuilder:
+        def build_labeled_dataset(self) -> tuple[pd.DataFrame, list[str]]:
+            return training_df, ["return_1", "momentum_3"]
+
+    training_app = TrainingApp(
+        config=TrainingConfig(
+            data_file=raw_data_path,
+            coinmarketcap_use_context=False,
+            n_estimators=12,
+            max_depth=3,
+            random_state=7,
+        ),
+        dataset_builder=StubDatasetBuilder(),
+    )
+
+    result = training_app.run()
+    metadata_path = Path(result["metadataPath"])
+    metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert metadata_path.exists()
+    assert metadata_payload["modelType"] == result["modelType"]
+    assert metadata_payload["metrics"]["balancedAccuracy"] == pytest.approx(result["balancedAccuracy"])
+    assert metadata_payload["trainingDataPath"] == str(raw_data_path)
+    assert metadata_payload["artifacts"]["metricsPath"] == result["metricsPath"]
+
+
+def test_training_app_bootstraps_missing_market_data_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training should auto-refresh raw market data when the CSV is missing."""
+
+    raw_data_path = tmp_path / "marketPrices.csv"
+
+    import crypto_signal_ml.app as app_module  # noqa: WPS433
+
+    monkeypatch.setattr(app_module, "PROCESSED_DATA_DIR", tmp_path / "processed")
+    monkeypatch.setattr(app_module, "MODELS_DIR", tmp_path / "models")
+    monkeypatch.setattr(app_module, "OUTPUTS_DIR", tmp_path / "outputs")
+
+    training_df = pd.DataFrame(
+        [
+            {"return_1": -0.04, "momentum_3": -0.09, "target_signal": -1},
+            {"return_1": -0.01, "momentum_3": -0.02, "target_signal": 0},
+            {"return_1": 0.05, "momentum_3": 0.08, "target_signal": 1},
+            {"return_1": -0.03, "momentum_3": -0.04, "target_signal": -1},
+            {"return_1": 0.00, "momentum_3": 0.01, "target_signal": 0},
+            {"return_1": 0.04, "momentum_3": 0.07, "target_signal": 1},
+        ]
+    )
+
+    class StubDatasetBuilder:
+        def build_labeled_dataset(self) -> tuple[pd.DataFrame, list[str]]:
+            assert raw_data_path.exists()
+            return training_df, ["return_1", "momentum_3"]
+
+    def fake_refresh_run(self: MarketDataRefreshApp) -> dict:
+        _build_sample_market_frame(total_hours=12).to_csv(raw_data_path, index=False)
+        return {
+            "savedPath": str(raw_data_path),
+            "rowsDownloaded": 24,
+            "marketDataSource": "coinbaseExchange",
+        }
+
+    monkeypatch.setattr(app_module.MarketDataRefreshApp, "run", fake_refresh_run)
+
+    training_app = TrainingApp(
+        config=TrainingConfig(
+            data_file=raw_data_path,
+            coinmarketcap_use_context=False,
+            n_estimators=12,
+            max_depth=3,
+            random_state=7,
+        ),
+        dataset_builder=StubDatasetBuilder(),
+    )
+
+    training_app.run()
+
+    refresh_summary_path = tmp_path / "outputs" / "marketDataRefreshOnDemand.json"
+    refresh_summary = json.loads(refresh_summary_path.read_text(encoding="utf-8"))
+
+    assert raw_data_path.exists()
+    assert refresh_summary["trigger"] == "automatic_training_bootstrap"
+    assert refresh_summary["refresh"]["savedPath"] == str(raw_data_path)
+
+
+def test_rag_knowledge_store_can_ingest_and_search_text_sources(tmp_path: Path) -> None:
+    """The lightweight knowledge store should return relevant external chunks."""
+
+    store = RagKnowledgeStore(
+        db_path=tmp_path / "assistantKnowledge.sqlite3",
+        chunk_size_chars=180,
+        chunk_overlap_chars=40,
+    )
+
+    source = store.ingest_text(
+        title="Bitcoin ETF research note",
+        content=(
+            "Spot bitcoin ETF inflows can tighten liquid supply and improve market structure over time. "
+            "When inflows accelerate, short-term momentum and sentiment can change quickly."
+        ),
+        source_uri="https://example.com/bitcoin-etf-note",
+    )
+    search_results = store.search("bitcoin ETF inflows", limit=3)
+
+    assert source["title"] == "Bitcoin ETF research note"
+    assert store.get_status()["sourceCount"] == 1
+    assert search_results
+    assert search_results[0]["title"] == "Bitcoin ETF research note"
+    assert "inflows" in search_results[0]["content"].lower()
 
 
 def test_market_universe_refresh_app_continues_after_batch_failure(
@@ -782,8 +1007,10 @@ def test_signal_parameter_tuning_app_returns_best_candidate(
         walkforward_min_train_size=0.50,
         walkforward_test_size=0.25,
         walkforward_step_size=0.25,
+        walkforward_purge_gap_timestamps=2,
         tuning_prediction_horizon_candidates=(2, 3),
         tuning_buy_threshold_candidates=(0.01, 0.015),
+        tuning_sell_threshold_candidates=(-0.01, -0.015),
         tuning_backtest_confidence_candidates=(0.0, 0.55),
         logistic_max_iter=200,
     )
@@ -796,6 +1023,7 @@ def test_signal_parameter_tuning_app_returns_best_candidate(
 
     assert result["bestPredictionHorizon"] in {2, 3}
     assert result["bestBuyThreshold"] in {0.01, 0.015}
+    assert result["bestSellThreshold"] in {-0.01, -0.015}
     assert result["bestBacktestMinConfidence"] in {0.0, 0.55}
     assert result["confidenceResultsPath"].endswith("signalConfidenceTuningResults.csv")
 
