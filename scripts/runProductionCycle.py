@@ -20,6 +20,7 @@ def main() -> None:
     print("Production cycle complete.")
     print(f"Market data refreshed: {market_refresh['rowsDownloaded']} rows")
     print(f"Products refreshed: {market_refresh['uniqueProducts']}")
+    print(f"CoinMarketCal events: {market_refresh['coinMarketCalEventsStatus']} ({market_refresh['coinMarketCalEventsRows']} rows)")
     print(f"Model type: {training['modelType']}")
     print(f"Model published to: {training['modelPath']}")
     print(f"Artifact metadata saved to: {training['metadataPath']}")

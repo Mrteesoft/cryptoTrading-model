@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 from .config import MODELS_DIR, TrainingConfig
-from .data import CoinbaseExchangePriceDataLoader
+from .data import create_market_data_loader
 from .frontend import build_frontend_signal_snapshot
 from .modeling import BaseSignalModel, get_model_class
 from .pipeline import CryptoDatasetBuilder
@@ -100,19 +100,18 @@ class LiveSignalEngine:
             assistant_retrieval_item_limit=self.config.assistant_retrieval_item_limit,
         )
 
-        data_loader = CoinbaseExchangePriceDataLoader(
+        data_loader = create_market_data_loader(
+            config=runtime_config,
             data_path=runtime_config.data_file,
+            should_save_downloaded_data=False,
             product_ids=tuple(resolved_product_ids),
             fetch_all_quote_products=(
                 runtime_config.live_fetch_all_quote_products and not resolved_product_ids
             ),
-            quote_currency=runtime_config.coinbase_quote_currency,
-            excluded_base_currencies=runtime_config.coinbase_excluded_base_currencies,
             max_products=runtime_config.live_max_products,
             granularity_seconds=runtime_config.live_granularity_seconds,
             total_candles=runtime_config.live_total_candles,
             request_pause_seconds=runtime_config.live_request_pause_seconds,
-            should_save_downloaded_data=False,
             product_batch_size=None,
             save_progress_every_products=0,
             log_progress=False,
@@ -125,7 +124,10 @@ class LiveSignalEngine:
         )
         feature_df = dataset_builder.build_feature_table()
         prediction_df = model.predict(feature_df)
-        latest_signals = build_latest_signal_summaries(prediction_df)
+        latest_signals = build_latest_signal_summaries(
+            prediction_df,
+            minimum_action_confidence=runtime_config.backtest_min_confidence,
+        )
         actionable_signals = build_actionable_signal_summaries(latest_signals)
         primary_signal = select_primary_signal(latest_signals)
 
@@ -138,7 +140,7 @@ class LiveSignalEngine:
         live_snapshot.update(
             {
                 "mode": "live",
-                "marketDataSource": "coinbaseExchangeRest",
+                "marketDataSource": str(runtime_config.market_data_source),
                 "requestMode": (
                     "requested-product"
                     if product_id
@@ -151,6 +153,7 @@ class LiveSignalEngine:
                 "featureRowsScored": int(len(prediction_df)),
                 "granularitySeconds": int(runtime_config.live_granularity_seconds),
                 "liveSignalCacheSeconds": int(runtime_config.live_signal_cache_seconds),
+                "minimumActionConfidence": float(runtime_config.backtest_min_confidence),
                 "modelPath": str(self._resolve_model_path()),
             }
         )

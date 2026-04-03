@@ -11,6 +11,18 @@ ACTION_PRIORITY = {
     "HOLD": 2,
 }
 
+SIGNAL_TO_ACTION = {
+    "BUY": "buy",
+    "TAKE_PROFIT": "take_profit",
+    "HOLD": "wait",
+}
+
+SIGNAL_TO_NUMERIC = {
+    "TAKE_PROFIT": -1,
+    "HOLD": 0,
+    "BUY": 1,
+}
+
 
 def _safe_float(signal_row: pd.Series, column_name: str, default_value: float = 0.0) -> float:
     """Read a numeric value from a row without crashing on missing data."""
@@ -107,7 +119,10 @@ def _calculate_setup_score(signal_row: pd.Series) -> float:
     return score
 
 
-def _build_reason_items(signal_row: pd.Series) -> List[str]:
+def _build_base_reason_items(
+    signal_row: pd.Series,
+    signal_name: str,
+) -> List[str]:
     """
     Build simple reason bullets from the current feature snapshot.
 
@@ -116,7 +131,6 @@ def _build_reason_items(signal_row: pd.Series) -> List[str]:
     the current feature state into plain-English support for that signal.
     """
 
-    signal_name = str(signal_row["predicted_name"])
     reasons: List[str] = []
 
     breakout_up_20 = _safe_float(signal_row, "breakout_up_20")
@@ -235,11 +249,37 @@ def _build_reason_items(signal_row: pd.Series) -> List[str]:
     return reasons[:4]
 
 
-def _build_signal_chat(signal_row: pd.Series, reason_items: List[str]) -> str:
+def _build_reason_items(
+    signal_row: pd.Series,
+    signal_name: str,
+    raw_signal_name: str,
+    confidence_gate_applied: bool,
+    minimum_action_confidence: float,
+) -> List[str]:
+    """Build explanation bullets, including confidence-gate context when needed."""
+
+    if not confidence_gate_applied:
+        return _build_base_reason_items(signal_row=signal_row, signal_name=signal_name)
+
+    confidence = _safe_float(signal_row, "confidence")
+    raw_reasons = _build_base_reason_items(signal_row=signal_row, signal_name=raw_signal_name)[:2]
+    gated_reasons = [
+        f"The model leaned {raw_signal_name}, but confidence is {confidence:.1%}, below the "
+        f"{minimum_action_confidence:.1%} action threshold.",
+        "Treating this as HOLD until the edge is stronger.",
+    ]
+    gated_reasons.extend(raw_reasons)
+    return gated_reasons[:4]
+
+
+def _build_signal_chat(
+    signal_row: pd.Series,
+    reason_items: List[str],
+    signal_name: str,
+) -> str:
     """Build one short explanation paragraph for the current signal."""
 
     product_id = str(signal_row.get("product_id", signal_row.get("base_currency", "This coin")))
-    signal_name = str(signal_row["predicted_name"])
 
     if signal_name == "BUY":
         opener = f"{product_id} is a BUY setup."
@@ -251,29 +291,49 @@ def _build_signal_chat(signal_row: pd.Series, reason_items: List[str]) -> str:
     return opener + " " + " ".join(reason_items)
 
 
-def _row_to_signal_summary(signal_row: pd.Series) -> Dict[str, Any]:
+def _row_to_signal_summary(
+    signal_row: pd.Series,
+    minimum_action_confidence: float = 0.0,
+) -> Dict[str, Any]:
     """Convert one prediction row into a JSON-friendly signal dictionary."""
 
-    reason_items = _build_reason_items(signal_row)
-    signal_name = str(signal_row["predicted_name"])
+    raw_signal_name = str(signal_row["predicted_name"])
+    model_predicted_signal = int(signal_row["predicted_signal"])
+    confidence = float(signal_row["confidence"])
+    minimum_action_confidence = max(float(minimum_action_confidence or 0.0), 0.0)
+    confidence_gate_applied = (
+        raw_signal_name in {"BUY", "TAKE_PROFIT"}
+        and confidence < minimum_action_confidence
+    )
+    signal_name = "HOLD" if confidence_gate_applied else raw_signal_name
+    reason_items = _build_reason_items(
+        signal_row=signal_row,
+        signal_name=signal_name,
+        raw_signal_name=raw_signal_name,
+        confidence_gate_applied=confidence_gate_applied,
+        minimum_action_confidence=minimum_action_confidence,
+    )
     coin_symbol = _resolve_coin_symbol(signal_row)
     pair_symbol = str(signal_row.get("product_id", "")) if "product_id" in signal_row.index else ""
-    spot_action = {
-        "BUY": "buy",
-        "TAKE_PROFIT": "take_profit",
-        "HOLD": "wait",
-    }.get(signal_name, "wait")
+    spot_action = SIGNAL_TO_ACTION.get(signal_name, "wait")
+    model_spot_action = SIGNAL_TO_ACTION.get(raw_signal_name, "wait")
 
     summary = {
         "time_step": int(signal_row["time_step"]),
         "close": float(signal_row["close"]),
-        "predicted_signal": int(signal_row["predicted_signal"]),
+        "predicted_signal": SIGNAL_TO_NUMERIC.get(signal_name, model_predicted_signal),
         "signal_name": signal_name,
         "spotAction": spot_action,
+        "actionable": signal_name in {"BUY", "TAKE_PROFIT"},
         "symbol": coin_symbol,
         "coinSymbol": coin_symbol,
         "pairSymbol": pair_symbol,
-        "confidence": float(signal_row["confidence"]),
+        "confidence": confidence,
+        "minimumActionConfidence": minimum_action_confidence,
+        "confidenceGateApplied": confidence_gate_applied,
+        "modelPredictedSignal": model_predicted_signal,
+        "modelSignalName": raw_signal_name,
+        "modelSpotAction": model_spot_action,
         "setupScore": _calculate_setup_score(signal_row),
         "probabilities": {
             "take_profit": float(signal_row["prob_take_profit"]),
@@ -282,7 +342,7 @@ def _row_to_signal_summary(signal_row: pd.Series) -> Dict[str, Any]:
         },
         "reasonItems": reason_items,
         "reasonSummary": reason_items[0],
-        "signalChat": _build_signal_chat(signal_row, reason_items),
+        "signalChat": _build_signal_chat(signal_row, reason_items, signal_name=signal_name),
         "chartContext": {
             "breakoutUp20": _safe_float(signal_row, "breakout_up_20"),
             "breakoutDown20": _safe_float(signal_row, "breakout_down_20"),
@@ -298,6 +358,20 @@ def _row_to_signal_summary(signal_row: pd.Series) -> Dict[str, Any]:
             "cmcPercentChange30d": _safe_float(signal_row, "cmc_percent_change_30d"),
             "cmcContextAvailable": int(_safe_float(signal_row, "cmc_context_available")),
             "themeTags": _collect_theme_tags(signal_row),
+        },
+        "marketState": {
+            "label": str(signal_row.get("market_regime_label", "unknown")),
+            "code": int(_safe_float(signal_row, "market_regime_code")),
+            "trendScore": _safe_float(signal_row, "regime_trend_score"),
+            "volatilityRatio": _safe_float(signal_row, "regime_volatility_ratio", default_value=1.0),
+            "isTrending": bool(_safe_float(signal_row, "regime_is_trending")),
+            "isHighVolatility": bool(_safe_float(signal_row, "regime_is_high_volatility")),
+        },
+        "eventContext": {
+            "eventCountNext7d": int(_safe_float(signal_row, "cmcal_event_count_next_7d")),
+            "eventCountNext30d": int(_safe_float(signal_row, "cmcal_event_count_next_30d")),
+            "hasEventNext7d": bool(_safe_float(signal_row, "cmcal_has_event_next_7d")),
+            "daysToNextEvent": _safe_float(signal_row, "cmcal_days_to_next_event"),
         },
     }
 
@@ -322,7 +396,10 @@ def _row_to_signal_summary(signal_row: pd.Series) -> Dict[str, Any]:
     return summary
 
 
-def build_latest_signal_summary(prediction_df: pd.DataFrame) -> Dict[str, Any]:
+def build_latest_signal_summary(
+    prediction_df: pd.DataFrame,
+    minimum_action_confidence: float = 0.0,
+) -> Dict[str, Any]:
     """
     Convert the newest prediction row into a compact JSON-friendly summary.
 
@@ -335,10 +412,16 @@ def build_latest_signal_summary(prediction_df: pd.DataFrame) -> Dict[str, Any]:
 
     latest_row = prediction_df.iloc[-1]
 
-    return _row_to_signal_summary(latest_row)
+    return _row_to_signal_summary(
+        signal_row=latest_row,
+        minimum_action_confidence=minimum_action_confidence,
+    )
 
 
-def build_latest_signal_summaries(prediction_df: pd.DataFrame) -> List[Dict[str, Any]]:
+def build_latest_signal_summaries(
+    prediction_df: pd.DataFrame,
+    minimum_action_confidence: float = 0.0,
+) -> List[Dict[str, Any]]:
     """
     Build the newest available signal for each asset in the prediction table.
 
@@ -351,7 +434,12 @@ def build_latest_signal_summaries(prediction_df: pd.DataFrame) -> List[Dict[str,
         raise ValueError("No prediction rows were available. Check your feature generation step.")
 
     if "product_id" not in prediction_df.columns:
-        return [build_latest_signal_summary(prediction_df)]
+        return [
+            build_latest_signal_summary(
+                prediction_df=prediction_df,
+                minimum_action_confidence=minimum_action_confidence,
+            )
+        ]
 
     latest_rows = (
         prediction_df
@@ -360,18 +448,23 @@ def build_latest_signal_summaries(prediction_df: pd.DataFrame) -> List[Dict[str,
         .tail(1)
         .copy()
     )
-    latest_rows["signal_priority"] = latest_rows["predicted_name"].map(ACTION_PRIORITY).fillna(99)
-    latest_rows["setup_score"] = latest_rows.apply(_calculate_setup_score, axis=1)
-    latest_rows = (
-        latest_rows
-        .sort_values(
-            ["signal_priority", "setup_score", "confidence", "product_id"],
-            ascending=[True, False, False, True],
+    signal_summaries = [
+        _row_to_signal_summary(
+            signal_row=signal_row,
+            minimum_action_confidence=minimum_action_confidence,
         )
-        .reset_index(drop=True)
-    )
+        for _, signal_row in latest_rows.iterrows()
+    ]
 
-    return [_row_to_signal_summary(signal_row) for _, signal_row in latest_rows.iterrows()]
+    return sorted(
+        signal_summaries,
+        key=lambda signal_summary: (
+            ACTION_PRIORITY.get(signal_summary.get("signal_name", "HOLD"), 99),
+            -float(signal_summary.get("setupScore", 0.0)),
+            -float(signal_summary.get("confidence", 0.0)),
+            str(signal_summary.get("productId", "")),
+        ),
+    )
 
 
 def build_actionable_signal_summaries(signal_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

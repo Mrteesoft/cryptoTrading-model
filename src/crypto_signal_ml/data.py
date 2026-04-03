@@ -2,17 +2,20 @@
 
 from abc import ABC, abstractmethod
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+import numpy as np
+
+from .config import TrainingConfig
 
 
 REQUIRED_PRICE_COLUMNS = ["open", "high", "low", "close", "volume"]
@@ -180,6 +183,38 @@ class EnrichedCsvPriceDataLoader(CsvPriceDataLoader):
         """Load the CSV and then attach all configured enrichment sources."""
 
         price_df = super().load()
+        for enricher in self.enrichers:
+            price_df = enricher.enrich(price_df)
+        return price_df
+
+
+class EnrichedPriceDataLoader(BasePriceDataLoader):
+    """
+    Wrap any base loader with one or more enrichment passes.
+
+    The existing `EnrichedCsvPriceDataLoader` only handled CSV sources.
+    Live inference now needs the same enrichment behavior when the base
+    candles come directly from an API loader instead of a saved CSV.
+    """
+
+    def __init__(
+        self,
+        base_loader: BasePriceDataLoader,
+        enrichers: Sequence[BasePriceDataEnricher] = None,
+    ) -> None:
+        super().__init__(base_loader.data_path)
+        self.base_loader = base_loader
+        self.enrichers = tuple(enrichers or ())
+
+    def _read_data(self) -> pd.DataFrame:
+        """Delegate raw reading to the wrapped base loader."""
+
+        return self.base_loader.load()
+
+    def load(self) -> pd.DataFrame:
+        """Load the wrapped source and attach every configured enricher."""
+
+        price_df = self.base_loader.load()
         for enricher in self.enrichers:
             price_df = enricher.enrich(price_df)
         return price_df
@@ -835,6 +870,948 @@ class CoinMarketCapContextEnricher(BasePriceDataEnricher):
             print(message)
 
 
+class CoinMarketCalEventEnricher(BasePriceDataEnricher):
+    """
+    Attach cached upcoming-event context from CoinMarketCal to candle rows.
+
+    The first objective here is pipeline support:
+    - load a saved event cache when it exists
+    - optionally refresh that cache from the API
+    - derive row-level event proximity columns without making them mandatory
+
+    Event-derived columns are intentionally not part of the core ML feature set
+    yet because leakage control depends on event announcement timestamps.
+    """
+
+    events_endpoint = "/events"
+
+    def __init__(
+        self,
+        events_path: Path,
+        api_base_url: str,
+        api_key_env_var: str,
+        lookahead_days: int = 30,
+        request_pause_seconds: float = 0.2,
+        should_refresh_events: bool = False,
+        log_progress: bool = True,
+    ) -> None:
+        self.events_path = events_path
+        self.api_base_url = api_base_url.rstrip("/")
+        self.api_key_env_var = api_key_env_var
+        self.lookahead_days = max(int(lookahead_days), 1)
+        self.request_pause_seconds = request_pause_seconds
+        self.should_refresh_events = should_refresh_events
+        self.log_progress = log_progress
+        self.last_events_summary: Dict[str, object] = {}
+
+    @property
+    def api_key(self) -> str:
+        """Read the API key lazily from the configured environment variable."""
+
+        return os.getenv(self.api_key_env_var, "")
+
+    def enrich(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Attach upcoming-event proximity columns to the current price table."""
+
+        price_with_keys = price_df.copy()
+        if "base_currency" not in price_with_keys.columns and "product_id" in price_with_keys.columns:
+            price_with_keys["base_currency"] = (
+                price_with_keys["product_id"].astype(str).str.split("-").str[0]
+            )
+
+        event_df = self._load_or_refresh_events(price_with_keys)
+        if event_df.empty:
+            return self._attach_default_event_columns(price_with_keys)
+
+        return self._merge_event_features(price_with_keys, event_df)
+
+    def refresh_events(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Fetch a fresh event snapshot and save it to the configured cache file."""
+
+        if not self.api_key:
+            raise ValueError(
+                "CoinMarketCal event refresh requires an API key in the "
+                f"`{self.api_key_env_var}` environment variable."
+            )
+
+        symbol_frame = self._build_symbol_frame(price_df)
+        if symbol_frame.empty:
+            return pd.DataFrame()
+
+        event_rows = self._request_event_rows(symbol_frame["base_currency"].tolist())
+        events_df = pd.DataFrame(event_rows)
+        if events_df.empty:
+            return pd.DataFrame()
+
+        events_df["base_currency"] = events_df["base_currency"].astype(str).str.upper()
+        events_df["event_start"] = pd.to_datetime(events_df["event_start"], errors="coerce", utc=True)
+        events_df = events_df.dropna(subset=["base_currency", "event_start"]).sort_values(
+            ["base_currency", "event_start", "event_id"]
+        ).reset_index(drop=True)
+
+        existing_row_count = 0
+        final_events_df = events_df.copy()
+
+        if self.events_path.exists():
+            existing_events_df = pd.read_csv(self.events_path)
+            if not existing_events_df.empty:
+                existing_events_df["event_start"] = pd.to_datetime(
+                    existing_events_df["event_start"],
+                    errors="coerce",
+                    utc=True,
+                )
+                existing_row_count = len(existing_events_df)
+                final_events_df = pd.concat([existing_events_df, events_df], ignore_index=True)
+                final_events_df = final_events_df.drop_duplicates(
+                    subset=["base_currency", "event_start", "event_title"],
+                    keep="last",
+                ).sort_values(["base_currency", "event_start", "event_id"]).reset_index(drop=True)
+
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        final_events_df.to_csv(self.events_path, index=False)
+        self.last_events_summary = {
+            "eventsPath": str(self.events_path),
+            "coinsRequested": int(len(symbol_frame)),
+            "rowsSaved": int(len(events_df)),
+            "existingRowsMerged": existing_row_count,
+            "finalRowsSaved": int(len(final_events_df)),
+        }
+        self._log_progress(
+            "Saved CoinMarketCal events snapshot "
+            f"with {len(final_events_df)} total rows to {self.events_path}"
+        )
+
+        return final_events_df
+
+    def _load_or_refresh_events(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Load a cached event snapshot or refresh it when allowed."""
+
+        if self.should_refresh_events and self.api_key:
+            return self.refresh_events(price_df)
+
+        if self.events_path.exists():
+            return pd.read_csv(self.events_path)
+
+        if self.api_key:
+            return self.refresh_events(price_df)
+
+        self._log_progress(
+            "CoinMarketCal events skipped because no cached snapshot was found "
+            f"and `{self.api_key_env_var}` is not set."
+        )
+        return pd.DataFrame()
+
+    def _build_symbol_frame(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Build the unique list of assets that need event context."""
+
+        symbol_df = price_df.copy()
+        if "base_currency" not in symbol_df.columns and "product_id" in symbol_df.columns:
+            symbol_df["base_currency"] = symbol_df["product_id"].astype(str).str.split("-").str[0]
+
+        symbol_df = symbol_df[["base_currency"]].dropna().drop_duplicates().reset_index(drop=True)
+        symbol_df["base_currency"] = symbol_df["base_currency"].astype(str).str.upper()
+        return symbol_df.sort_values("base_currency").reset_index(drop=True)
+
+    def _request_event_rows(self, base_currencies: Sequence[str]) -> List[Dict[str, object]]:
+        """
+        Request upcoming events for the current asset set.
+
+        The API contract is intentionally parsed defensively because CoinMarketCal
+        payloads can vary by plan and endpoint version.
+        """
+
+        request_symbols = self._normalize_unique_values(base_currencies, uppercase=True)
+        if not request_symbols:
+            return []
+
+        response_payload = self._request_json(
+            endpoint_path=self.events_endpoint,
+            query_params={
+                "symbols": ",".join(request_symbols),
+                "max": 1000,
+            },
+        )
+        raw_events = self._extract_event_payload(response_payload)
+        normalized_rows: List[Dict[str, object]] = []
+
+        for raw_event in raw_events:
+            normalized_rows.extend(self._normalize_event_row(raw_event))
+
+        return normalized_rows
+
+    def _extract_event_payload(self, response_payload: Dict[str, object]) -> List[Dict[str, object]]:
+        """Normalize list-style CoinMarketCal responses into dictionaries."""
+
+        for payload_key in ("body", "data", "events"):
+            raw_rows = response_payload.get(payload_key, [])
+            if isinstance(raw_rows, list):
+                return [row for row in raw_rows if isinstance(row, dict)]
+
+        return []
+
+    def _normalize_event_row(self, raw_event: Dict[str, object]) -> List[Dict[str, object]]:
+        """Convert one raw event payload into one or more asset-linked rows."""
+
+        event_id = raw_event.get("id") or raw_event.get("event_id") or ""
+        event_title = raw_event.get("title") or raw_event.get("name") or ""
+        event_category = raw_event.get("category") or raw_event.get("type") or ""
+        event_start = (
+            raw_event.get("date_event")
+            or raw_event.get("event_date")
+            or raw_event.get("start_date")
+            or raw_event.get("created_date")
+            or raw_event.get("date")
+        )
+
+        coin_rows = raw_event.get("coins") or raw_event.get("currencies") or []
+        if isinstance(coin_rows, dict):
+            coin_rows = [coin_rows]
+
+        normalized_rows: List[Dict[str, object]] = []
+        for coin_row in coin_rows:
+            if not isinstance(coin_row, dict):
+                continue
+
+            base_currency = (
+                coin_row.get("symbol")
+                or coin_row.get("code")
+                or coin_row.get("short")
+                or ""
+            )
+            base_currency = str(base_currency).strip().upper()
+            if not base_currency:
+                continue
+
+            normalized_rows.append(
+                {
+                    "event_id": str(event_id),
+                    "event_title": str(event_title),
+                    "event_category": str(event_category),
+                    "event_start": event_start,
+                    "base_currency": base_currency,
+                }
+            )
+
+        return normalized_rows
+
+    def _merge_event_features(
+        self,
+        price_df: pd.DataFrame,
+        event_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Derive simple upcoming-event proximity columns for each candle row."""
+
+        output_df = self._attach_default_event_columns(price_df)
+        output_df["timestamp"] = pd.to_datetime(output_df["timestamp"], errors="coerce", utc=True)
+
+        working_event_df = event_df.copy()
+        working_event_df["base_currency"] = working_event_df["base_currency"].astype(str).str.upper()
+        working_event_df["event_start"] = pd.to_datetime(working_event_df["event_start"], errors="coerce", utc=True)
+        working_event_df = working_event_df.dropna(subset=["base_currency", "event_start"])
+
+        seven_day_ns = int(pd.Timedelta(days=7).value)
+        thirty_day_ns = int(pd.Timedelta(days=30).value)
+        hour_ns = float(pd.Timedelta(hours=1).value)
+
+        for base_currency, row_index in output_df.groupby("base_currency", sort=False).groups.items():
+            asset_event_df = working_event_df.loc[
+                working_event_df["base_currency"] == str(base_currency).upper()
+            ].sort_values("event_start")
+            if asset_event_df.empty:
+                continue
+
+            row_positions = list(row_index)
+            event_start_ns = pd.to_datetime(
+                asset_event_df["event_start"],
+                errors="coerce",
+                utc=True,
+            ).to_numpy(dtype="datetime64[ns]").astype("int64")
+            row_timestamp_ns = pd.to_datetime(
+                output_df.loc[row_positions, "timestamp"],
+                errors="coerce",
+                utc=True,
+            ).to_numpy(dtype="datetime64[ns]").astype("int64")
+            delta_ns = event_start_ns[np.newaxis, :] - row_timestamp_ns[:, np.newaxis]
+            future_mask = delta_ns >= 0
+
+            event_count_next_7d = np.sum(
+                future_mask & (delta_ns <= seven_day_ns),
+                axis=1,
+            )
+            event_count_next_30d = np.sum(
+                future_mask & (delta_ns <= thirty_day_ns),
+                axis=1,
+            )
+            next_delta_ns = np.where(
+                future_mask,
+                delta_ns,
+                np.iinfo(np.int64).max,
+            )
+            next_event_exists = future_mask.any(axis=1)
+            hours_to_next_event = np.where(
+                next_event_exists,
+                next_delta_ns.min(axis=1) / hour_ns,
+                np.nan,
+            )
+
+            output_df.loc[row_positions, "cmcal_event_count_next_7d"] = event_count_next_7d
+            output_df.loc[row_positions, "cmcal_event_count_next_30d"] = event_count_next_30d
+            output_df.loc[row_positions, "cmcal_has_event_next_7d"] = (event_count_next_7d > 0).astype(float)
+            output_df.loc[row_positions, "cmcal_hours_to_next_event"] = hours_to_next_event
+            output_df.loc[row_positions, "cmcal_days_to_next_event"] = hours_to_next_event / 24.0
+
+        return output_df
+
+    def _attach_default_event_columns(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Return the input table with zero-filled event context columns."""
+
+        output_df = price_df.copy()
+        for column_name, default_value in {
+            "cmcal_event_count_next_7d": 0.0,
+            "cmcal_event_count_next_30d": 0.0,
+            "cmcal_has_event_next_7d": 0.0,
+            "cmcal_hours_to_next_event": np.nan,
+            "cmcal_days_to_next_event": np.nan,
+        }.items():
+            if column_name not in output_df.columns:
+                output_df[column_name] = default_value
+
+        return output_df
+
+    def _normalize_unique_values(
+        self,
+        values: Sequence[object],
+        uppercase: bool = False,
+    ) -> List[str]:
+        """Clean a sequence into unique string values while preserving order."""
+
+        normalized_values: List[str] = []
+        seen_values = set()
+
+        for value in values:
+            text_value = str(value).strip()
+            if not text_value:
+                continue
+
+            if uppercase:
+                text_value = text_value.upper()
+
+            if text_value in seen_values:
+                continue
+
+            seen_values.add(text_value)
+            normalized_values.append(text_value)
+
+        return normalized_values
+
+    def _request_json(
+        self,
+        endpoint_path: str,
+        query_params: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Send one CoinMarketCal request and decode the JSON payload."""
+
+        request_url = self.api_base_url + endpoint_path
+        if query_params:
+            request_url += "?" + urlencode(query_params, doseq=True)
+
+        request = Request(
+            request_url,
+            headers={
+                "Accept": "application/json",
+                "x-api-key": self.api_key,
+                "User-Agent": "crypto-signal-ml/0.1",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            error_body = ""
+            try:
+                error_body = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_body = ""
+
+            query_summary = urlencode(query_params, doseq=True)[:200]
+            body_summary = error_body.strip().replace("\n", " ")[:300]
+            message = (
+                "CoinMarketCal request failed "
+                f"with status {error.code} for {endpoint_path}. "
+                f"Query: {query_summary or '<none>'}."
+            )
+            if body_summary:
+                message += f" Response: {body_summary}"
+            raise ValueError(message) from error
+        except URLError as error:
+            raise ValueError(
+                "CoinMarketCal request failed "
+                f"for {endpoint_path}. Reason: {error.reason}"
+            ) from error
+
+        if self.request_pause_seconds > 0:
+            time.sleep(self.request_pause_seconds)
+
+        if not isinstance(response_payload, dict):
+            raise ValueError(
+                "Unexpected response received from CoinMarketCal. "
+                f"Response type: {type(response_payload)}"
+            )
+
+        return response_payload
+
+    def _log_progress(self, message: str) -> None:
+        """Print event-enrichment progress when verbose mode is enabled."""
+
+        if self.log_progress:
+            print(message)
+
+
+class CoinMarketCapOhlcvPriceDataLoader(BaseApiPriceDataLoader):
+    """
+    Download historical OHLCV candles from the CoinMarketCap API.
+
+    This loader is meant to replace Coinbase as the primary backend price
+    source for the model, while still keeping the rest of the project's
+    expectations unchanged:
+    - one combined OHLCV table
+    - multi-asset support
+    - batch-aware refreshes
+    - the same saved CSV schema used by training and live inference
+    """
+
+    api_name = "coinmarketcap"
+    valid_granularities = {3600, 86400}
+
+    def __init__(
+        self,
+        data_path: Path,
+        api_base_url: str,
+        api_key_env_var: str,
+        quote_currency: str,
+        granularity_seconds: int,
+        total_candles: int,
+        request_pause_seconds: float = 0.2,
+        should_save_downloaded_data: bool = True,
+        product_id: Optional[str] = None,
+        product_ids: Sequence[str] = None,
+        fetch_all_quote_products: bool = False,
+        excluded_base_currencies: Sequence[str] = None,
+        max_products: Optional[int] = None,
+        product_batch_size: Optional[int] = None,
+        product_batch_number: int = 1,
+        save_progress_every_products: int = 5,
+        log_progress: bool = True,
+        historical_endpoint: str = "/v2/cryptocurrency/ohlcv/historical",
+        map_endpoint: str = "/v1/cryptocurrency/map",
+    ) -> None:
+        super().__init__(data_path=data_path, should_save_downloaded_data=should_save_downloaded_data)
+        self.api_base_url = api_base_url.rstrip("/")
+        self.api_key_env_var = api_key_env_var
+        self.quote_currency = quote_currency
+        self.granularity_seconds = granularity_seconds
+        self.total_candles = total_candles
+        self.request_pause_seconds = request_pause_seconds
+        self.product_id = product_id
+        self.product_ids = tuple(product_ids or ())
+        self.fetch_all_quote_products = fetch_all_quote_products
+        self.excluded_base_currencies = tuple(excluded_base_currencies or ())
+        self.max_products = max_products
+        self.product_batch_size = product_batch_size
+        self.product_batch_number = product_batch_number
+        self.save_progress_every_products = save_progress_every_products
+        self.log_progress = log_progress
+        self.historical_endpoint = historical_endpoint
+        self.map_endpoint = map_endpoint
+
+    @property
+    def api_key(self) -> str:
+        """Read the API key lazily from the configured environment variable."""
+
+        return os.getenv(self.api_key_env_var, "")
+
+    def _read_data(self) -> pd.DataFrame:
+        """Download fresh candles from CoinMarketCap and normalize them."""
+
+        self._validate_download_settings()
+
+        available_products = self._resolve_products_to_download()
+        selected_products, batch_summary = self._slice_products_for_batch(available_products)
+        all_candle_rows: List[Dict[str, object]] = []
+
+        self._log_progress(
+            "Starting CoinMarketCap market refresh: "
+            f"{len(selected_products)} products in this batch, "
+            f"{self.total_candles} candles per product."
+        )
+
+        for product_index, product_details in enumerate(selected_products):
+            self._log_progress(
+                f"[{product_index + 1}/{len(selected_products)}] "
+                f"Downloading {product_details['product_id']}"
+            )
+            candle_rows = self._request_historical_ohlcv_rows(
+                base_currency=product_details["base_currency"],
+            )
+            normalized_rows = self._normalize_candle_rows(
+                product_id=product_details["product_id"],
+                base_currency=product_details["base_currency"],
+                quote_currency=product_details["quote_currency"],
+                candle_rows=candle_rows,
+            )
+            all_candle_rows.extend(normalized_rows)
+            self._maybe_save_partial_progress(
+                all_candle_rows=all_candle_rows,
+                completed_products=product_index + 1,
+            )
+
+        if not all_candle_rows:
+            raise ValueError("The CoinMarketCap API returned no candle data for the selected products.")
+
+        price_df = self._build_price_frame(all_candle_rows)
+        self.last_refresh_summary = {
+            "totalAvailableProducts": len(available_products),
+            "productsDownloaded": len(selected_products),
+            "requestWindowsPerProduct": 1,
+            "batchSize": batch_summary["batchSize"],
+            "batchNumber": batch_summary["batchNumber"],
+            "batchStartIndex": batch_summary["batchStartIndex"],
+            "batchEndIndex": batch_summary["batchEndIndex"],
+            "partialSavePath": str(self.partial_data_path),
+            "rowsDownloaded": len(price_df),
+        }
+        self._log_progress(
+            f"Completed CoinMarketCap refresh batch with {len(price_df)} rows "
+            f"across {len(selected_products)} products."
+        )
+        return price_df
+
+    def _save_downloaded_data(self, price_df: pd.DataFrame) -> None:
+        """Save the downloaded batch, merging with the existing market file when needed."""
+
+        final_df = price_df.copy()
+        final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+        existing_row_count = 0
+
+        if self.product_batch_size is not None and self.data_path.exists():
+            existing_df = pd.read_csv(self.data_path)
+            existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
+            existing_row_count = len(existing_df)
+            final_df = pd.concat([existing_df, price_df], ignore_index=True)
+            final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+            final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")
+            final_df = self._sort_rows(final_df)
+
+        super()._save_downloaded_data(final_df)
+        self.last_refresh_summary["existingRowsMerged"] = existing_row_count
+        self.last_refresh_summary["finalRowsSaved"] = len(final_df)
+
+    def _validate_download_settings(self) -> None:
+        """Validate the requested market-data settings before hitting the API."""
+
+        if not self.api_key:
+            raise ValueError(
+                "CoinMarketCap market refresh requires an API key in the "
+                f"`{self.api_key_env_var}` environment variable."
+            )
+
+        if self.granularity_seconds not in self.valid_granularities:
+            raise ValueError(
+                "coinmarketcap_granularity_seconds must be one of "
+                f"{sorted(self.valid_granularities)}."
+            )
+
+        if self.total_candles <= 0:
+            raise ValueError("coinmarketcap_total_candles must be greater than zero.")
+
+        if self.product_batch_size is not None and self.product_batch_size <= 0:
+            raise ValueError("coinmarketcap_product_batch_size must be greater than zero when provided.")
+
+        if self.product_batch_number <= 0:
+            raise ValueError("coinmarketcap_product_batch_number must be greater than zero.")
+
+        if self.save_progress_every_products < 0:
+            raise ValueError("coinmarketcap_save_progress_every_products cannot be negative.")
+
+    def _resolve_products_to_download(self) -> List[Dict[str, str]]:
+        """Decide which assets belong in the CoinMarketCap download universe."""
+
+        if self.fetch_all_quote_products:
+            return self._fetch_filtered_products()
+
+        explicit_product_ids = list(self.product_ids)
+        if self.product_id:
+            explicit_product_ids.append(self.product_id)
+
+        if not explicit_product_ids:
+            raise ValueError("No CoinMarketCap products were provided for download.")
+
+        return [
+            {
+                "product_id": product_id,
+                "base_currency": product_id.split("-")[0].upper(),
+                "quote_currency": product_id.split("-")[1].upper() if "-" in product_id else self.quote_currency.upper(),
+            }
+            for product_id in explicit_product_ids
+        ]
+
+    def _fetch_filtered_products(self) -> List[Dict[str, str]]:
+        """Fetch the CoinMarketCap asset catalog and keep the desired universe."""
+
+        response_payload = self._request_json(
+            endpoint_path=self.map_endpoint,
+            query_params={
+                "listing_status": "active",
+            },
+        )
+        raw_rows = response_payload.get("data", []) if isinstance(response_payload, dict) else []
+        if not isinstance(raw_rows, list):
+            raise ValueError(
+                "Unexpected response received from CoinMarketCap map endpoint. "
+                f"Response type: {type(raw_rows)}"
+            )
+
+        excluded_bases = {currency.upper() for currency in self.excluded_base_currencies}
+        best_row_by_symbol: Dict[str, Dict[str, object]] = {}
+
+        for raw_row in raw_rows:
+            if not isinstance(raw_row, dict):
+                continue
+
+            base_currency = str(raw_row.get("symbol", "")).strip().upper()
+            if not base_currency:
+                continue
+            if base_currency in excluded_bases:
+                continue
+
+            current_row = best_row_by_symbol.get(base_currency)
+            if current_row is None:
+                best_row_by_symbol[base_currency] = raw_row
+                continue
+
+            if int(raw_row.get("rank") or 10**9) < int(current_row.get("rank") or 10**9):
+                best_row_by_symbol[base_currency] = raw_row
+
+        filtered_products = [
+            {
+                "product_id": f"{base_currency}-{self.quote_currency.upper()}",
+                "base_currency": base_currency,
+                "quote_currency": self.quote_currency.upper(),
+            }
+            for base_currency in sorted(best_row_by_symbol.keys())
+        ]
+
+        if self.max_products is not None:
+            filtered_products = filtered_products[: self.max_products]
+
+        if not filtered_products:
+            raise ValueError("No CoinMarketCap assets matched the configured multi-coin filters.")
+
+        return filtered_products
+
+    def get_available_products(self) -> List[Dict[str, str]]:
+        """Return the filtered asset universe for the current loader settings."""
+
+        self._validate_download_settings()
+        return self._resolve_products_to_download()
+
+    def get_total_batches(self) -> int:
+        """Return how many product batches are needed for the current universe."""
+
+        available_products = self.get_available_products()
+        if self.product_batch_size is None:
+            return 1
+
+        return max(1, math.ceil(len(available_products) / self.product_batch_size))
+
+    def _slice_products_for_batch(
+        self,
+        selected_products: List[Dict[str, str]],
+    ) -> tuple[List[Dict[str, str]], Dict[str, int]]:
+        """Limit a large asset universe to one configured batch."""
+
+        if self.product_batch_size is None:
+            batch_summary = {
+                "batchSize": len(selected_products),
+                "batchNumber": 1,
+                "batchStartIndex": 1,
+                "batchEndIndex": len(selected_products),
+            }
+            return selected_products, batch_summary
+
+        total_products = len(selected_products)
+        total_batches = max(1, math.ceil(total_products / self.product_batch_size))
+
+        if self.product_batch_number > total_batches:
+            raise ValueError(
+                "Requested CoinMarketCap product batch is out of range. "
+                f"Requested batch {self.product_batch_number}, available batches {total_batches}."
+            )
+
+        batch_start_index = (self.product_batch_number - 1) * self.product_batch_size
+        batch_end_index = min(batch_start_index + self.product_batch_size, total_products)
+        batch_products = selected_products[batch_start_index:batch_end_index]
+
+        batch_summary = {
+            "batchSize": len(batch_products),
+            "batchNumber": self.product_batch_number,
+            "batchStartIndex": batch_start_index + 1,
+            "batchEndIndex": batch_end_index,
+        }
+
+        self._log_progress(
+            "Using CoinMarketCap product batch "
+            f"{self.product_batch_number}/{total_batches}: "
+            f"products {batch_summary['batchStartIndex']} to {batch_summary['batchEndIndex']}."
+        )
+
+        return batch_products, batch_summary
+
+    def _maybe_save_partial_progress(
+        self,
+        all_candle_rows: Sequence[Dict[str, object]],
+        completed_products: int,
+    ) -> None:
+        """Save a partial CSV snapshot during a long-running market refresh."""
+
+        if not self.should_save_downloaded_data:
+            return
+
+        if self.save_progress_every_products == 0:
+            return
+
+        if completed_products % self.save_progress_every_products != 0:
+            return
+
+        partial_df = self._build_price_frame(all_candle_rows)
+        self._save_partial_download(partial_df)
+        self._log_progress(
+            f"Saved partial market data after {completed_products} products "
+            f"to {self.partial_data_path}"
+        )
+
+    def _request_historical_ohlcv_rows(
+        self,
+        base_currency: str,
+    ) -> List[Dict[str, object]]:
+        """Request one historical OHLCV series and extract the nested quote rows."""
+
+        response_payload = self._request_json(
+            endpoint_path=self.historical_endpoint,
+            query_params={
+                "symbol": base_currency,
+                "convert": self.quote_currency,
+                "count": self.total_candles,
+                "interval": self._resolve_interval_alias(),
+                "time_period": self._resolve_interval_alias(),
+            },
+        )
+        return self._extract_historical_quote_rows(response_payload, base_currency=base_currency)
+
+    def _extract_historical_quote_rows(
+        self,
+        response_payload: Dict[str, object],
+        base_currency: str,
+    ) -> List[Dict[str, object]]:
+        """Extract one flat list of OHLCV quote rows from a CoinMarketCap payload."""
+
+        raw_data = response_payload.get("data", {}) if isinstance(response_payload, dict) else {}
+        candidate_assets: List[Dict[str, object]] = []
+
+        if isinstance(raw_data, list):
+            candidate_assets.extend([row for row in raw_data if isinstance(row, dict)])
+        elif isinstance(raw_data, dict):
+            if any(key in raw_data for key in ("quotes", "quote", "symbol", "id")):
+                candidate_assets.append(raw_data)
+            else:
+                for asset_value in raw_data.values():
+                    if isinstance(asset_value, dict):
+                        candidate_assets.append(asset_value)
+                    elif isinstance(asset_value, list):
+                        candidate_assets.extend([row for row in asset_value if isinstance(row, dict)])
+
+        normalized_rows: List[Dict[str, object]] = []
+        for asset_payload in candidate_assets:
+            payload_symbol = str(asset_payload.get("symbol", base_currency)).strip().upper()
+            if payload_symbol and payload_symbol != str(base_currency).upper():
+                continue
+
+            quote_rows = self._extract_quote_rows_from_asset(asset_payload)
+            normalized_rows.extend(quote_rows)
+
+        return normalized_rows
+
+    def _extract_quote_rows_from_asset(self, asset_payload: Dict[str, object]) -> List[Dict[str, object]]:
+        """Extract flat historical quote rows from one asset payload."""
+
+        raw_quote_rows: Any = asset_payload.get("quotes")
+        if raw_quote_rows is None:
+            raw_quote_rows = asset_payload.get("quote")
+        if raw_quote_rows is None:
+            raw_quote_rows = asset_payload.get("ohlcv")
+        if raw_quote_rows is None:
+            raw_quote_rows = asset_payload.get("data")
+
+        if isinstance(raw_quote_rows, dict) and self.quote_currency in raw_quote_rows:
+            raw_quote_rows = [raw_quote_rows]
+        elif isinstance(raw_quote_rows, dict):
+            raw_quote_rows = [raw_quote_rows]
+
+        if not isinstance(raw_quote_rows, list):
+            return []
+
+        normalized_rows: List[Dict[str, object]] = []
+        for raw_quote_row in raw_quote_rows:
+            if not isinstance(raw_quote_row, dict):
+                continue
+
+            quote_details = raw_quote_row.get("quote", raw_quote_row)
+            if isinstance(quote_details, dict) and self.quote_currency in quote_details:
+                quote_details = quote_details[self.quote_currency]
+
+            if not isinstance(quote_details, dict):
+                continue
+
+            timestamp_value = (
+                raw_quote_row.get("time_close")
+                or raw_quote_row.get("timestamp")
+                or raw_quote_row.get("time_open")
+                or quote_details.get("timestamp")
+            )
+            parsed_timestamp = pd.to_datetime(timestamp_value, errors="coerce", utc=True)
+            if pd.isna(parsed_timestamp):
+                continue
+
+            if any(
+                quote_details.get(field_name) is None
+                for field_name in ("open", "high", "low", "close", "volume")
+            ):
+                continue
+
+            normalized_rows.append(
+                {
+                    "timestamp": parsed_timestamp,
+                    "open": quote_details["open"],
+                    "high": quote_details["high"],
+                    "low": quote_details["low"],
+                    "close": quote_details["close"],
+                    "volume": quote_details["volume"],
+                }
+            )
+
+        return normalized_rows
+
+    def _normalize_candle_rows(
+        self,
+        product_id: str,
+        base_currency: str,
+        quote_currency: str,
+        candle_rows: Sequence[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        """Convert flat CoinMarketCap quote rows into the project schema."""
+
+        normalized_rows = []
+
+        for candle_row in candle_rows:
+            normalized_rows.append(
+                {
+                    "timestamp": candle_row["timestamp"],
+                    "open": candle_row["open"],
+                    "high": candle_row["high"],
+                    "low": candle_row["low"],
+                    "close": candle_row["close"],
+                    "volume": candle_row["volume"],
+                    "product_id": product_id,
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "granularity_seconds": self.granularity_seconds,
+                    "source": self.api_name,
+                }
+            )
+
+        return normalized_rows
+
+    def _build_price_frame(self, normalized_rows: Sequence[Dict[str, object]]) -> pd.DataFrame:
+        """Normalize the full multi-asset candle set into the project's schema."""
+
+        price_df = pd.DataFrame(normalized_rows)
+        price_df = price_df.drop_duplicates(subset=["product_id", "timestamp"])
+        return price_df.sort_values(["timestamp", "product_id"]).reset_index(drop=True)
+
+    def _resolve_interval_alias(self) -> str:
+        """Map project granularity settings into CoinMarketCap interval aliases."""
+
+        if self.granularity_seconds == 3600:
+            return "hourly"
+
+        return "daily"
+
+    def _request_json(
+        self,
+        endpoint_path: str,
+        query_params: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Send one CoinMarketCap request and decode the JSON payload."""
+
+        request_url = self.api_base_url + endpoint_path
+        if query_params:
+            request_url += "?" + urlencode(query_params, doseq=True)
+
+        request = Request(
+            request_url,
+            headers={
+                "Accept": "application/json",
+                "Accepts": "application/json",
+                "X-CMC_PRO_API_KEY": self.api_key,
+                "User-Agent": "crypto-signal-ml/0.1",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            error_body = ""
+            try:
+                error_body = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_body = ""
+
+            query_summary = urlencode(query_params, doseq=True)[:200]
+            body_summary = error_body.strip().replace("\n", " ")[:300]
+            message = (
+                "CoinMarketCap request failed "
+                f"with status {error.code} for {endpoint_path}. "
+                f"Query: {query_summary or '<none>'}."
+            )
+            if body_summary:
+                message += f" Response: {body_summary}"
+            raise ValueError(message) from error
+        except URLError as error:
+            raise ValueError(
+                "CoinMarketCap request failed "
+                f"for {endpoint_path}. Reason: {error.reason}"
+            ) from error
+
+        if self.request_pause_seconds > 0:
+            time.sleep(self.request_pause_seconds)
+
+        if not isinstance(response_payload, dict):
+            raise ValueError(
+                "Unexpected response received from CoinMarketCap. "
+                f"Response type: {type(response_payload)}"
+            )
+
+        return response_payload
+
+    def _log_progress(self, message: str) -> None:
+        """Print refresh progress when verbose mode is enabled."""
+
+        if self.log_progress:
+            print(message)
+
+
 class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
     """
     Download public candle data from the Coinbase Exchange REST API.
@@ -1329,6 +2306,304 @@ class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
 
         if self.log_progress:
             print(message)
+
+
+def create_market_data_loader(
+    config: TrainingConfig,
+    data_path: Path | None = None,
+    should_save_downloaded_data: bool = True,
+    product_id: Optional[str] = None,
+    product_ids: Sequence[str] | None = None,
+    fetch_all_quote_products: Optional[bool] = None,
+    max_products: Optional[int] = None,
+    granularity_seconds: Optional[int] = None,
+    total_candles: Optional[int] = None,
+    request_pause_seconds: Optional[float] = None,
+    product_batch_size: Optional[int] = None,
+    product_batch_number: Optional[int] = None,
+    save_progress_every_products: Optional[int] = None,
+    log_progress: Optional[bool] = None,
+) -> BaseApiPriceDataLoader:
+    """Build the configured market-data loader for the requested source."""
+
+    market_data_source = str(config.market_data_source).strip()
+
+    if market_data_source == "coinmarketcap":
+        return CoinMarketCapOhlcvPriceDataLoader(
+            data_path=data_path or config.data_file,
+            api_base_url=config.coinmarketcap_api_base_url,
+            api_key_env_var=config.coinmarketcap_api_key_env_var,
+            quote_currency=config.coinmarketcap_quote_currency,
+            granularity_seconds=int(
+                granularity_seconds
+                if granularity_seconds is not None
+                else config.coinmarketcap_granularity_seconds
+            ),
+            total_candles=int(
+                total_candles
+                if total_candles is not None
+                else config.coinmarketcap_total_candles
+            ),
+            request_pause_seconds=(
+                request_pause_seconds
+                if request_pause_seconds is not None
+                else config.coinmarketcap_request_pause_seconds
+            ),
+            should_save_downloaded_data=should_save_downloaded_data,
+            product_id=product_id if product_id is not None else config.coinmarketcap_product_id,
+            product_ids=(
+                tuple(product_ids)
+                if product_ids is not None
+                else config.coinmarketcap_product_ids
+            ),
+            fetch_all_quote_products=(
+                fetch_all_quote_products
+                if fetch_all_quote_products is not None
+                else config.coinmarketcap_fetch_all_quote_products
+            ),
+            excluded_base_currencies=config.coinmarketcap_excluded_base_currencies,
+            max_products=max_products if max_products is not None else config.coinmarketcap_max_products,
+            product_batch_size=(
+                product_batch_size
+                if product_batch_size is not None
+                else config.coinmarketcap_product_batch_size
+            ),
+            product_batch_number=(
+                int(product_batch_number)
+                if product_batch_number is not None
+                else int(config.coinmarketcap_product_batch_number)
+            ),
+            save_progress_every_products=(
+                int(save_progress_every_products)
+                if save_progress_every_products is not None
+                else int(config.coinmarketcap_save_progress_every_products)
+            ),
+            log_progress=log_progress if log_progress is not None else config.coinmarketcap_log_progress,
+            historical_endpoint=config.coinmarketcap_ohlcv_historical_endpoint,
+            map_endpoint=config.coinmarketcap_map_endpoint,
+        )
+
+    if market_data_source == "coinbaseExchange":
+        return CoinbaseExchangePriceDataLoader(
+            data_path=data_path or config.data_file,
+            product_id=product_id if product_id is not None else config.coinbase_product_id,
+            product_ids=tuple(product_ids) if product_ids is not None else config.coinbase_product_ids,
+            fetch_all_quote_products=(
+                fetch_all_quote_products
+                if fetch_all_quote_products is not None
+                else config.coinbase_fetch_all_quote_products
+            ),
+            quote_currency=config.coinbase_quote_currency,
+            excluded_base_currencies=config.coinbase_excluded_base_currencies,
+            max_products=max_products if max_products is not None else config.coinbase_max_products,
+            product_batch_size=(
+                product_batch_size
+                if product_batch_size is not None
+                else config.coinbase_product_batch_size
+            ),
+            product_batch_number=(
+                int(product_batch_number)
+                if product_batch_number is not None
+                else int(config.coinbase_product_batch_number)
+            ),
+            granularity_seconds=int(
+                granularity_seconds
+                if granularity_seconds is not None
+                else config.coinbase_granularity_seconds
+            ),
+            total_candles=int(
+                total_candles
+                if total_candles is not None
+                else config.coinbase_total_candles
+            ),
+            request_pause_seconds=(
+                request_pause_seconds
+                if request_pause_seconds is not None
+                else config.coinbase_request_pause_seconds
+            ),
+            should_save_downloaded_data=should_save_downloaded_data,
+            save_progress_every_products=(
+                int(save_progress_every_products)
+                if save_progress_every_products is not None
+                else int(config.coinbase_save_progress_every_products)
+            ),
+            log_progress=log_progress if log_progress is not None else config.coinbase_log_progress,
+        )
+
+    raise ValueError(
+        "Unsupported market_data_source. "
+        "Currently supported: coinmarketcap, coinbaseExchange"
+    )
+
+
+def _normalize_timeframe_alias(timeframe: str) -> str:
+    """Normalize a timeframe alias into a compact lowercase key such as `4h` or `1d`."""
+
+    normalized_value = str(timeframe).strip().lower()
+    if not normalized_value:
+        raise ValueError("Timeframe aliases must not be empty.")
+
+    pandas_offset_input = normalized_value
+    if normalized_value.endswith("d"):
+        pandas_offset_input = normalized_value[:-1] + "D"
+
+    pandas_offset = pd.tseries.frequencies.to_offset(pandas_offset_input)
+    if pandas_offset.n <= 0:
+        raise ValueError(f"Unsupported timeframe alias: {timeframe}")
+
+    rule_code = str(pandas_offset.name).lower()
+    if rule_code.endswith("min"):
+        return f"{pandas_offset.n}min"
+
+    if rule_code.endswith("h"):
+        return f"{pandas_offset.n}h"
+
+    if rule_code.endswith("d"):
+        return f"{pandas_offset.n}d"
+
+    raise ValueError(
+        "Unsupported timeframe alias. Supported families are minutes, hours, and days. "
+        f"Received: {timeframe}"
+    )
+
+
+def _timeframe_alias_to_pandas_rule(timeframe: str) -> str:
+    """Convert a compact timeframe alias into a pandas resample rule."""
+
+    normalized_alias = _normalize_timeframe_alias(timeframe)
+    if normalized_alias.endswith("d"):
+        return normalized_alias[:-1] + "D"
+
+    return normalized_alias
+
+
+def _calculate_higher_timeframe_features(resampled_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a small higher-timeframe feature set before aligning it back to base rows."""
+
+    feature_df = resampled_df.copy()
+    feature_df["return_1"] = feature_df["close"].pct_change(1)
+    feature_df["range_pct"] = (feature_df["high"] - feature_df["low"]) / feature_df["close"].replace(0, pd.NA)
+    feature_df["volume_change_1"] = feature_df["volume"].pct_change(1)
+    feature_df["sma_3"] = feature_df["close"].rolling(window=3).mean()
+    feature_df["ema_3"] = feature_df["close"].ewm(span=3, adjust=False).mean()
+    feature_df["close_vs_sma_3"] = (feature_df["close"] / feature_df["sma_3"]) - 1
+    feature_df["close_vs_ema_3"] = (feature_df["close"] / feature_df["ema_3"]) - 1
+    feature_df["volatility_3"] = feature_df["return_1"].rolling(window=3).std()
+    return feature_df
+
+
+def align_multi_timeframe_context(
+    price_df: pd.DataFrame,
+    timeframes: Sequence[str],
+    base_granularity_seconds: int,
+) -> pd.DataFrame:
+    """
+    Align completed higher-timeframe bars back onto the base candle table.
+
+    The alignment uses candle close timestamps, not raw start timestamps, so a
+    base row only sees information from higher-timeframe candles that would
+    already be complete at that moment.
+    """
+
+    if not timeframes:
+        return price_df.copy()
+
+    if "timestamp" not in price_df.columns:
+        return price_df.copy()
+
+    aligned_df = price_df.copy()
+    aligned_df["timestamp"] = pd.to_datetime(aligned_df["timestamp"], errors="coerce", utc=True)
+    aligned_df = aligned_df.dropna(subset=["timestamp"]).reset_index(drop=True)
+
+    product_key_column = "product_id"
+    synthetic_product_key = "__GLOBAL__"
+    if product_key_column not in aligned_df.columns:
+        product_key_column = "__multi_timeframe_product_id"
+        aligned_df[product_key_column] = synthetic_product_key
+
+    base_granularity_seconds = max(int(base_granularity_seconds), 60)
+    base_delta = pd.to_timedelta(base_granularity_seconds, unit="s")
+    aligned_df["_base_close_timestamp"] = aligned_df["timestamp"] + base_delta
+    aligned_df = aligned_df.sort_values([product_key_column, "_base_close_timestamp"]).reset_index(drop=True)
+
+    aligned_output_df = aligned_df.copy()
+
+    for timeframe in timeframes:
+        normalized_alias = _normalize_timeframe_alias(timeframe)
+        resample_rule = _timeframe_alias_to_pandas_rule(normalized_alias)
+        aligned_frames: List[pd.DataFrame] = []
+
+        for product_id, asset_df in aligned_df.groupby(product_key_column, sort=False):
+            asset_base_df = asset_df.sort_values("_base_close_timestamp").reset_index(drop=True)
+            resampled_df = (
+                asset_base_df
+                .resample(
+                    resample_rule,
+                    on="_base_close_timestamp",
+                    label="right",
+                    closed="right",
+                )
+                .agg(
+                    open=("open", "first"),
+                    high=("high", "max"),
+                    low=("low", "min"),
+                    close=("close", "last"),
+                    volume=("volume", "sum"),
+                )
+                .dropna(subset=["open", "high", "low", "close", "volume"])
+                .reset_index()
+            )
+
+            if resampled_df.empty:
+                aligned_frames.append(asset_base_df.copy())
+                continue
+
+            resampled_feature_df = _calculate_higher_timeframe_features(resampled_df)
+            rename_map = {
+                "_base_close_timestamp": f"htf_{normalized_alias}_close_timestamp",
+                "close": f"htf_{normalized_alias}_close",
+                "return_1": f"htf_{normalized_alias}_return_1",
+                "range_pct": f"htf_{normalized_alias}_range_pct",
+                "volume_change_1": f"htf_{normalized_alias}_volume_change_1",
+                "close_vs_sma_3": f"htf_{normalized_alias}_close_vs_sma_3",
+                "close_vs_ema_3": f"htf_{normalized_alias}_close_vs_ema_3",
+                "volatility_3": f"htf_{normalized_alias}_volatility_3",
+            }
+            resampled_feature_df = resampled_feature_df.rename(columns=rename_map)
+            resampled_feature_df[product_key_column] = product_id
+
+            aligned_asset_df = pd.merge_asof(
+                asset_base_df,
+                resampled_feature_df[
+                    [
+                        product_key_column,
+                        f"htf_{normalized_alias}_close_timestamp",
+                        f"htf_{normalized_alias}_close",
+                        f"htf_{normalized_alias}_return_1",
+                        f"htf_{normalized_alias}_range_pct",
+                        f"htf_{normalized_alias}_volume_change_1",
+                        f"htf_{normalized_alias}_close_vs_sma_3",
+                        f"htf_{normalized_alias}_close_vs_ema_3",
+                        f"htf_{normalized_alias}_volatility_3",
+                    ]
+                ],
+                left_on="_base_close_timestamp",
+                right_on=f"htf_{normalized_alias}_close_timestamp",
+                by=product_key_column,
+                direction="backward",
+                allow_exact_matches=True,
+            )
+            aligned_frames.append(aligned_asset_df)
+
+        aligned_output_df = pd.concat(aligned_frames, ignore_index=True)
+        aligned_output_df = aligned_output_df.sort_values(
+            [product_key_column, "_base_close_timestamp"]
+        ).reset_index(drop=True)
+
+    if "__multi_timeframe_product_id" in aligned_output_df.columns:
+        aligned_output_df = aligned_output_df.drop(columns=["__multi_timeframe_product_id"])
+
+    return aligned_output_df.drop(columns=["_base_close_timestamp"])
 
 
 def load_price_data(csv_path: Path) -> pd.DataFrame:

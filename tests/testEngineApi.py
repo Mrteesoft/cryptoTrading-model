@@ -19,13 +19,17 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
+from crypto_signal_ml.api import create_signal_api  # noqa: E402
 from crypto_signal_ml.engine_api import create_app  # noqa: E402
 from crypto_signal_ml.frontend import build_frontend_signal_snapshot  # noqa: E402
 from crypto_signal_ml.modeling import RandomForestSignalModel  # noqa: E402
 from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
 
 
-def _build_trained_model(model_path: Path) -> None:
+def _build_trained_model(
+    model_path: Path,
+    config: TrainingConfig | None = None,
+) -> None:
     """Train and save a tiny model artifact for engine endpoint tests."""
 
     feature_columns = ["return_1", "momentum_3"]
@@ -41,7 +45,7 @@ def _build_trained_model(model_path: Path) -> None:
     )
 
     model = RandomForestSignalModel(
-        config=TrainingConfig(
+        config=config or TrainingConfig(
             coinmarketcap_use_context=False,
             n_estimators=12,
             max_depth=3,
@@ -51,6 +55,40 @@ def _build_trained_model(model_path: Path) -> None:
     )
     model.fit(training_df)
     model.save(model_path)
+
+
+def _build_chart_history_frame() -> pd.DataFrame:
+    """Create a small hourly OHLCV set for chart and quote endpoint tests."""
+
+    rows = []
+    market_start = pd.Timestamp("2026-03-01T00:00:00Z")
+    market_specs = [
+        ("BTC-USD", "BTC", 62000.0, 250.0, 1100.0),
+        ("ETH-USD", "ETH", 3200.0, 18.0, 2100.0),
+    ]
+
+    for hour_index in range(8):
+        timestamp = market_start + pd.Timedelta(hours=hour_index)
+        for product_id, base_currency, start_price, price_step, start_volume in market_specs:
+            open_price = start_price + (hour_index * price_step)
+            close_price = open_price + (price_step * 0.35)
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "product_id": product_id,
+                    "base_currency": base_currency,
+                    "quote_currency": "USD",
+                    "open": open_price,
+                    "high": close_price + (price_step * 0.25),
+                    "low": open_price - (price_step * 0.15),
+                    "close": close_price,
+                    "volume": start_volume + hour_index,
+                    "granularity_seconds": 3600,
+                    "source": "coinmarketcap",
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def _build_snapshot(snapshot_path: Path) -> None:
@@ -66,6 +104,14 @@ def _build_snapshot(snapshot_path: Path) -> None:
             "signalChat": "BTC-USD is a BUY setup with strong relative momentum.",
             "symbol": "BTC",
             "close": 65000.0,
+            "marketState": {
+                "label": "trend_up",
+                "code": 2,
+                "trendScore": 0.03,
+                "volatilityRatio": 1.05,
+                "isTrending": True,
+                "isHighVolatility": False,
+            },
         },
         {
             "productId": "ETH-USD",
@@ -76,6 +122,14 @@ def _build_snapshot(snapshot_path: Path) -> None:
             "signalChat": "ETH-USD is a HOLD setup while momentum rebuilds.",
             "symbol": "ETH",
             "close": 3300.0,
+            "marketState": {
+                "label": "range_high_volatility",
+                "code": 4,
+                "trendScore": 0.00,
+                "volatilityRatio": 1.30,
+                "isTrending": False,
+                "isHighVolatility": True,
+            },
         },
     ]
 
@@ -101,6 +155,14 @@ def _build_live_snapshot_payload() -> dict[str, object]:
             "signalChat": "BTC-USD is a BUY setup on the latest live candle.",
             "symbol": "BTC",
             "close": 65250.0,
+            "marketState": {
+                "label": "trend_up",
+                "code": 2,
+                "trendScore": 0.03,
+                "volatilityRatio": 1.02,
+                "isTrending": True,
+                "isHighVolatility": False,
+            },
         },
         {
             "productId": "ETH-USD",
@@ -111,6 +173,14 @@ def _build_live_snapshot_payload() -> dict[str, object]:
             "signalChat": "ETH-USD is a HOLD setup on the latest live candle.",
             "symbol": "ETH",
             "close": 3320.0,
+            "marketState": {
+                "label": "range",
+                "code": 1,
+                "trendScore": 0.00,
+                "volatilityRatio": 0.95,
+                "isTrending": False,
+                "isHighVolatility": False,
+            },
         },
     ]
 
@@ -170,8 +240,27 @@ def test_engine_api_exposes_health_and_signal_payloads(tmp_path: Path) -> None:
     assert landing_response.json()["model"]["modelType"] == "randomForestSignalModel"
     assert landing_response.json()["modelResearch"]["tracks"][0]["title"] == "Triple-Barrier Method"
     assert landing_response.json()["snapshot"]["marketSummary"]["actionableSignals"] == 1
+    assert landing_response.json()["snapshot"]["marketState"]["dominant"]["label"] == "range_high_volatility"
     assert signals_response.status_code == 200
     assert signals_response.json()["count"] == 2
+
+
+def test_cached_signal_api_exposes_market_state_summary(tmp_path: Path) -> None:
+    """The lightweight cached API should surface the aggregate market-state block."""
+
+    snapshot_path = tmp_path / "frontendSignalSnapshot.json"
+    _build_snapshot(snapshot_path)
+
+    client = TestClient(create_signal_api(snapshot_path=snapshot_path))
+
+    overview_response = client.get("/api/overview")
+    market_state_response = client.get("/api/market-state")
+
+    assert overview_response.status_code == 200
+    assert overview_response.json()["marketState"]["primary"]["label"] == "trend_up"
+    assert market_state_response.status_code == 200
+    assert market_state_response.json()["dominant"]["label"] == "range_high_volatility"
+    assert market_state_response.json()["highVolatilitySignals"] == 1
 
 
 def test_engine_api_reports_missing_snapshot_cleanly(tmp_path: Path) -> None:
@@ -235,6 +324,42 @@ def test_model_summary_exposes_lifecycle_metadata_when_sidecar_exists(tmp_path: 
     assert payload["split"] == {"trainRows": 4, "testRows": 2}
     assert payload["lifecycle"]["metadataPath"] == str(metadata_path)
     assert payload["lifecycle"]["freshness"] in {"fresh", "stale"}
+
+
+def test_model_summary_uses_active_market_source_settings(tmp_path: Path) -> None:
+    """The model summary should describe the active configured market source, not Coinbase-only fields."""
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    model_path = model_dir / "randomForestSignalModel.pkl"
+    _build_trained_model(
+        model_path,
+        config=TrainingConfig(
+            market_data_source="coinmarketcap",
+            coinmarketcap_use_context=False,
+            coinmarketcap_fetch_all_quote_products=False,
+            coinmarketcap_product_ids=("BTC-USD",),
+            coinbase_fetch_all_quote_products=True,
+            n_estimators=12,
+            max_depth=3,
+            random_state=7,
+        ),
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=model_dir,
+        )
+    )
+
+    model_response = client.get("/api/model")
+    payload = model_response.json()
+
+    assert model_response.status_code == 200
+    assert payload["settings"]["marketDataSource"] == "coinmarketcap"
+    assert payload["settings"]["quoteCurrency"] == "USD"
+    assert payload["settings"]["productMode"] == "explicit product list"
 
 
 def test_engine_api_exposes_live_signal_endpoints(tmp_path: Path) -> None:
@@ -310,6 +435,93 @@ def test_engine_api_exposes_live_signal_endpoints(tmp_path: Path) -> None:
     assert detail_response.status_code == 200
     assert detail_response.json()["productId"] == "BTC-USD"
     assert detail_response.json()["signal_name"] == "BUY"
+
+
+def test_engine_api_exposes_tradingview_chart_and_event_endpoints(tmp_path: Path) -> None:
+    """The engine should expose TradingView-style history plus CoinMarketCal event endpoints."""
+
+    data_path = tmp_path / "marketPrices.csv"
+    _build_chart_history_frame().to_csv(data_path, index=False)
+
+    events_path = tmp_path / "coinMarketCalEvents.csv"
+    pd.DataFrame(
+        [
+            {
+                "event_id": "evt-1",
+                "event_title": "Mainnet upgrade",
+                "event_category": "protocol",
+                "event_start": "2026-03-01T04:00:00Z",
+                "base_currency": "BTC",
+            }
+        ]
+    ).to_csv(events_path, index=False)
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            config=TrainingConfig(
+                data_file=data_path,
+                market_data_source="coinmarketcap",
+                coinmarketcap_use_context=False,
+                coinmarketcal_events_file=events_path,
+                coinmarketcap_fetch_all_quote_products=False,
+                coinmarketcap_product_ids=("BTC-USD", "ETH-USD"),
+                live_product_ids=("BTC-USD", "ETH-USD"),
+            ),
+        )
+    )
+
+    config_response = client.get("/api/tradingview/config")
+    search_response = client.get("/api/tradingview/search?query=BTC")
+    symbol_response = client.get("/api/tradingview/symbols?symbol=BTC-USD")
+    history_response = client.get(
+        "/api/tradingview/history",
+        params={
+            "symbol": "BTC-USD",
+            "resolution": "60",
+            "from": int(pd.Timestamp("2026-03-01T00:00:00Z").timestamp()),
+            "to": int(pd.Timestamp("2026-03-01T08:00:00Z").timestamp()),
+        },
+    )
+    quotes_response = client.get("/api/tradingview/quotes?symbols=BTC-USD,ETH-USD")
+    marks_response = client.get(
+        "/api/tradingview/marks",
+        params={
+            "symbol": "BTC-USD",
+            "from": int(pd.Timestamp("2026-03-01T00:00:00Z").timestamp()),
+            "to": int(pd.Timestamp("2026-03-02T00:00:00Z").timestamp()),
+        },
+    )
+    timescale_marks_response = client.get(
+        "/api/tradingview/timescale_marks",
+        params={
+            "symbol": "BTC-USD",
+            "from": int(pd.Timestamp("2026-03-01T00:00:00Z").timestamp()),
+            "to": int(pd.Timestamp("2026-03-02T00:00:00Z").timestamp()),
+        },
+    )
+    events_response = client.get("/api/events?symbol=BTC-USD&limit=10")
+
+    assert config_response.status_code == 200
+    assert "60" in config_response.json()["supported_resolutions"]
+    assert search_response.status_code == 200
+    assert search_response.json()[0]["symbol"] == "BTC-USD"
+    assert symbol_response.status_code == 200
+    assert symbol_response.json()["exchange"] == "CMC"
+    assert history_response.status_code == 200
+    assert history_response.json()["s"] == "ok"
+    assert len(history_response.json()["t"]) == 8
+    assert quotes_response.status_code == 200
+    assert quotes_response.json()["s"] == "ok"
+    assert len(quotes_response.json()["d"]) == 2
+    assert marks_response.status_code == 200
+    assert marks_response.json()["id"] == ["evt-1"]
+    assert timescale_marks_response.status_code == 200
+    assert timescale_marks_response.json()[0]["id"] == "evt-1"
+    assert events_response.status_code == 200
+    assert events_response.json()["count"] == 1
+    assert events_response.json()["events"][0]["productId"] == "BTC-USD"
 
 
 def test_engine_api_supports_assistant_chat_endpoints(tmp_path: Path) -> None:

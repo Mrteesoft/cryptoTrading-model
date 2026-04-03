@@ -30,7 +30,7 @@ class TrainingConfig:
     """
 
     data_file: Path = RAW_DATA_DIR / "marketPrices.csv"
-    market_data_source: str = "coinbaseExchange"
+    market_data_source: str = "coinmarketcap"
     coinmarketcap_use_context: bool = True
     coinmarketcap_context_file: Path = RAW_DATA_DIR / "coinMarketCapContext.csv"
     coinmarketcap_api_base_url: str = "https://pro-api.coinmarketcap.com"
@@ -40,6 +40,27 @@ class TrainingConfig:
     coinmarketcap_refresh_context_after_market_refresh: bool = True
     coinmarketcap_request_pause_seconds: float = 0.2
     coinmarketcap_log_progress: bool = True
+    coinmarketcap_fetch_all_quote_products: bool = True
+    coinmarketcap_product_ids: Tuple[str, ...] = ("BTC-USD",)
+    coinmarketcap_excluded_base_currencies: Tuple[str, ...] = ("USDT", "USDC")
+    coinmarketcap_max_products: Optional[int] = None
+    coinmarketcap_product_id: str = "BTC-USD"
+    coinmarketcap_product_batch_size: Optional[int] = 25
+    coinmarketcap_product_batch_number: int = 1
+    coinmarketcap_granularity_seconds: int = 3600
+    coinmarketcap_total_candles: int = 1800
+    coinmarketcap_save_progress_every_products: int = 5
+    coinmarketcap_ohlcv_historical_endpoint: str = "/v2/cryptocurrency/ohlcv/historical"
+    coinmarketcap_map_endpoint: str = "/v1/cryptocurrency/map"
+    coinmarketcal_use_events: bool = True
+    coinmarketcal_events_file: Path = RAW_DATA_DIR / "coinMarketCalEvents.csv"
+    coinmarketcal_api_base_url: str = "https://developers.coinmarketcal.com/v1"
+    coinmarketcal_api_key_env_var: str = "COINMARKETCAL_API_KEY"
+    coinmarketcal_refresh_events_on_load: bool = False
+    coinmarketcal_refresh_events_after_market_refresh: bool = True
+    coinmarketcal_request_pause_seconds: float = 0.2
+    coinmarketcal_log_progress: bool = True
+    coinmarketcal_lookahead_days: int = 30
     coinbase_fetch_all_quote_products: bool = True
     coinbase_quote_currency: str = "USD"
     coinbase_product_ids: Tuple[str, ...] = ("BTC-USD",)
@@ -71,6 +92,11 @@ class TrainingConfig:
     rag_fetch_timeout_seconds: float = 15.0
     rag_fetch_max_chars: int = 50000
     rag_search_limit: int = 6
+    feature_context_timeframes: Tuple[str, ...] = ("4h", "1d")
+    regime_features_enabled: bool = True
+    regime_trend_strength_threshold: float = 0.0125
+    regime_high_volatility_ratio_threshold: float = 1.20
+    regime_low_volatility_ratio_threshold: float = 0.85
     model_type: str = "histGradientBoostingSignalModel"
     comparison_model_types: Tuple[str, ...] = (
         "histGradientBoostingSignalModel",
@@ -86,8 +112,8 @@ class TrainingConfig:
     tuning_sell_threshold_candidates: Tuple[float, ...] = (-0.01, -0.0125, -0.015)
     tuning_backtest_confidence_candidates: Tuple[float, ...] = (0.0, 0.55, 0.60, 0.65)
     labeling_strategy: str = "triple_barrier"
-    prediction_horizon: int = 3
-    buy_threshold: float = 0.015
+    prediction_horizon: int = 2
+    buy_threshold: float = 0.01
     sell_threshold: float = -0.015
     triple_barrier_use_high_low: bool = True
     triple_barrier_tie_break: str = "stop_loss"
@@ -107,7 +133,7 @@ class TrainingConfig:
     backtest_initial_capital: float = 10000.0
     backtest_trading_fee_rate: float = 0.001
     backtest_slippage_rate: float = 0.0005
-    backtest_min_confidence: float = 0.0
+    backtest_min_confidence: float = 0.65
     backtest_max_positions_per_timestamp: int = 3
     walkforward_purge_gap_timestamps: Optional[int] = None
     production_model_max_age_hours: float = 24.0
@@ -136,6 +162,7 @@ def config_to_dict(config: TrainingConfig) -> Dict[str, object]:
     config_dict = asdict(config)
     config_dict["data_file"] = str(config.data_file)
     config_dict["coinmarketcap_context_file"] = str(config.coinmarketcap_context_file)
+    config_dict["coinmarketcal_events_file"] = str(config.coinmarketcal_events_file)
     config_dict["rag_store_path"] = str(config.rag_store_path)
     return config_dict
 
@@ -152,10 +179,20 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
     restored_config["data_file"] = Path(str(restored_config["data_file"]))
     if "coinmarketcap_context_file" in restored_config:
         restored_config["coinmarketcap_context_file"] = Path(str(restored_config["coinmarketcap_context_file"]))
+    if "coinmarketcal_events_file" in restored_config:
+        restored_config["coinmarketcal_events_file"] = Path(str(restored_config["coinmarketcal_events_file"]))
     if "rag_store_path" in restored_config:
         restored_config["rag_store_path"] = Path(str(restored_config["rag_store_path"]))
     if "comparison_model_types" in restored_config:
         restored_config["comparison_model_types"] = tuple(restored_config["comparison_model_types"])
+    if "feature_context_timeframes" in restored_config:
+        restored_config["feature_context_timeframes"] = tuple(restored_config["feature_context_timeframes"])
+    if "coinmarketcap_product_ids" in restored_config:
+        restored_config["coinmarketcap_product_ids"] = tuple(restored_config["coinmarketcap_product_ids"])
+    if "coinmarketcap_excluded_base_currencies" in restored_config:
+        restored_config["coinmarketcap_excluded_base_currencies"] = tuple(
+            restored_config["coinmarketcap_excluded_base_currencies"]
+        )
     if "coinbase_product_ids" in restored_config:
         restored_config["coinbase_product_ids"] = tuple(restored_config["coinbase_product_ids"])
     if "live_product_ids" in restored_config:

@@ -9,12 +9,20 @@ from .config import TrainingConfig
 from .data import (
     BasePriceDataEnricher,
     BasePriceDataLoader,
+    CoinMarketCalEventEnricher,
     CoinMarketCapContextEnricher,
     CsvPriceDataLoader,
-    EnrichedCsvPriceDataLoader,
+    EnrichedPriceDataLoader,
+    align_multi_timeframe_context,
 )
-from .features import BaseFeatureEngineer, FEATURE_COLUMNS, TechnicalFeatureEngineer
-from .labels import BaseSignalLabeler, create_labeler_from_config
+from .features import (
+    BaseFeatureEngineer,
+    FEATURE_COLUMNS,
+    MULTI_TIMEFRAME_FEATURE_COLUMNS,
+    TechnicalFeatureEngineer,
+)
+from .labels import BaseSignalLabeler, MarketRegimeLabeler, create_labeler_from_config, create_regime_labeler_from_config
+from .regimes import MarketRegimeDetector
 
 
 class BaseDatasetBuilder(ABC):
@@ -36,11 +44,15 @@ class BaseDatasetBuilder(ABC):
         data_loader: BasePriceDataLoader,
         feature_engineer: BaseFeatureEngineer,
         labeler: BaseSignalLabeler,
+        regime_detector: MarketRegimeDetector | None = None,
+        regime_labeler: MarketRegimeLabeler | None = None,
     ) -> None:
         self.config = config
         self.data_loader = data_loader
         self.feature_engineer = feature_engineer
         self.labeler = labeler
+        self.regime_detector = regime_detector
+        self.regime_labeler = regime_labeler
         self.feature_columns = list(self.feature_engineer.feature_columns)
 
     def build_feature_table(self) -> pd.DataFrame:
@@ -52,7 +64,15 @@ class BaseDatasetBuilder(ABC):
         """
 
         price_df = self.data_loader.load()
+        price_df = align_multi_timeframe_context(
+            price_df=price_df,
+            timeframes=self.config.feature_context_timeframes,
+            base_granularity_seconds=self._resolve_base_granularity_seconds(price_df),
+        )
         feature_df = self.feature_engineer.build(price_df)
+        if self.regime_detector is not None:
+            feature_df = self.regime_detector.enrich_feature_table(feature_df)
+        feature_df = self._ensure_feature_columns_exist(feature_df)
         return feature_df
 
     def build_labeled_dataset(self) -> Tuple[pd.DataFrame, List[str]]:
@@ -67,6 +87,8 @@ class BaseDatasetBuilder(ABC):
         """
 
         feature_df = self.build_feature_table()
+        if self.regime_labeler is not None:
+            feature_df = self.regime_labeler.add_labels(feature_df)
         labeled_df = self.labeler.add_labels(feature_df)
         cleaned_df = self._clean_labeled_dataset(labeled_df)
 
@@ -82,9 +104,58 @@ class BaseDatasetBuilder(ABC):
         We drop both sections here once, in one shared place.
         """
 
+        required_columns = list(self.feature_columns) + ["future_return"]
+        if self.regime_labeler is not None:
+            required_columns.append("target_market_regime_code")
+
         return labeled_df.dropna(
-            subset=self.feature_columns + ["future_return"]
+            subset=required_columns
         ).reset_index(drop=True)
+
+    def _ensure_feature_columns_exist(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure every configured feature column exists before labels or inference use it."""
+
+        completed_df = feature_df.copy()
+        optional_context_columns = set(MULTI_TIMEFRAME_FEATURE_COLUMNS)
+        optional_context_columns.update(self._regime_feature_columns())
+
+        for feature_column in self.feature_columns:
+            if feature_column not in completed_df.columns:
+                completed_df[feature_column] = 0.0
+            elif feature_column in optional_context_columns:
+                completed_df[feature_column] = pd.to_numeric(
+                    completed_df[feature_column],
+                    errors="coerce",
+                ).fillna(0.0)
+
+        return completed_df
+
+    def _resolve_base_granularity_seconds(self, price_df: pd.DataFrame) -> int:
+        """Resolve the candle size from the loaded data when possible."""
+
+        if "granularity_seconds" in price_df.columns:
+            granularity_series = pd.to_numeric(price_df["granularity_seconds"], errors="coerce").dropna()
+            if not granularity_series.empty:
+                return int(granularity_series.mode().iloc[0])
+
+        if self.config.market_data_source == "coinmarketcap":
+            return int(self.config.coinmarketcap_granularity_seconds)
+
+        return int(self.config.coinbase_granularity_seconds)
+
+    def _regime_feature_columns(self) -> list[str]:
+        """Return the numeric regime feature columns when the detector is enabled."""
+
+        if self.regime_detector is None:
+            return []
+
+        return [
+            "regime_trend_score",
+            "regime_volatility_ratio",
+            "regime_is_trending",
+            "regime_is_high_volatility",
+            "market_regime_code",
+        ]
 
 
 class CryptoDatasetBuilder(BaseDatasetBuilder):
@@ -108,38 +179,54 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
         selected_feature_columns = feature_columns or list(FEATURE_COLUMNS)
 
         if data_loader is None:
-            enrichers: List[BasePriceDataEnricher] = []
-            if config.coinmarketcap_use_context:
-                enrichers.append(
-                    CoinMarketCapContextEnricher(
-                        context_path=config.coinmarketcap_context_file,
-                        api_base_url=config.coinmarketcap_api_base_url,
-                        api_key_env_var=config.coinmarketcap_api_key_env_var,
-                        quote_currency=config.coinmarketcap_quote_currency,
-                        request_pause_seconds=config.coinmarketcap_request_pause_seconds,
-                        should_refresh_context=config.coinmarketcap_refresh_context_on_load,
-                        log_progress=config.coinmarketcap_log_progress,
-                    )
-                )
+            data_loader = CsvPriceDataLoader(config.data_file)
 
-            if enrichers:
-                data_loader = EnrichedCsvPriceDataLoader(
-                    data_path=config.data_file,
-                    enrichers=enrichers,
+        enrichers: List[BasePriceDataEnricher] = []
+        if config.coinmarketcap_use_context:
+            enrichers.append(
+                CoinMarketCapContextEnricher(
+                    context_path=config.coinmarketcap_context_file,
+                    api_base_url=config.coinmarketcap_api_base_url,
+                    api_key_env_var=config.coinmarketcap_api_key_env_var,
+                    quote_currency=config.coinmarketcap_quote_currency,
+                    request_pause_seconds=config.coinmarketcap_request_pause_seconds,
+                    should_refresh_context=config.coinmarketcap_refresh_context_on_load,
+                    log_progress=config.coinmarketcap_log_progress,
                 )
-            else:
-                data_loader = CsvPriceDataLoader(config.data_file)
+            )
+        if config.coinmarketcal_use_events:
+            enrichers.append(
+                CoinMarketCalEventEnricher(
+                    events_path=config.coinmarketcal_events_file,
+                    api_base_url=config.coinmarketcal_api_base_url,
+                    api_key_env_var=config.coinmarketcal_api_key_env_var,
+                    lookahead_days=config.coinmarketcal_lookahead_days,
+                    request_pause_seconds=config.coinmarketcal_request_pause_seconds,
+                    should_refresh_events=config.coinmarketcal_refresh_events_on_load,
+                    log_progress=config.coinmarketcal_log_progress,
+                )
+            )
+
+        if enrichers:
+            data_loader = EnrichedPriceDataLoader(
+                base_loader=data_loader,
+                enrichers=enrichers,
+            )
 
         feature_engineer = feature_engineer or TechnicalFeatureEngineer(
             feature_columns=selected_feature_columns,
         )
         labeler = labeler or create_labeler_from_config(config)
+        regime_detector = MarketRegimeDetector(config) if config.regime_features_enabled else None
+        regime_labeler = create_regime_labeler_from_config(config) if config.regime_features_enabled else None
 
         super().__init__(
             config=config,
             data_loader=data_loader,
             feature_engineer=feature_engineer,
             labeler=labeler,
+            regime_detector=regime_detector,
+            regime_labeler=regime_labeler,
         )
 
 

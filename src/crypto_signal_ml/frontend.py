@@ -2,10 +2,61 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+def _build_market_state_snapshot(
+    primary_signal: Dict[str, Any],
+    latest_signals: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize the dominant and primary regime state for the cached snapshot."""
+
+    market_state_rows = [
+        signal_summary.get("marketState", {})
+        for signal_summary in latest_signals
+        if isinstance(signal_summary.get("marketState"), dict)
+    ]
+    regime_counter = Counter(
+        str(state_row.get("label", "unknown"))
+        for state_row in market_state_rows
+    )
+    dominant_label = "unknown"
+    dominant_count = 0
+    if regime_counter:
+        dominant_label, dominant_count = sorted(
+            regime_counter.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[0]
+
+    primary_market_state = primary_signal.get("marketState", {}) if isinstance(primary_signal, dict) else {}
+    total_signals = max(len(latest_signals), 1)
+
+    return {
+        "primary": {
+            "label": str(primary_market_state.get("label", "unknown")),
+            "code": int(primary_market_state.get("code", 0) or 0),
+            "trendScore": float(primary_market_state.get("trendScore", 0.0) or 0.0),
+            "volatilityRatio": float(primary_market_state.get("volatilityRatio", 1.0) or 1.0),
+            "isTrending": bool(primary_market_state.get("isTrending", False)),
+            "isHighVolatility": bool(primary_market_state.get("isHighVolatility", False)),
+        },
+        "dominant": {
+            "label": dominant_label,
+            "count": int(dominant_count),
+            "share": float(dominant_count / total_signals),
+        },
+        "regimeCounts": dict(sorted(regime_counter.items())),
+        "trendingSignals": int(
+            sum(bool(state_row.get("isTrending", False)) for state_row in market_state_rows)
+        ),
+        "highVolatilitySignals": int(
+            sum(bool(state_row.get("isHighVolatility", False)) for state_row in market_state_rows)
+        ),
+    }
 
 
 def build_frontend_signal_snapshot(
@@ -52,6 +103,10 @@ def build_frontend_signal_snapshot(
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "modelType": model_type,
         "primarySignal": primary_signal,
+        "marketState": _build_market_state_snapshot(
+            primary_signal=primary_signal,
+            latest_signals=latest_signals,
+        ),
         "marketSummary": {
             "totalSignals": len(latest_signals),
             "actionableSignals": len(actionable_signals),
@@ -105,9 +160,16 @@ class SignalSnapshotStore:
         return {
             "generatedAt": snapshot["generatedAt"],
             "modelType": snapshot["modelType"],
+            "marketState": snapshot.get("marketState", {}),
             "marketSummary": snapshot["marketSummary"],
             "primarySignal": snapshot["primarySignal"],
         }
+
+    def get_market_state(self) -> Dict[str, Any]:
+        """Return the cached aggregate market-state block for API consumers."""
+
+        snapshot = self.get_snapshot()
+        return dict(snapshot.get("marketState", {}))
 
     def list_signals(
         self,

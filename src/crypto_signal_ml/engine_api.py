@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .assistant import ConversationSessionStore, TradingAssistantService
+from .charting import MarketChartService
 from .config import MODELS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TrainingConfig
 from .frontend import SignalSnapshotStore
 from .live import LiveSignalEngine
@@ -241,6 +242,32 @@ class ModelArtifactStore:
         except (OSError, json.JSONDecodeError):
             return {}
 
+    @staticmethod
+    def _resolve_quote_currency(config: TrainingConfig) -> str:
+        """Return the active quote currency for the configured market source."""
+
+        if config.market_data_source == "coinmarketcap":
+            return config.coinmarketcap_quote_currency
+
+        return config.coinbase_quote_currency
+
+    @staticmethod
+    def _resolve_product_mode(config: TrainingConfig) -> str:
+        """Return the active product-mode label for the configured market source."""
+
+        if config.market_data_source == "coinmarketcap":
+            fetch_all = bool(config.coinmarketcap_fetch_all_quote_products)
+            quote_currency = config.coinmarketcap_quote_currency
+        else:
+            fetch_all = bool(config.coinbase_fetch_all_quote_products)
+            quote_currency = config.coinbase_quote_currency
+
+        return (
+            f"all-{quote_currency.lower()} markets"
+            if fetch_all
+            else "explicit product list"
+        )
+
     def get_summary(self) -> dict[str, Any]:
         """Return a frontend-friendly description of the latest saved model."""
 
@@ -327,12 +354,8 @@ class ModelArtifactStore:
                 ),
                 "trainSize": float(model.config.train_size),
                 "marketDataSource": model.config.market_data_source,
-                "quoteCurrency": model.config.coinbase_quote_currency,
-                "productMode": (
-                    f"all-{model.config.coinbase_quote_currency.lower()} markets"
-                    if model.config.coinbase_fetch_all_quote_products
-                    else "explicit product list"
-                ),
+                "quoteCurrency": self._resolve_quote_currency(model.config),
+                "productMode": self._resolve_product_mode(model.config),
             },
         }
 
@@ -358,7 +381,9 @@ class ModelArtifactStore:
 def create_app(
     snapshot_path: Path | None = None,
     model_dir: Path | None = None,
+    config: TrainingConfig | None = None,
     live_signal_engine: LiveSignalEngine | None = None,
+    chart_service: MarketChartService | None = None,
     assistant_service: TradingAssistantService | None = None,
     session_store: ConversationSessionStore | None = None,
     knowledge_store: RagKnowledgeStore | None = None,
@@ -367,7 +392,7 @@ def create_app(
 
     snapshot_path = Path(snapshot_path or (OUTPUTS_DIR / "frontendSignalSnapshot.json"))
     model_dir = Path(model_dir or MODELS_DIR)
-    runtime_config = TrainingConfig()
+    runtime_config = config or TrainingConfig()
 
     snapshot_store = SignalSnapshotStore(snapshot_path=snapshot_path)
     model_store = ModelArtifactStore(model_dir=model_dir, config=runtime_config)
@@ -375,6 +400,7 @@ def create_app(
         model_dir=model_dir,
         config=runtime_config,
     )
+    chart_service = chart_service or MarketChartService(config=runtime_config)
     session_store = session_store or ConversationSessionStore(
         OUTPUTS_DIR / "assistantSessions.sqlite3"
     )
@@ -451,6 +477,7 @@ def create_app(
                 max_age_hours=runtime_config.production_snapshot_max_age_hours,
             ),
             "modelType": overview["modelType"],
+            "marketState": overview.get("marketState", {}),
             "marketSummary": overview["marketSummary"],
             "primarySignal": overview["primarySignal"],
         }
@@ -546,6 +573,10 @@ def create_app(
                     "command": "python model-service/scripts/refreshMarketData.py",
                 },
                 {
+                    "step": "Refresh CoinMarketCal events manually",
+                    "command": "python model-service/scripts/refreshMarketEvents.py",
+                },
+                {
                     "step": "Retrain and publish the current artifact",
                     "command": "python model-service/scripts/trainModel.py",
                 },
@@ -588,6 +619,10 @@ def create_app(
                     "path": "/api/overview",
                 },
                 {
+                    "label": "Market state",
+                    "path": "/api/market-state",
+                },
+                {
                     "label": "Signal list",
                     "path": "/api/signals?action=all&limit=12",
                 },
@@ -598,6 +633,18 @@ def create_app(
                 {
                     "label": "Live signals",
                     "path": "/api/live/signals?action=all&limit=12",
+                },
+                {
+                    "label": "TradingView config",
+                    "path": "/api/tradingview/config",
+                },
+                {
+                    "label": "TradingView history",
+                    "path": "/api/tradingview/history?symbol=BTC-USD&resolution=60&from=0&to=4102444800",
+                },
+                {
+                    "label": "CoinMarketCal events",
+                    "path": "/api/events?symbol=BTC-USD&limit=20",
                 },
                 {
                     "label": "Create chat session",
@@ -622,9 +669,17 @@ def create_app(
         return {
             "generatedAt": snapshot["generatedAt"],
             "modelType": snapshot["modelType"],
+            "marketState": snapshot.get("marketState", {}),
             "marketSummary": snapshot["marketSummary"],
             "primarySignal": snapshot["primarySignal"],
         }
+
+    @app.get("/api/market-state")
+    def market_state() -> dict[str, Any]:
+        """Return the aggregate market-state block from the cached snapshot."""
+
+        require_snapshot()
+        return snapshot_store.get_market_state()
 
     @app.get("/api/signals")
     def list_signals(
@@ -714,6 +769,132 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"No live signal found for {product_id}.")
 
         return signal_summary
+
+    @app.get("/api/tradingview/config")
+    def tradingview_config() -> dict[str, Any]:
+        """Return the TradingView UDF capability block."""
+
+        return chart_service.get_udf_config()
+
+    @app.get("/api/tradingview/time")
+    def tradingview_time() -> int:
+        """Return the current server time for TradingView clients."""
+
+        return chart_service.get_server_time()
+
+    @app.get("/api/tradingview/search")
+    def tradingview_search(
+        query: str = Query(default=""),
+        exchange: str | None = Query(default=None),
+        type: str | None = Query(default=None),
+        limit: int = Query(default=30, ge=1, le=100),
+    ) -> list[dict[str, Any]]:
+        """Search the chart symbol catalog."""
+
+        return chart_service.search_symbols(
+            query=query,
+            exchange=exchange,
+            symbol_type=type,
+            limit=limit,
+        )
+
+    @app.get("/api/tradingview/symbols")
+    def tradingview_symbol(symbol: str = Query(...)) -> dict[str, Any]:
+        """Resolve one symbol into TradingView metadata."""
+
+        try:
+            return chart_service.resolve_symbol(symbol)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.get("/api/tradingview/history")
+    def tradingview_history(
+        symbol: str = Query(...),
+        resolution: str = Query(...),
+        from_value: int = Query(alias="from"),
+        to: int = Query(...),
+        countback: int | None = Query(default=None, ge=1),
+    ) -> dict[str, Any]:
+        """Return OHLCV history in TradingView UDF format."""
+
+        try:
+            return chart_service.get_history(
+                symbol=symbol,
+                resolution=resolution,
+                from_seconds=from_value,
+                to_seconds=to,
+                countback=countback,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=f"Chart history request failed: {error}") from error
+
+    @app.get("/api/tradingview/quotes")
+    def tradingview_quotes(symbols: str = Query(...)) -> dict[str, Any]:
+        """Return the latest quote block for one or more symbols."""
+
+        symbol_list = [value for value in str(symbols).split(",") if value.strip()]
+        try:
+            return chart_service.get_quotes(symbol_list)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=f"Quote request failed: {error}") from error
+
+    @app.get("/api/tradingview/marks")
+    def tradingview_marks(
+        symbol: str = Query(...),
+        from_value: int = Query(alias="from"),
+        to: int = Query(...),
+        resolution: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Return CoinMarketCal events as TradingView chart marks."""
+
+        del resolution
+        return chart_service.get_marks(
+            symbol=symbol,
+            from_seconds=from_value,
+            to_seconds=to,
+        )
+
+    @app.get("/api/tradingview/timescale_marks")
+    def tradingview_timescale_marks(
+        symbol: str = Query(...),
+        from_value: int = Query(alias="from"),
+        to: int = Query(...),
+        resolution: str | None = Query(default=None),
+    ) -> list[dict[str, Any]]:
+        """Return CoinMarketCal events as TradingView timescale marks."""
+
+        del resolution
+        return chart_service.get_timescale_marks(
+            symbol=symbol,
+            from_seconds=from_value,
+            to_seconds=to,
+        )
+
+    @app.get("/api/events")
+    def market_events(
+        symbol: str | None = Query(default=None),
+        from_value: int | None = Query(default=None, alias="from"),
+        to: int | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Return cached CoinMarketCal events for frontend consumers."""
+
+        event_rows = chart_service.list_events(
+            symbol=symbol,
+            from_seconds=from_value,
+            to_seconds=to,
+            limit=limit,
+        )
+        return {
+            "count": len(event_rows),
+            "events": event_rows,
+        }
 
     @app.post("/api/chat/sessions")
     def create_chat_session(request: ChatSessionCreateRequest) -> dict[str, Any]:

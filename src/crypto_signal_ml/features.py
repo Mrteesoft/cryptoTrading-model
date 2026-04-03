@@ -6,6 +6,33 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+from .regimes import REGIME_FEATURE_COLUMNS
+
+
+DEFAULT_CONTEXT_TIMEFRAMES = ("4h", "1d")
+
+
+def _build_multi_timeframe_feature_columns(timeframes: tuple[str, ...]) -> list[str]:
+    """Return the aligned higher-timeframe feature names for the configured aliases."""
+
+    feature_columns: list[str] = []
+    for timeframe in timeframes:
+        feature_columns.extend(
+            [
+                f"htf_{timeframe}_return_1",
+                f"htf_{timeframe}_range_pct",
+                f"htf_{timeframe}_volume_change_1",
+                f"htf_{timeframe}_close_vs_sma_3",
+                f"htf_{timeframe}_close_vs_ema_3",
+                f"htf_{timeframe}_volatility_3",
+            ]
+        )
+
+    return feature_columns
+
+
+MULTI_TIMEFRAME_FEATURE_COLUMNS = _build_multi_timeframe_feature_columns(DEFAULT_CONTEXT_TIMEFRAMES)
+
 
 # This list is the exact set of columns the model will learn from.
 # Keeping it in one place prevents accidental training/prediction mismatch.
@@ -70,6 +97,8 @@ FEATURE_COLUMNS = [
     "hour_of_day_cos",
     "day_of_week_sin",
     "day_of_week_cos",
+    *MULTI_TIMEFRAME_FEATURE_COLUMNS,
+    *REGIME_FEATURE_COLUMNS,
     "cmc_context_available",
     "cmc_rank_score",
     "cmc_market_cap_log",

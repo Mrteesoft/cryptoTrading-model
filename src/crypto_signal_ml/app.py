@@ -12,11 +12,17 @@ import pandas as pd
 
 from .backtesting import BaseSignalBacktester, EqualWeightSignalBacktester
 from .config import MODELS_DIR, OUTPUTS_DIR, PROCESSED_DATA_DIR, TrainingConfig, config_to_dict, ensure_project_directories
-from .data import CoinbaseExchangePriceDataLoader, CoinMarketCapContextEnricher
+from .data import (
+    CoinMarketCalEventEnricher,
+    CoinMarketCapContextEnricher,
+    CsvPriceDataLoader,
+    create_market_data_loader,
+)
 from .frontend import build_frontend_signal_snapshot
-from .labels import create_labeler_from_config
+from .labels import create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
+from .regime_modeling import MarketRegimeModel
 from .signals import (
     build_actionable_signal_summaries,
     build_latest_signal_summaries,
@@ -136,6 +142,55 @@ class BaseSignalApp:
 
         return int(config.prediction_horizon)
 
+    def _resolve_market_quote_currency(self) -> str:
+        """Return the active quote currency for the configured market source."""
+
+        if self.config.market_data_source == "coinmarketcap":
+            return self.config.coinmarketcap_quote_currency
+
+        return self.config.coinbase_quote_currency
+
+    def _resolve_market_fetch_all_quote_products(self) -> bool:
+        """Return whether the active market source is in quote-universe mode."""
+
+        if self.config.market_data_source == "coinmarketcap":
+            return bool(self.config.coinmarketcap_fetch_all_quote_products)
+
+        return bool(self.config.coinbase_fetch_all_quote_products)
+
+    def _resolve_market_granularity_seconds(self) -> int:
+        """Return the active base-candle size for the configured market source."""
+
+        if self.config.market_data_source == "coinmarketcap":
+            return int(self.config.coinmarketcap_granularity_seconds)
+
+        return int(self.config.coinbase_granularity_seconds)
+
+    def _resolve_market_product_batch_number(self) -> int:
+        """Return the active product-batch index for the configured market source."""
+
+        if self.config.market_data_source == "coinmarketcap":
+            return int(self.config.coinmarketcap_product_batch_number)
+
+        return int(self.config.coinbase_product_batch_number)
+
+    def _with_market_product_batch_number(
+        self,
+        batch_number: int,
+    ) -> TrainingConfig:
+        """Clone the config with the active source's product batch number updated."""
+
+        if self.config.market_data_source == "coinmarketcap":
+            return replace(
+                self.config,
+                coinmarketcap_product_batch_number=int(batch_number),
+            )
+
+        return replace(
+            self.config,
+            coinbase_product_batch_number=int(batch_number),
+        )
+
     def _ensure_market_data_available(self) -> None:
         """
         Bootstrap the raw market CSV when a training-style workflow starts empty.
@@ -226,36 +281,18 @@ class BaseSignalApp:
             "metadataPath": str(metadata_path),
         }
 
-    def build_market_data_loader(self) -> CoinbaseExchangePriceDataLoader:
+    def build_market_data_loader(self):
         """
         Create the configured real-market-data loader.
 
-        For now the real-data path uses Coinbase Exchange public candles.
         Keeping this factory in the base app avoids rebuilding the same
-        loader configuration in multiple places.
+        loader-selection logic in multiple places.
         """
 
-        if self.config.market_data_source != "coinbaseExchange":
-            raise ValueError(
-                "Unsupported market_data_source. "
-                "Currently supported: coinbaseExchange"
-            )
-
-        return CoinbaseExchangePriceDataLoader(
+        return create_market_data_loader(
+            config=self.config,
             data_path=self.config.data_file,
-            product_id=self.config.coinbase_product_id,
-            product_ids=self.config.coinbase_product_ids,
-            fetch_all_quote_products=self.config.coinbase_fetch_all_quote_products,
-            quote_currency=self.config.coinbase_quote_currency,
-            excluded_base_currencies=self.config.coinbase_excluded_base_currencies,
-            max_products=self.config.coinbase_max_products,
-            product_batch_size=self.config.coinbase_product_batch_size,
-            product_batch_number=self.config.coinbase_product_batch_number,
-            granularity_seconds=self.config.coinbase_granularity_seconds,
-            total_candles=self.config.coinbase_total_candles,
-            request_pause_seconds=self.config.coinbase_request_pause_seconds,
-            save_progress_every_products=self.config.coinbase_save_progress_every_products,
-            log_progress=self.config.coinbase_log_progress,
+            should_save_downloaded_data=True,
         )
 
     def build_coinmarketcap_context_enricher(
@@ -280,6 +317,22 @@ class BaseSignalApp:
             request_pause_seconds=self.config.coinmarketcap_request_pause_seconds,
             should_refresh_context=should_refresh_context,
             log_progress=self.config.coinmarketcap_log_progress,
+        )
+
+    def build_coinmarketcal_event_enricher(
+        self,
+        should_refresh_events: bool = False,
+    ) -> CoinMarketCalEventEnricher:
+        """Create the configured CoinMarketCal event enrichment helper."""
+
+        return CoinMarketCalEventEnricher(
+            events_path=self.config.coinmarketcal_events_file,
+            api_base_url=self.config.coinmarketcal_api_base_url,
+            api_key_env_var=self.config.coinmarketcal_api_key_env_var,
+            lookahead_days=self.config.coinmarketcal_lookahead_days,
+            request_pause_seconds=self.config.coinmarketcal_request_pause_seconds,
+            should_refresh_events=should_refresh_events,
+            log_progress=self.config.coinmarketcal_log_progress,
         )
 
     @staticmethod
@@ -704,6 +757,360 @@ class WalkForwardValidationApp(TrainingApp):
         )
 
 
+class RegimeTrainingApp(BaseSignalApp):
+    """Train a dedicated model that forecasts the next market-regime label."""
+
+    def __init__(
+        self,
+        config: TrainingConfig = None,
+        dataset_builder: CryptoDatasetBuilder = None,
+        model: MarketRegimeModel = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            dataset_builder=dataset_builder,
+            model=model,
+        )
+        self.regime_labeler = create_regime_labeler_from_config(self.config)
+
+    @property
+    def model_path(self) -> Path:
+        """Return the saved artifact path for the standalone regime model."""
+
+        return MODELS_DIR / MarketRegimeModel.default_model_filename
+
+    @property
+    def dataset_path(self) -> Path:
+        """Return the prepared regime dataset path."""
+
+        return PROCESSED_DATA_DIR / "marketFeaturesAndRegimes.csv"
+
+    def _build_dataset(self) -> tuple[pd.DataFrame, List[str]]:
+        """Build and save the explicit regime-label dataset."""
+
+        self._ensure_market_data_available()
+        feature_df = self.dataset_builder.build_feature_table()
+        feature_columns = list(self.dataset_builder.feature_columns)
+        labeled_df = self.regime_labeler.add_labels(feature_df)
+        cleaned_df = labeled_df.dropna(
+            subset=feature_columns + [MarketRegimeModel.target_column]
+        ).reset_index(drop=True)
+        self.save_dataframe(cleaned_df, self.dataset_path)
+        return cleaned_df, feature_columns
+
+    def _train_model_on_split(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        feature_columns: List[str],
+        training_config: TrainingConfig = None,
+    ) -> Dict[str, Any]:
+        """Train and evaluate the dedicated regime model on one time split."""
+
+        training_config = training_config or self.config
+        model = MarketRegimeModel(
+            config=training_config,
+            feature_columns=feature_columns,
+        )
+        model.fit(train_df)
+        prediction_df, metrics = model.evaluate(train_df, test_df)
+        metrics["config"] = config_to_dict(training_config)
+
+        return {
+            "config": training_config,
+            "model": model,
+            "train_df": train_df,
+            "test_df": test_df,
+            "prediction_df": prediction_df,
+            "metrics": metrics,
+        }
+
+    def _save_training_outputs(
+        self,
+        training_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Save the standalone regime-model artifacts and enrich the metadata sidecar."""
+
+        self.model = training_result["model"]
+        prediction_df = training_result["prediction_df"]
+        metrics = training_result["metrics"]
+        train_df = training_result["train_df"]
+        test_df = training_result["test_df"]
+        output_paths = self.save_model_artifact_outputs(
+            model=self.model,
+            metrics=metrics,
+            prediction_df=prediction_df,
+            train_df=train_df,
+            test_df=test_df,
+            dataset_path=self.dataset_path,
+            model_path=self.model_path,
+            metrics_path=OUTPUTS_DIR / "regimeTrainingMetrics.json",
+            predictions_path=OUTPUTS_DIR / "regimeTestPredictions.csv",
+            feature_importance_path=OUTPUTS_DIR / "regimeFeatureImportance.csv",
+        )
+
+        metadata_path = Path(output_paths["metadataPath"])
+        metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata_payload.update(
+            {
+                "artifactType": "market_regime_model",
+                "estimatorType": self.model.estimator_type,
+                "target": {
+                    "targetColumn": MarketRegimeModel.target_column,
+                    "targetLabelColumn": MarketRegimeModel.target_label_column,
+                    "predictionHorizon": int(self.regime_labeler.prediction_horizon),
+                },
+                "regimeClassDistribution": {
+                    "train": metrics.get("train_class_distribution", {}),
+                    "test": metrics.get("test_class_distribution", {}),
+                },
+            }
+        )
+        self.save_json(metadata_payload, metadata_path)
+
+        return {
+            "modelType": self.model.model_type,
+            "estimatorType": self.model.estimator_type,
+            "datasetPath": str(self.dataset_path),
+            **output_paths,
+            "trainRows": int(len(train_df)),
+            "testRows": int(len(test_df)),
+            "accuracy": float(metrics["accuracy"]),
+            "balancedAccuracy": float(metrics["balanced_accuracy"]),
+        }
+
+    def run(self) -> Dict[str, Any]:
+        """Train the regime model on the configured time split and save outputs."""
+
+        dataset, feature_columns = self._build_dataset()
+        train_df, test_df = MarketRegimeModel.split_train_test_by_time(
+            dataset=dataset,
+            train_size=self.config.train_size,
+        )
+        training_result = self._train_model_on_split(
+            train_df=train_df,
+            test_df=test_df,
+            feature_columns=feature_columns,
+            training_config=self.config,
+        )
+        return self._save_training_outputs(training_result)
+
+
+class RegimeWalkForwardValidationApp(RegimeTrainingApp):
+    """Validate the standalone regime model across expanding time folds."""
+
+    def run(self) -> Dict[str, Any]:
+        """Execute walk-forward validation for the dedicated regime model."""
+
+        dataset, feature_columns = self._build_dataset()
+        walk_forward_result = self._run_walk_forward_validation(
+            dataset=dataset,
+            feature_columns=feature_columns,
+            validation_config=self.config,
+        )
+        return self._save_walk_forward_outputs(walk_forward_result)
+
+    def _run_walk_forward_validation(
+        self,
+        dataset: pd.DataFrame,
+        feature_columns: List[str],
+        validation_config: TrainingConfig,
+    ) -> Dict[str, Any]:
+        """Run walk-forward validation for the standalone regime classifier."""
+
+        fold_splits = MarketRegimeModel.split_walk_forward_by_time(
+            dataset=dataset,
+            min_train_size=validation_config.walkforward_min_train_size,
+            test_size=validation_config.walkforward_test_size,
+            step_size=validation_config.walkforward_step_size,
+            purge_gap_timestamps=self._resolve_walkforward_purge_gap(validation_config),
+        )
+
+        fold_metric_rows = []
+        prediction_frames = []
+        feature_importance_frames = []
+
+        for fold_split in fold_splits:
+            training_result = self._train_model_on_split(
+                train_df=fold_split["train_df"],
+                test_df=fold_split["test_df"],
+                feature_columns=feature_columns,
+                training_config=validation_config,
+            )
+            model = training_result["model"]
+            metrics = training_result["metrics"]
+            prediction_df = training_result["prediction_df"].copy()
+            prediction_df["fold_number"] = fold_split["fold_number"]
+            prediction_frames.append(prediction_df)
+
+            feature_importance_df = model.get_feature_importance_frame()
+            feature_importance_df["fold_number"] = fold_split["fold_number"]
+            feature_importance_frames.append(feature_importance_df)
+
+            fold_metric_rows.append(
+                {
+                    "foldNumber": fold_split["fold_number"],
+                    "trainRows": int(len(fold_split["train_df"])),
+                    "testRows": int(len(fold_split["test_df"])),
+                    "trainTimestampCount": fold_split["train_timestamp_count"],
+                    "testTimestampCount": fold_split["test_timestamp_count"],
+                    "trainStartTimestamp": str(fold_split["train_start_timestamp"]),
+                    "trainEndTimestamp": str(fold_split["train_end_timestamp"]),
+                    "testStartTimestamp": str(fold_split["test_start_timestamp"]),
+                    "testEndTimestamp": str(fold_split["test_end_timestamp"]),
+                    "purgeGapTimestamps": int(fold_split["purgeGapTimestamps"]),
+                    "purgedTimestampCount": int(fold_split["purgedTimestampCount"]),
+                    "accuracy": float(metrics["accuracy"]),
+                    "balancedAccuracy": float(metrics["balanced_accuracy"]),
+                }
+            )
+            self._save_walk_forward_progress(
+                fold_metric_rows=fold_metric_rows,
+                prediction_frames=prediction_frames,
+                feature_importance_frames=feature_importance_frames,
+            )
+
+        walk_forward_predictions_df = pd.concat(prediction_frames, ignore_index=True)
+        walk_forward_predictions_df = walk_forward_predictions_df.sort_values(
+            by=["timestamp", "product_id"] if "product_id" in walk_forward_predictions_df.columns else ["timestamp"]
+        ).reset_index(drop=True)
+        fold_metrics_df = pd.DataFrame(fold_metric_rows)
+        average_feature_importance_df = self._average_feature_importance(feature_importance_frames)
+
+        aggregate_metrics = MarketRegimeModel.build_classification_metrics(
+            actual_labels=walk_forward_predictions_df[MarketRegimeModel.target_column],
+            predicted_labels=walk_forward_predictions_df["predicted_market_regime_code"],
+        )
+        aggregate_metrics.update(
+            {
+                "model_type": MarketRegimeModel.model_type,
+                "estimator_type": validation_config.model_type,
+                "fold_count": int(len(fold_metrics_df)),
+                "out_of_sample_rows": int(len(walk_forward_predictions_df)),
+                "average_fold_accuracy": float(fold_metrics_df["accuracy"].mean()),
+                "average_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].mean()),
+                "best_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].max()),
+                "worst_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].min()),
+                "test_class_distribution": MarketRegimeModel.build_class_distribution(
+                    walk_forward_predictions_df[MarketRegimeModel.target_column]
+                ),
+                "walkforward_settings": {
+                    "minTrainSize": float(validation_config.walkforward_min_train_size),
+                    "testSize": float(validation_config.walkforward_test_size),
+                    "stepSize": float(validation_config.walkforward_step_size),
+                    "purgeGapTimestamps": int(self._resolve_walkforward_purge_gap(validation_config)),
+                },
+                "config": config_to_dict(validation_config),
+            }
+        )
+
+        return {
+            "config": validation_config,
+            "fold_metrics_df": fold_metrics_df,
+            "walk_forward_predictions_df": walk_forward_predictions_df,
+            "average_feature_importance_df": average_feature_importance_df,
+            "summary": aggregate_metrics,
+        }
+
+    def _save_walk_forward_outputs(
+        self,
+        walk_forward_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Save the standalone regime walk-forward outputs."""
+
+        fold_metrics_df = walk_forward_result["fold_metrics_df"]
+        walk_forward_predictions_df = walk_forward_result["walk_forward_predictions_df"]
+        average_feature_importance_df = walk_forward_result["average_feature_importance_df"]
+        walk_forward_summary = walk_forward_result["summary"]
+
+        fold_metrics_path = OUTPUTS_DIR / "regimeWalkForwardFoldMetrics.csv"
+        predictions_path = OUTPUTS_DIR / "regimeWalkForwardPredictions.csv"
+        feature_importance_path = OUTPUTS_DIR / "regimeWalkForwardFeatureImportance.csv"
+        summary_path = OUTPUTS_DIR / "regimeWalkForwardSummary.json"
+
+        self.save_dataframe(fold_metrics_df, fold_metrics_path)
+        self.save_dataframe(walk_forward_predictions_df, predictions_path)
+        self.save_dataframe(average_feature_importance_df, feature_importance_path)
+        self.save_json(walk_forward_summary, summary_path)
+
+        return {
+            "modelType": MarketRegimeModel.model_type,
+            "estimatorType": self.config.model_type,
+            "datasetPath": str(self.dataset_path),
+            "walkForwardFoldMetricsPath": str(fold_metrics_path),
+            "walkForwardPredictionsPath": str(predictions_path),
+            "walkForwardFeatureImportancePath": str(feature_importance_path),
+            "walkForwardSummaryPath": str(summary_path),
+            "foldCount": int(len(fold_metrics_df)),
+            "outOfSampleRows": int(len(walk_forward_predictions_df)),
+            "accuracy": float(walk_forward_summary["accuracy"]),
+            "balancedAccuracy": float(walk_forward_summary["balanced_accuracy"]),
+            "averageFoldBalancedAccuracy": float(walk_forward_summary["average_fold_balanced_accuracy"]),
+        }
+
+    def _average_feature_importance(
+        self,
+        feature_importance_frames: List[pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Average feature importance across regime-validation folds."""
+
+        valid_feature_importance_frames = [
+            feature_importance_df
+            for feature_importance_df in feature_importance_frames
+            if not feature_importance_df.empty
+            and {"feature", "importance"}.issubset(feature_importance_df.columns)
+        ]
+
+        if not valid_feature_importance_frames:
+            return pd.DataFrame(columns=["feature", "importance"])
+
+        combined_feature_importance_df = pd.concat(valid_feature_importance_frames, ignore_index=True)
+        return (
+            combined_feature_importance_df.groupby("feature", as_index=False)
+            .agg(importance=("importance", "mean"))
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def _save_walk_forward_progress(
+        self,
+        fold_metric_rows: List[Dict[str, Any]],
+        prediction_frames: List[pd.DataFrame],
+        feature_importance_frames: List[pd.DataFrame],
+    ) -> None:
+        """Persist partial regime walk-forward outputs while folds are still running."""
+
+        if not fold_metric_rows:
+            return
+
+        self.save_dataframe(
+            pd.DataFrame(fold_metric_rows),
+            OUTPUTS_DIR / "regimeWalkForwardFoldMetrics.partial.csv",
+        )
+
+        if prediction_frames:
+            partial_predictions_df = pd.concat(prediction_frames, ignore_index=True)
+            partial_predictions_df = partial_predictions_df.sort_values(
+                by=["timestamp", "product_id"] if "product_id" in partial_predictions_df.columns else ["timestamp"]
+            ).reset_index(drop=True)
+            self.save_dataframe(
+                partial_predictions_df,
+                OUTPUTS_DIR / "regimeWalkForwardPredictions.partial.csv",
+            )
+
+        self.save_dataframe(
+            self._average_feature_importance(feature_importance_frames),
+            OUTPUTS_DIR / "regimeWalkForwardFeatureImportance.partial.csv",
+        )
+        self.save_json(
+            {
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "completedFolds": int(len(fold_metric_rows)),
+            },
+            OUTPUTS_DIR / "regimeWalkForwardProgress.json",
+        )
+
+
 class SignalParameterTuningApp(WalkForwardValidationApp):
     """Tune label thresholds and backtest confidence with walk-forward scoring."""
 
@@ -1082,7 +1489,10 @@ class SignalGenerationApp(BaseSignalApp):
         self._ensure_market_data_available()
         feature_df = self.dataset_builder.build_feature_table()
         prediction_df = self.model.predict(feature_df)
-        latest_signals = build_latest_signal_summaries(prediction_df)
+        latest_signals = build_latest_signal_summaries(
+            prediction_df,
+            minimum_action_confidence=self.config.backtest_min_confidence,
+        )
         actionable_signals = build_actionable_signal_summaries(latest_signals)
         top_signal = select_primary_signal(latest_signals)
         frontend_signal_snapshot = build_frontend_signal_snapshot(
@@ -1200,6 +1610,9 @@ class MarketDataRefreshApp(BaseSignalApp):
         coinmarketcap_context_status = "disabled"
         coinmarketcap_context_rows = 0
         coinmarketcap_context_error = ""
+        coinmarketcal_events_status = "disabled"
+        coinmarketcal_events_rows = 0
+        coinmarketcal_events_error = ""
 
         if self.config.coinmarketcap_use_context:
             context_enricher = self.build_coinmarketcap_context_enricher(
@@ -1221,14 +1634,34 @@ class MarketDataRefreshApp(BaseSignalApp):
             else:
                 coinmarketcap_context_status = "enabled_cached_only"
 
+        if self.config.coinmarketcal_use_events:
+            event_enricher = self.build_coinmarketcal_event_enricher(
+                should_refresh_events=self.config.coinmarketcal_refresh_events_after_market_refresh,
+            )
+
+            if self.config.coinmarketcal_refresh_events_after_market_refresh:
+                try:
+                    events_df = event_enricher.refresh_events(price_df)
+                    coinmarketcal_events_status = "refreshed"
+                    coinmarketcal_events_rows = len(events_df)
+                except Exception as error:
+                    error_message = str(error)
+                    if "requires an API key" in error_message:
+                        coinmarketcal_events_status = "skipped_missing_api_key"
+                    else:
+                        coinmarketcal_events_status = "refresh_failed"
+                        coinmarketcal_events_error = error_message
+            else:
+                coinmarketcal_events_status = "enabled_cached_only"
+
         return {
             "marketDataSource": self.config.market_data_source,
             "productMode": (
-                f"all-{self.config.coinbase_quote_currency.upper()}-quoted-products"
-                if self.config.coinbase_fetch_all_quote_products
+                f"all-{self._resolve_market_quote_currency().upper()}-quoted-products"
+                if self._resolve_market_fetch_all_quote_products()
                 else "explicit-product-list"
             ),
-            "granularitySeconds": self.config.coinbase_granularity_seconds,
+            "granularitySeconds": self._resolve_market_granularity_seconds(),
             "savedPath": str(self.config.data_file),
             "rowsDownloaded": len(price_df),
             "uniqueProducts": int(price_df["product_id"].nunique()) if "product_id" in price_df.columns else 1,
@@ -1239,6 +1672,45 @@ class MarketDataRefreshApp(BaseSignalApp):
             "coinMarketCapContextRows": coinmarketcap_context_rows,
             "coinMarketCapContextError": coinmarketcap_context_error,
             "coinMarketCapContextPath": str(self.config.coinmarketcap_context_file),
+            "coinMarketCalEventsStatus": coinmarketcal_events_status,
+            "coinMarketCalEventsRows": coinmarketcal_events_rows,
+            "coinMarketCalEventsError": coinmarketcal_events_error,
+            "coinMarketCalEventsPath": str(self.config.coinmarketcal_events_file),
+        }
+
+
+class MarketEventsRefreshApp(BaseSignalApp):
+    """Refresh the cached CoinMarketCal event snapshot independently of candle refreshes."""
+
+    def run(self) -> Dict[str, Any]:
+        """Load the tracked market universe and refresh its event cache."""
+
+        self._ensure_market_data_available()
+        price_df = CsvPriceDataLoader(self.config.data_file).load()
+        event_enricher = self.build_coinmarketcal_event_enricher(should_refresh_events=True)
+        events_df = event_enricher.refresh_events(price_df)
+        refresh_summary = getattr(event_enricher, "last_events_summary", {})
+
+        return {
+            "status": "refreshed",
+            "marketDataPath": str(self.config.data_file),
+            "eventsPath": str(self.config.coinmarketcal_events_file),
+            "trackedProducts": (
+                int(price_df["product_id"].nunique())
+                if "product_id" in price_df.columns
+                else 1
+            ),
+            "trackedBaseCurrencies": (
+                int(price_df["base_currency"].astype(str).str.upper().nunique())
+                if "base_currency" in price_df.columns
+                else (
+                    int(price_df["product_id"].astype(str).str.split("-").str[0].nunique())
+                    if "product_id" in price_df.columns
+                    else 0
+                )
+            ),
+            "eventsRows": int(len(events_df)),
+            "refreshSummary": refresh_summary,
         }
 
 
@@ -1257,21 +1729,18 @@ class MarketUniverseRefreshApp(BaseSignalApp):
         market_loader = self.build_market_data_loader()
         total_products = len(market_loader.get_available_products())
         total_batches = market_loader.get_total_batches()
-        start_batch = self.config.coinbase_product_batch_number
+        start_batch = self._resolve_market_product_batch_number()
 
         if start_batch > total_batches:
             raise ValueError(
-                "coinbase_product_batch_number is beyond the available batch count. "
+                "The configured market product batch number is beyond the available batch count. "
                 f"Start batch: {start_batch}, total batches: {total_batches}."
             )
 
         batch_results = []
         failed_batches = []
         for batch_number in range(start_batch, total_batches + 1):
-            batch_config = replace(
-                self.config,
-                coinbase_product_batch_number=batch_number,
-            )
+            batch_config = self._with_market_product_batch_number(batch_number)
             batch_app = MarketDataRefreshApp(config=batch_config)
             try:
                 batch_result = batch_app.run()

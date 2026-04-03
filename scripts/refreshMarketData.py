@@ -26,6 +26,9 @@ def main() -> None:
     print(f"CoinMarketCap context status: {results['coinMarketCapContextStatus']}")
     print(f"CoinMarketCap context rows: {results['coinMarketCapContextRows']}")
     print(f"CoinMarketCap context path: {results['coinMarketCapContextPath']}")
+    print(f"CoinMarketCal events status: {results['coinMarketCalEventsStatus']}")
+    print(f"CoinMarketCal events rows: {results['coinMarketCalEventsRows']}")
+    print(f"CoinMarketCal events path: {results['coinMarketCalEventsPath']}")
     if results["downloadSummary"]:
         print(f"Download summary: {results['downloadSummary']}")
 

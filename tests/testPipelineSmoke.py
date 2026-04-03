@@ -16,6 +16,7 @@ if str(SRC_DIR) not in sys.path:
 
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
 from crypto_signal_ml.app import (  # noqa: E402
+    MarketEventsRefreshApp,
     MarketDataRefreshApp,
     MarketUniverseRefreshApp,
     SignalParameterTuningApp,
@@ -23,7 +24,14 @@ from crypto_signal_ml.app import (  # noqa: E402
     WalkForwardValidationApp,
 )
 from crypto_signal_ml.backtesting import EqualWeightSignalBacktester  # noqa: E402
-from crypto_signal_ml.data import CoinbaseExchangePriceDataLoader, CoinMarketCapContextEnricher, CsvPriceDataLoader  # noqa: E402
+from crypto_signal_ml.data import (  # noqa: E402
+    CoinbaseExchangePriceDataLoader,
+    CoinMarketCalEventEnricher,
+    CoinMarketCapContextEnricher,
+    CoinMarketCapOhlcvPriceDataLoader,
+    CsvPriceDataLoader,
+    create_market_data_loader,
+)
 from crypto_signal_ml.environment import load_env_file  # noqa: E402
 from crypto_signal_ml.features import TechnicalFeatureEngineer  # noqa: E402
 from crypto_signal_ml.frontend import SignalSnapshotStore, build_frontend_signal_snapshot  # noqa: E402
@@ -40,7 +48,7 @@ from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
 from crypto_signal_ml.signals import build_actionable_signal_summaries, build_latest_signal_summaries  # noqa: E402
 
 
-def _build_sample_market_frame(total_hours: int = 24) -> DataFrame:
+def _build_sample_market_frame(total_hours: int = 96) -> DataFrame:
     """
     Create a small but realistic multi-coin market dataset for tests.
 
@@ -77,7 +85,7 @@ def _build_sample_market_frame(total_hours: int = 24) -> DataFrame:
     return pd.DataFrame(rows)
 
 
-def _build_mixed_market_frame(total_hours: int = 48) -> DataFrame:
+def _build_mixed_market_frame(total_hours: int = 120) -> DataFrame:
     """
     Create a multi-coin dataset with alternating up and down moves.
 
@@ -374,6 +382,147 @@ def test_coinbase_loader_reports_total_batches(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert loader.get_total_batches() == 3
+
+
+def test_coinmarketcap_loader_can_normalize_historical_quote_rows() -> None:
+    """The CoinMarketCap loader should normalize nested historical OHLCV rows."""
+
+    loader = CoinMarketCapOhlcvPriceDataLoader(
+        data_path=Path("marketPrices.csv"),
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        quote_currency="USD",
+        granularity_seconds=3600,
+        total_candles=2,
+        should_save_downloaded_data=False,
+    )
+
+    raw_rows = loader._extract_historical_quote_rows(
+        response_payload={
+            "data": {
+                "btc": {
+                    "symbol": "BTC",
+                    "quotes": [
+                        {
+                            "time_close": "2026-01-01T00:00:00Z",
+                            "quote": {
+                                "USD": {
+                                    "open": 100.0,
+                                    "high": 105.0,
+                                    "low": 99.0,
+                                    "close": 104.0,
+                                    "volume": 1250.0,
+                                }
+                            },
+                        },
+                        {
+                            "time_close": "2026-01-01T01:00:00Z",
+                            "quote": {
+                                "USD": {
+                                    "open": 104.0,
+                                    "high": 106.0,
+                                    "low": 103.0,
+                                    "close": 105.0,
+                                    "volume": 1180.0,
+                                }
+                            },
+                        },
+                    ],
+                }
+            }
+        },
+        base_currency="BTC",
+    )
+    normalized_rows = loader._normalize_candle_rows(
+        product_id="BTC-USD",
+        base_currency="BTC",
+        quote_currency="USD",
+        candle_rows=raw_rows,
+    )
+    price_df = loader._build_price_frame(normalized_rows)
+
+    assert len(raw_rows) == 2
+    assert list(price_df.columns[:6]) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert len(price_df) == 2
+    assert price_df.iloc[0]["timestamp"] < price_df.iloc[1]["timestamp"]
+
+
+def test_market_data_loader_factory_can_create_coinmarketcap_loader() -> None:
+    """The source factory should build the CoinMarketCap loader when configured."""
+
+    loader = create_market_data_loader(
+        TrainingConfig(
+            market_data_source="coinmarketcap",
+            coinmarketcap_use_context=False,
+        ),
+        should_save_downloaded_data=False,
+    )
+
+    assert isinstance(loader, CoinMarketCapOhlcvPriceDataLoader)
+
+
+def test_coinmarketcal_event_enricher_adds_upcoming_event_context(tmp_path: Path) -> None:
+    """The CoinMarketCal enricher should attach simple upcoming-event features from cache."""
+
+    events_path = tmp_path / "coinMarketCalEvents.csv"
+    pd.DataFrame(
+        [
+            {
+                "event_id": "1",
+                "event_title": "Mainnet upgrade",
+                "event_category": "protocol",
+                "event_start": "2026-01-05T00:00:00Z",
+                "base_currency": "BTC",
+            },
+            {
+                "event_id": "2",
+                "event_title": "Conference",
+                "event_category": "community",
+                "event_start": "2026-01-20T00:00:00Z",
+                "base_currency": "BTC",
+            },
+        ]
+    ).to_csv(events_path, index=False)
+
+    price_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 10.0,
+            },
+            {
+                "timestamp": "2026-01-10T00:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "open": 110.0,
+                "high": 111.0,
+                "low": 109.0,
+                "close": 110.0,
+                "volume": 12.0,
+            },
+        ]
+    )
+
+    enricher = CoinMarketCalEventEnricher(
+        events_path=events_path,
+        api_base_url="https://developers.coinmarketcal.com/v1",
+        api_key_env_var="COINMARKETCAL_API_KEY",
+        should_refresh_events=False,
+        log_progress=False,
+    )
+    enriched_df = enricher.enrich(price_df)
+
+    assert enriched_df.loc[0, "cmcal_event_count_next_7d"] == 1
+    assert enriched_df.loc[0, "cmcal_has_event_next_7d"] == 1
+    assert enriched_df.loc[0, "cmcal_event_count_next_30d"] == 2
+    assert enriched_df.loc[1, "cmcal_event_count_next_7d"] == 0
+    assert enriched_df.loc[1, "cmcal_event_count_next_30d"] == 1
 
 
 def test_csv_loader_rebuilds_time_step_from_saved_raw_file(tmp_path: Path) -> None:
@@ -939,7 +1088,7 @@ def test_market_universe_refresh_app_continues_after_batch_failure(
             return 3
 
     def fake_batch_run(self: MarketDataRefreshApp) -> dict:
-        batch_number = self.config.coinbase_product_batch_number
+        batch_number = self.config.coinmarketcap_product_batch_number
         if batch_number == 2:
             raise RuntimeError("simulated batch failure")
 
@@ -958,6 +1107,63 @@ def test_market_universe_refresh_app_continues_after_batch_failure(
     assert result["failedBatches"] == [2]
     assert result["successfulBatches"] == [1, 3]
     assert len(result["batchResults"]) == 3
+
+
+def test_market_events_refresh_app_refreshes_cached_coinmarketcal_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The standalone event-refresh app should update the cached CoinMarketCal snapshot."""
+
+    data_path = tmp_path / "marketPrices.csv"
+    events_path = tmp_path / "coinMarketCalEvents.csv"
+    sample_df = _build_sample_market_frame()
+    sample_df["base_currency"] = sample_df["product_id"].str.split("-").str[0]
+    sample_df["quote_currency"] = "USD"
+    sample_df.to_csv(data_path, index=False)
+
+    refresh_app = MarketEventsRefreshApp(
+        config=TrainingConfig(
+            data_file=data_path,
+            coinmarketcap_use_context=False,
+            coinmarketcal_events_file=events_path,
+        )
+    )
+
+    class FakeEventEnricher:
+        last_events_summary = {
+            "eventsPath": str(events_path),
+            "coinsRequested": 2,
+            "rowsSaved": 1,
+            "finalRowsSaved": 1,
+        }
+
+        def refresh_events(self, price_df: pd.DataFrame) -> pd.DataFrame:
+            assert len(price_df) > 0
+            return pd.DataFrame(
+                [
+                    {
+                        "event_id": "evt-1",
+                        "event_title": "Protocol upgrade",
+                        "event_category": "protocol",
+                        "event_start": "2026-01-03T00:00:00Z",
+                        "base_currency": "BTC",
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        refresh_app,
+        "build_coinmarketcal_event_enricher",
+        lambda should_refresh_events: FakeEventEnricher(),
+    )
+
+    result = refresh_app.run()
+
+    assert result["status"] == "refreshed"
+    assert result["trackedProducts"] == 2
+    assert result["eventsRows"] == 1
+    assert result["refreshSummary"]["coinsRequested"] == 2
 
 
 def test_walk_forward_validation_app_builds_out_of_sample_summary(
@@ -1127,6 +1333,14 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
             "confidence": 0.82,
             "setupScore": 4.0,
             "signalChat": "BTC-USD is a BUY setup.",
+            "marketState": {
+                "label": "trend_up",
+                "code": 2,
+                "trendScore": 0.03,
+                "volatilityRatio": 1.10,
+                "isTrending": True,
+                "isHighVolatility": False,
+            },
         },
         {
             "productId": "ETH-USD",
@@ -1135,6 +1349,14 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
             "confidence": 0.71,
             "setupScore": 3.0,
             "signalChat": "ETH-USD is a TAKE_PROFIT setup for spot trading.",
+            "marketState": {
+                "label": "range_high_volatility",
+                "code": 4,
+                "trendScore": 0.00,
+                "volatilityRatio": 1.35,
+                "isTrending": False,
+                "isHighVolatility": True,
+            },
         },
         {
             "productId": "SOL-USD",
@@ -1143,6 +1365,14 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
             "confidence": 0.66,
             "setupScore": 0.0,
             "signalChat": "SOL-USD is a HOLD setup.",
+            "marketState": {
+                "label": "trend_up",
+                "code": 2,
+                "trendScore": 0.02,
+                "volatilityRatio": 0.95,
+                "isTrending": True,
+                "isHighVolatility": False,
+            },
         },
     ]
     actionable_signals = latest_signals[:2]
@@ -1158,13 +1388,17 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
 
     snapshot_store = SignalSnapshotStore(snapshot_path)
     overview = snapshot_store.get_overview()
+    market_state = snapshot_store.get_market_state()
     buy_signals = snapshot_store.list_signals(action="buy")
     actionable_list = snapshot_store.list_signals(action="actionable")
     eth_signal = snapshot_store.get_signal_by_product("eth-usd")
 
+    assert overview["marketState"]["dominant"]["label"] == "trend_up"
     assert overview["marketSummary"]["signalCounts"]["buy"] == 1
     assert overview["marketSummary"]["signalCounts"]["take_profit"] == 1
     assert overview["marketSummary"]["signalCounts"]["wait"] == 1
+    assert market_state["highVolatilitySignals"] == 1
+    assert market_state["trendingSignals"] == 2
     assert len(buy_signals) == 1
     assert buy_signals[0]["productId"] == "BTC-USD"
     assert len(actionable_list) == 2

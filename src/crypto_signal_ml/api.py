@@ -53,6 +53,7 @@ def create_signal_api(snapshot_path: Path = OUTPUTS_DIR / "frontendSignalSnapsho
             "status": "ok",
             "generatedAt": overview["generatedAt"],
             "modelType": overview["modelType"],
+            "marketState": overview.get("marketState", {}),
             "snapshotPath": str(snapshot_path),
         }
 
@@ -62,6 +63,12 @@ def create_signal_api(snapshot_path: Path = OUTPUTS_DIR / "frontendSignalSnapsho
 
         return snapshot_store.get_overview()
 
+    @app.get("/api/market-state")
+    def market_state() -> dict:
+        """Return the cached aggregate market-state summary."""
+
+        return snapshot_store.get_market_state()
+
     @app.get("/api/signals")
     def list_signals(
         action: str = Query(default="all"),
@@ -69,10 +76,11 @@ def create_signal_api(snapshot_path: Path = OUTPUTS_DIR / "frontendSignalSnapsho
     ) -> dict:
         """Return cached signal rows for the requested action filter."""
 
+        signal_rows = snapshot_store.list_signals(action=action, limit=limit)
         return {
             "action": action,
-            "count": len(snapshot_store.list_signals(action=action, limit=limit)),
-            "signals": snapshot_store.list_signals(action=action, limit=limit),
+            "count": len(signal_rows),
+            "signals": signal_rows,
         }
 
     @app.get("/api/signals/{product_id}")

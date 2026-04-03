@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .config import TrainingConfig
+from .regimes import REGIME_LABEL_TO_CODE
 
 
 SIGNAL_NAME_MAP = {
@@ -257,6 +258,71 @@ class TripleBarrierSignalLabeler(BaseSignalLabeler):
         return "lower"
 
 
+class MarketRegimeLabeler(BaseSignalLabeler):
+    """
+    Create explicit future market-state targets from the regime columns.
+
+    The current feature table already contains descriptive regime columns such
+    as `market_regime_label` and `market_regime_code`. This labeler turns that
+    current-state information into a supervised target by shifting the regime
+    forward per asset, which lets a separate model learn regime transitions.
+    """
+
+    def __init__(self, prediction_horizon: int = 1) -> None:
+        if prediction_horizon < 1:
+            raise ValueError("prediction_horizon must be at least 1 for regime labeling.")
+
+        self.prediction_horizon = prediction_horizon
+
+    def add_labels(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """Attach current and future regime labels to the feature table."""
+
+        if "market_regime_label" not in feature_df.columns:
+            raise ValueError("market_regime_label is missing. Run regime enrichment before regime labeling.")
+
+        labeled_df = feature_df.copy()
+        labeled_df["current_market_regime_label"] = (
+            labeled_df["market_regime_label"]
+            .fillna("unknown")
+            .astype(str)
+        )
+        labeled_df["current_market_regime_code"] = pd.to_numeric(
+            labeled_df.get("market_regime_code", 0.0),
+            errors="coerce",
+        )
+
+        labeled_df["target_market_regime_label"] = self._shift_by_asset(
+            labeled_df=labeled_df,
+            column_name="current_market_regime_label",
+            periods=-self.prediction_horizon,
+        )
+        labeled_df["target_market_regime_code"] = self._shift_by_asset(
+            labeled_df=labeled_df,
+            column_name="current_market_regime_code",
+            periods=-self.prediction_horizon,
+        )
+
+        if labeled_df["target_market_regime_code"].isna().any():
+            mapped_target_codes = labeled_df["target_market_regime_label"].map(REGIME_LABEL_TO_CODE)
+            labeled_df["target_market_regime_code"] = labeled_df["target_market_regime_code"].fillna(mapped_target_codes)
+
+        labeled_df["target_market_regime_code"] = pd.to_numeric(
+            labeled_df["target_market_regime_code"],
+            errors="coerce",
+        )
+        labeled_df["market_regime_changed"] = (
+            labeled_df["target_market_regime_label"].notna()
+            & (labeled_df["target_market_regime_label"] != labeled_df["current_market_regime_label"])
+        ).astype(float)
+        labeled_df["market_regime_transition"] = np.where(
+            labeled_df["target_market_regime_label"].notna(),
+            labeled_df["current_market_regime_label"] + " -> " + labeled_df["target_market_regime_label"].astype(str),
+            np.nan,
+        )
+
+        return labeled_df
+
+
 def create_labeler_from_config(config: TrainingConfig) -> BaseSignalLabeler:
     """Build the configured labeling strategy from one config object."""
 
@@ -282,6 +348,12 @@ def create_labeler_from_config(config: TrainingConfig) -> BaseSignalLabeler:
     )
 
 
+def create_regime_labeler_from_config(config: TrainingConfig) -> MarketRegimeLabeler:
+    """Build the default regime labeler from the active training config."""
+
+    return MarketRegimeLabeler(prediction_horizon=config.prediction_horizon)
+
+
 def signal_to_text(signal_value: int) -> str:
     """
     Backward-compatible helper that delegates to the base labeler class.
@@ -304,4 +376,15 @@ def add_signal_labels(
         prediction_horizon=prediction_horizon,
         buy_threshold=buy_threshold,
         sell_threshold=sell_threshold,
+    ).add_labels(feature_df)
+
+
+def add_regime_labels(
+    feature_df: pd.DataFrame,
+    prediction_horizon: int = 1,
+) -> pd.DataFrame:
+    """Backward-compatible helper for attaching explicit regime targets."""
+
+    return MarketRegimeLabeler(
+        prediction_horizon=prediction_horizon,
     ).add_labels(feature_df)
