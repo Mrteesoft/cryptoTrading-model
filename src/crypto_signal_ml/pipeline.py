@@ -5,12 +5,13 @@ from typing import List, Tuple
 
 import pandas as pd
 
-from .config import TrainingConfig
+from .config import TrainingConfig, is_coinmarketcap_market_data_source
 from .data import (
     BasePriceDataEnricher,
     BasePriceDataLoader,
     CoinMarketCalEventEnricher,
     CoinMarketCapContextEnricher,
+    CoinMarketCapMarketIntelligenceEnricher,
     CsvPriceDataLoader,
     EnrichedPriceDataLoader,
     align_multi_timeframe_context,
@@ -138,7 +139,7 @@ class BaseDatasetBuilder(ABC):
             if not granularity_series.empty:
                 return int(granularity_series.mode().iloc[0])
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_granularity_seconds)
 
         return int(self.config.coinbase_granularity_seconds)
@@ -192,6 +193,20 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
                     request_pause_seconds=config.coinmarketcap_request_pause_seconds,
                     should_refresh_context=config.coinmarketcap_refresh_context_on_load,
                     log_progress=config.coinmarketcap_log_progress,
+                )
+            )
+        if config.coinmarketcap_use_market_intelligence:
+            enrichers.append(
+                CoinMarketCapMarketIntelligenceEnricher(
+                    intelligence_path=config.coinmarketcap_market_intelligence_file,
+                    api_base_url=config.coinmarketcap_api_base_url,
+                    api_key_env_var=config.coinmarketcap_api_key_env_var,
+                    quote_currency=config.coinmarketcap_quote_currency,
+                    request_pause_seconds=config.coinmarketcap_request_pause_seconds,
+                    should_refresh_market_intelligence=config.coinmarketcap_refresh_market_intelligence_on_load,
+                    log_progress=config.coinmarketcap_log_progress,
+                    global_metrics_endpoint=config.coinmarketcap_global_metrics_endpoint,
+                    fear_greed_latest_endpoint=config.coinmarketcap_fear_greed_latest_endpoint,
                 )
             )
         if config.coinmarketcal_use_events:

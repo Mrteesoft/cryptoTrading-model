@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Sequence
 
 import pandas as pd
 
-from .config import TrainingConfig
+from .config import TrainingConfig, is_coinmarketcap_market_data_source
 from .data import CsvPriceDataLoader, create_market_data_loader
 
 
@@ -543,7 +543,7 @@ class MarketChartService:
     def _base_granularity_seconds(self) -> int:
         """Resolve the active raw-candle size from the configured data source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_granularity_seconds)
 
         return int(self.config.coinbase_granularity_seconds)
@@ -632,7 +632,7 @@ class MarketChartService:
         """Return the configured fallback product ids when no cached file exists."""
 
         candidate_product_ids: list[str] = []
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             candidate_product_ids.extend(self.config.coinmarketcap_product_ids)
         else:
             candidate_product_ids.extend(self.config.coinbase_product_ids)
@@ -652,7 +652,7 @@ class MarketChartService:
     def _exchange_name(self) -> str:
         """Return the display exchange name for the active source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return "CMC"
 
         return "COINBASE"
@@ -660,7 +660,7 @@ class MarketChartService:
     def _quote_currency(self) -> str:
         """Return the active quote currency for the current source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return self.config.coinmarketcap_quote_currency
 
         return self.config.coinbase_quote_currency

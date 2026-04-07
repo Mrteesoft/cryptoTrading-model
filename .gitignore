@@ -19,5 +19,6 @@ models/*.json
 
 outputs/*.csv
 outputs/*.json
+outputs/*.log
 outputs/*.sqlite3
 !outputs/.gitkeep

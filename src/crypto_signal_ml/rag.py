@@ -9,11 +9,12 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
-import sqlite3
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
+
+from .storage.database import DatabaseConnection, DatabaseHandle
 
 
 COMMON_STOP_WORDS = {
@@ -92,18 +93,22 @@ def _tokenize(text: str) -> set[str]:
 
 
 class RagKnowledgeStore:
-    """Store source documents and searchable chunks in a local SQLite database."""
+    """Store source documents and searchable chunks in SQLite or PostgreSQL."""
 
     def __init__(
         self,
         db_path: Path,
+        database_url: str | None = None,
         chunk_size_chars: int = 900,
         chunk_overlap_chars: int = 120,
         fetch_timeout_seconds: float = 15.0,
         fetch_max_chars: int = 50000,
     ) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database = DatabaseHandle(
+            sqlite_path=db_path,
+            database_url=database_url,
+        )
+        self.db_path = self.database.sqlite_path
         self.chunk_size_chars = max(int(chunk_size_chars), 200)
         self.chunk_overlap_chars = max(min(int(chunk_overlap_chars), self.chunk_size_chars - 1), 0)
         self.fetch_timeout_seconds = max(float(fetch_timeout_seconds), 1.0)
@@ -114,12 +119,18 @@ class RagKnowledgeStore:
         """Return counts that describe the current knowledge-store state."""
 
         with self._connect() as connection:
-            source_count = int(connection.execute("SELECT COUNT(*) FROM rag_sources").fetchone()[0])
-            chunk_count = int(connection.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0])
+            source_count = int(
+                connection.execute("SELECT COUNT(*) AS source_count FROM rag_sources").fetchone()["source_count"]
+            )
+            chunk_count = int(
+                connection.execute("SELECT COUNT(*) AS chunk_count FROM rag_chunks").fetchone()["chunk_count"]
+            )
 
         return {
             "enabled": True,
-            "dbPath": str(self.db_path),
+            "dbPath": str(self.db_path) if self.db_path is not None else None,
+            "storageBackend": self.database.storage_backend,
+            "databaseTarget": self.database.database_target,
             "sourceCount": source_count,
             "chunkCount": chunk_count,
         }
@@ -461,7 +472,7 @@ class RagKnowledgeStore:
         parser.feed(html_text)
         return parser.get_text()
 
-    def _row_to_source_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _row_to_source_dict(self, row: Mapping[str, Any]) -> Dict[str, Any]:
         """Convert one source row into a JSON-friendly dictionary."""
 
         return {
@@ -493,31 +504,49 @@ class RagKnowledgeStore:
                 )
                 """
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rag_chunks (
-                    chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id TEXT NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_uri TEXT,
-                    content TEXT NOT NULL,
-                    snippet TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    token_json TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(source_id) REFERENCES rag_sources(source_id)
+            if self.database.storage_backend == "postgresql":
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS rag_chunks (
+                        chunk_id BIGSERIAL PRIMARY KEY,
+                        source_id TEXT NOT NULL,
+                        chunk_index INTEGER NOT NULL,
+                        title TEXT NOT NULL,
+                        source_type TEXT NOT NULL,
+                        source_uri TEXT,
+                        content TEXT NOT NULL,
+                        snippet TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        token_json TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(source_id) REFERENCES rag_sources(source_id)
+                    )
+                    """
                 )
-                """
-            )
+            else:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS rag_chunks (
+                        chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_id TEXT NOT NULL,
+                        chunk_index INTEGER NOT NULL,
+                        title TEXT NOT NULL,
+                        source_type TEXT NOT NULL,
+                        source_uri TEXT,
+                        content TEXT NOT NULL,
+                        snippet TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        token_json TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(source_id) REFERENCES rag_sources(source_id)
+                    )
+                    """
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rag_chunks_source_id ON rag_chunks(source_id)"
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a SQLite connection with dict-style row access."""
+    def _connect(self) -> DatabaseConnection:
+        """Open a backend-aware connection with dict-style row access."""
 
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return self.database.connect()

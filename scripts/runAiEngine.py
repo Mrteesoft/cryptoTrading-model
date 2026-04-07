@@ -1,30 +1,16 @@
-"""Run the Python model and AI engine behind the TypeScript backend."""
+"""Backward-compatible wrapper for the canonical model-service entrypoint."""
 
 from __future__ import annotations
 
-import os
-
-import uvicorn
-
-from scriptSupport import bootstrap_src_path
-
-bootstrap_src_path()
-
-from crypto_signal_ml.engine_api import create_app  # noqa: E402
+import sys
+from pathlib import Path
 
 
-def main() -> None:
-    """Start the internal Python AI engine."""
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-    host = os.getenv("AI_ENGINE_HOST", "127.0.0.1")
-    port = int(os.getenv("AI_ENGINE_PORT", "8100"))
-    app = create_app()
-
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-    )
+from main import main  # noqa: E402
 
 
 if __name__ == "__main__":

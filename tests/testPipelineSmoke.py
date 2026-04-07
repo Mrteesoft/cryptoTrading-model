@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import sys
+from typing import Sequence
 
 import pandas as pd
 import pytest
@@ -14,28 +15,40 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from crypto_signal_ml.config import TrainingConfig  # noqa: E402
+from crypto_signal_ml.config import TrainingConfig, apply_runtime_market_data_settings  # noqa: E402
 from crypto_signal_ml.app import (  # noqa: E402
     MarketEventsRefreshApp,
     MarketDataRefreshApp,
     MarketUniverseRefreshApp,
+    SignalGenerationApp,
     SignalParameterTuningApp,
     TrainingApp,
     WalkForwardValidationApp,
 )
+from crypto_signal_ml.assistant import ConversationSessionStore  # noqa: E402
 from crypto_signal_ml.backtesting import EqualWeightSignalBacktester  # noqa: E402
 from crypto_signal_ml.data import (  # noqa: E402
     CoinbaseExchangePriceDataLoader,
     CoinMarketCalEventEnricher,
+    CoinMarketCapRateLimitError,
     CoinMarketCapContextEnricher,
+    CoinMarketCapLatestQuotesPriceDataLoader,
+    CoinMarketCapMarketIntelligenceEnricher,
     CoinMarketCapOhlcvPriceDataLoader,
     CsvPriceDataLoader,
     create_market_data_loader,
 )
 from crypto_signal_ml.environment import load_env_file  # noqa: E402
 from crypto_signal_ml.features import TechnicalFeatureEngineer  # noqa: E402
-from crypto_signal_ml.frontend import SignalSnapshotStore, build_frontend_signal_snapshot  # noqa: E402
+from crypto_signal_ml.frontend import (  # noqa: E402
+    SignalSnapshotStore,
+    WatchlistPoolStore,
+    build_frontend_signal_snapshot,
+    build_watchlist_pool_snapshot,
+)
 from crypto_signal_ml.labels import FutureReturnSignalLabeler, TripleBarrierSignalLabeler  # noqa: E402
+from crypto_signal_ml.live import LiveSignalEngine  # noqa: E402
+from crypto_signal_ml.monitor import SignalMonitorService  # noqa: E402
 from crypto_signal_ml.modeling import (  # noqa: E402
     BaseSignalModel,
     HistGradientBoostingSignalModel,
@@ -44,8 +57,17 @@ from crypto_signal_ml.modeling import (  # noqa: E402
     create_model_from_config,
 )
 from crypto_signal_ml.pipeline import CryptoDatasetBuilder  # noqa: E402
+from crypto_signal_ml.portfolio import TradingPortfolioStore  # noqa: E402
 from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
-from crypto_signal_ml.signals import build_actionable_signal_summaries, build_latest_signal_summaries  # noqa: E402
+from crypto_signal_ml.signals import (  # noqa: E402
+    apply_signal_trade_context,
+    build_actionable_signal_summaries,
+    build_latest_signal_summaries,
+    filter_published_signal_summaries,
+    select_primary_signal,
+)
+from crypto_signal_ml.symbols import is_signal_eligible_base_currency  # noqa: E402
+from crypto_signal_ml.trader_brain import TraderBrain  # noqa: E402
 
 
 def _build_sample_market_frame(total_hours: int = 96) -> DataFrame:
@@ -151,6 +173,16 @@ def test_config_can_create_logistic_regression_model() -> None:
     model = create_model_from_config(config=config, feature_columns=["return_1"])
 
     assert isinstance(model, LogisticRegressionSignalModel)
+
+
+def test_config_can_read_signal_exclusions_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Signal exclusions should be configurable from one comma-separated env var."""
+
+    monkeypatch.setenv("SIGNAL_EXCLUDED_BASE_CURRENCIES", "btc, eth, usdt, usdc, btc")
+
+    config = TrainingConfig()
+
+    assert config.signal_excluded_base_currencies == ("BTC", "ETH", "USDT", "USDC")
 
 
 def test_config_can_create_hist_gradient_boosting_model() -> None:
@@ -447,6 +479,93 @@ def test_coinmarketcap_loader_can_normalize_historical_quote_rows() -> None:
     assert price_df.iloc[0]["timestamp"] < price_df.iloc[1]["timestamp"]
 
 
+def test_coinmarketcap_latest_quotes_loader_can_merge_snapshot_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supported latest-quote snapshots should append cleanly to the local market history."""
+
+    data_path = tmp_path / "marketPrices.csv"
+    pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 10.0,
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "granularity_seconds": 3600,
+                "source": "coinbaseExchange",
+            }
+        ]
+    ).to_csv(data_path, index=False)
+
+    monkeypatch.setenv("COINMARKETCAP_API_KEY", "test-key")
+    loader = CoinMarketCapLatestQuotesPriceDataLoader(
+        data_path=data_path,
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        quote_currency="USD",
+        granularity_seconds=3600,
+        total_candles=120,
+        should_save_downloaded_data=False,
+        product_ids=("SOL-USD",),
+        fetch_all_quote_products=False,
+        log_progress=False,
+    )
+
+    def fake_request_json(endpoint_path: str, query_params: dict) -> dict:
+        assert endpoint_path == loader.quotes_latest_endpoint
+        assert query_params["symbol"] == "SOL"
+        return {
+            "status": {
+                "timestamp": "2026-01-01T01:00:00Z",
+                "error_code": 0,
+            },
+            "data": {
+                "SOL": [
+                    {
+                        "id": 5426,
+                        "name": "Solana",
+                        "symbol": "SOL",
+                        "circulating_supply": 480_000_000,
+                        "total_supply": 600_000_000,
+                        "max_supply": None,
+                        "quote": {
+                            "USD": {
+                                "price": 110.5,
+                                "volume_24h": 3_400_000_000,
+                                "volume_change_24h": 5.2,
+                                "market_cap": 53_000_000_000,
+                                "fully_diluted_market_cap": 66_000_000_000,
+                                "percent_change_1h": 0.4,
+                                "percent_change_24h": 3.1,
+                                "percent_change_7d": 8.4,
+                                "percent_change_30d": 18.2,
+                                "last_updated": "2026-01-01T01:00:00Z",
+                            }
+                        },
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(loader, "_request_json", fake_request_json)
+
+    price_df = loader.load()
+
+    assert set(price_df["product_id"]) == {"BTC-USD", "SOL-USD"}
+    sol_row = price_df.loc[price_df["product_id"] == "SOL-USD"].iloc[0]
+    assert float(sol_row["open"]) == pytest.approx(110.5)
+    assert float(sol_row["high"]) == pytest.approx(110.5)
+    assert float(sol_row["low"]) == pytest.approx(110.5)
+    assert float(sol_row["close"]) == pytest.approx(110.5)
+    assert float(sol_row["cmc_market_cap"]) == pytest.approx(53_000_000_000)
+    assert float(sol_row["cmc_percent_change_7d"]) == pytest.approx(8.4)
+    assert str(sol_row["source"]) == "coinmarketcapLatestQuotes"
+
+
 def test_market_data_loader_factory_can_create_coinmarketcap_loader() -> None:
     """The source factory should build the CoinMarketCap loader when configured."""
 
@@ -459,6 +578,93 @@ def test_market_data_loader_factory_can_create_coinmarketcap_loader() -> None:
     )
 
     assert isinstance(loader, CoinMarketCapOhlcvPriceDataLoader)
+
+
+def test_market_data_loader_factory_can_create_coinmarketcap_latest_quotes_loader() -> None:
+    """The source factory should build the supported CMC latest-quotes loader when configured."""
+
+    loader = create_market_data_loader(
+        TrainingConfig(
+            market_data_source="coinmarketcapLatestQuotes",
+            coinmarketcap_use_context=False,
+        ),
+        should_save_downloaded_data=False,
+    )
+
+    assert isinstance(loader, CoinMarketCapLatestQuotesPriceDataLoader)
+
+
+def test_signal_symbol_policy_rejects_numeric_only_symbols() -> None:
+    """Numeric-only tickers should not be exposed as public trading symbols."""
+
+    assert is_signal_eligible_base_currency("SOL") is True
+    assert is_signal_eligible_base_currency("1INCH") is True
+    assert is_signal_eligible_base_currency("00") is False
+    assert is_signal_eligible_base_currency("1234") is False
+
+
+def test_coinmarketcap_latest_quotes_loader_filters_numeric_only_symbols() -> None:
+    """The CMC auto-universe should skip numeric-only map entries like `00`."""
+
+    loader = CoinMarketCapLatestQuotesPriceDataLoader(
+        data_path=Path("unused.csv"),
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        quote_currency="USD",
+        granularity_seconds=3600,
+        total_candles=120,
+        should_save_downloaded_data=False,
+        fetch_all_quote_products=True,
+        request_pause_seconds=0.0,
+        product_batch_size=None,
+        log_progress=False,
+    )
+
+    def fake_request_json(endpoint_path: str, query_params: dict[str, object]) -> dict[str, object]:
+        assert endpoint_path == "/v1/cryptocurrency/map"
+        return {
+            "data": [
+                {"id": 1, "name": "00 Token", "symbol": "00", "rank": 1000},
+                {"id": 2, "name": "1inch", "symbol": "1INCH", "rank": 200},
+                {"id": 3, "name": "Solana", "symbol": "SOL", "rank": 5},
+            ]
+        }
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(loader, "_request_json", fake_request_json)
+    try:
+        filtered_products = loader._fetch_filtered_products()
+    finally:
+        monkeypatch.undo()
+
+    assert [product["product_id"] for product in filtered_products] == ["SOL-USD", "1INCH-USD"]
+
+
+def test_runtime_market_data_settings_can_override_saved_model_source() -> None:
+    """Runtime settings should be able to switch a saved model off unsupported CMC OHLCV mode."""
+
+    saved_config = TrainingConfig(
+        market_data_source="coinmarketcap",
+        coinmarketcap_use_context=False,
+        prediction_horizon=3,
+    )
+    runtime_config = TrainingConfig(
+        market_data_source="coinmarketcapLatestQuotes",
+        coinmarketcap_use_context=True,
+        coinmarketcap_fetch_all_quote_products=False,
+        coinmarketcap_product_ids=("SOL-USD",),
+    )
+
+    merged_config = apply_runtime_market_data_settings(
+        base_config=saved_config,
+        runtime_config=runtime_config,
+    )
+
+    assert merged_config.market_data_source == "coinmarketcapLatestQuotes"
+    assert merged_config.coinmarketcap_use_context is True
+    assert merged_config.coinmarketcap_product_ids == ("SOL-USD",)
+    assert merged_config.backtest_min_confidence == runtime_config.backtest_min_confidence
+    assert merged_config.prediction_horizon == 3
 
 
 def test_coinmarketcal_event_enricher_adds_upcoming_event_context(tmp_path: Path) -> None:
@@ -602,6 +808,21 @@ def test_feature_engineer_adds_context_and_chart_pattern_columns() -> None:
     price_df["cmc_has_layer1_tag"] = 1
     price_df["cmc_has_gaming_tag"] = 0
     price_df["cmc_has_meme_tag"] = 0
+    price_df["cmc_market_intelligence_available"] = 1
+    price_df["cmc_market_total_market_cap"] = 2_300_000_000_000
+    price_df["cmc_market_total_volume_24h"] = 75_000_000_000
+    price_df["cmc_market_total_market_cap_change_24h"] = 1.8
+    price_df["cmc_market_total_volume_change_24h"] = -5.2
+    price_df["cmc_market_altcoin_share"] = 0.42
+    price_df["cmc_market_btc_dominance"] = 58.0
+    price_df["cmc_market_btc_dominance_change_24h"] = -0.8
+    price_df["cmc_market_eth_dominance"] = 11.0
+    price_df["cmc_market_stablecoin_share"] = 0.12
+    price_df["cmc_market_defi_market_cap"] = 60_000_000_000
+    price_df["cmc_market_defi_volume_24h"] = 8_000_000_000
+    price_df["cmc_market_derivatives_volume_24h"] = 580_000_000_000
+    price_df["cmc_market_fear_greed_value"] = 68.0
+    price_df["cmc_market_fear_greed_classification"] = "Greed"
 
     feature_df = TechnicalFeatureEngineer().build(price_df)
     last_row = feature_df.iloc[-1]
@@ -609,7 +830,11 @@ def test_feature_engineer_adds_context_and_chart_pattern_columns() -> None:
     assert "breakout_up_20" in feature_df.columns
     assert "range_position_20" in feature_df.columns
     assert "cmc_market_cap_log" in feature_df.columns
+    assert "cmc_market_total_market_cap_log" in feature_df.columns
+    assert "cmc_market_fear_greed_score" in feature_df.columns
     assert last_row["cmc_market_cap_log"] > 0
+    assert last_row["cmc_market_total_market_cap_log"] > 0
+    assert last_row["cmc_market_fear_greed_score"] == pytest.approx(0.68)
     assert pd.notna(last_row["breakout_up_20"])
     assert pd.notna(last_row["relative_strength_1"])
 
@@ -680,6 +905,75 @@ def test_coinmarketcap_context_enricher_can_refresh_and_merge_context(tmp_path: 
     assert "cmc_market_cap" in enriched_df.columns
     assert float(enriched_df.loc[enriched_df["product_id"] == "BTC-USD", "cmc_market_cap"].iloc[0]) > 0
     assert int(enriched_df.loc[enriched_df["product_id"] == "ETH-USD", "cmc_has_defi_tag"].iloc[0]) == 1
+
+
+def test_coinmarketcap_market_intelligence_enricher_can_refresh_and_merge_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CMC market-intelligence enricher should cache and broadcast global signals."""
+
+    price_df = pd.DataFrame(
+        [
+            {"product_id": "BTC-USD", "base_currency": "BTC", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+            {"product_id": "ETH-USD", "base_currency": "ETH", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+        ]
+    )
+
+    monkeypatch.setenv("COINMARKETCAP_API_KEY", "test-key")
+    enricher = CoinMarketCapMarketIntelligenceEnricher(
+        intelligence_path=tmp_path / "coinMarketCapMarketIntelligence.csv",
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        should_refresh_market_intelligence=True,
+        log_progress=False,
+    )
+
+    def fake_request_json(endpoint_path: str, query_params: dict) -> dict:
+        if endpoint_path == enricher.global_metrics_endpoint:
+            return {
+                "data": {
+                    "btc_dominance": 58.0,
+                    "btc_dominance_24h_percentage_change": -0.8,
+                    "eth_dominance": 11.0,
+                    "last_updated": "2026-01-01T00:00:00Z",
+                    "quote": {
+                        "USD": {
+                            "total_market_cap": 2_300_000_000_000,
+                            "total_volume_24h": 75_000_000_000,
+                            "altcoin_market_cap": 966_000_000_000,
+                            "stablecoin_market_cap": 280_000_000_000,
+                            "defi_market_cap": 60_000_000_000,
+                            "defi_volume_24h": 8_000_000_000,
+                            "derivatives_volume_24h": 580_000_000_000,
+                            "total_market_cap_yesterday_percentage_change": 1.8,
+                            "total_volume_24h_yesterday_percentage_change": -5.2,
+                            "last_updated": "2026-01-01T00:00:00Z",
+                        }
+                    },
+                }
+            }
+        if endpoint_path == enricher.fear_greed_latest_endpoint:
+            return {
+                "data": {
+                    "value": 68,
+                    "value_classification": "Greed",
+                    "update_time": "2026-01-01T00:00:00Z",
+                }
+            }
+
+        raise AssertionError(f"Unexpected endpoint: {endpoint_path}")
+
+    monkeypatch.setattr(enricher, "_request_json", fake_request_json)
+
+    intelligence_df = enricher.refresh_market_intelligence()
+    enriched_df = enricher.enrich(price_df)
+
+    assert len(intelligence_df) == 1
+    assert float(intelligence_df.iloc[0]["cmc_market_fear_greed_value"]) == 68.0
+    assert "cmc_market_btc_dominance" in enriched_df.columns
+    assert float(enriched_df.loc[0, "cmc_market_btc_dominance"]) == 58.0
+    assert float(enriched_df.loc[1, "cmc_market_altcoin_share"]) == pytest.approx(966_000_000_000 / 2_300_000_000_000)
 
 
 def test_coinmarketcap_context_refresh_merges_existing_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -828,6 +1122,149 @@ def test_coinmarketcap_context_enricher_chunks_keyed_requests(tmp_path: Path, mo
     assert requested_id_groups == ["1,2", "3"]
 
 
+def test_coinmarketcap_context_enricher_does_not_retry_single_ids_after_rate_limit(
+    tmp_path: Path,
+) -> None:
+    """A CMC 429 should not fan out into one request per id."""
+
+    enricher = CoinMarketCapContextEnricher(
+        context_path=tmp_path / "coinMarketCapContext.csv",
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        should_refresh_context=True,
+        log_progress=False,
+    )
+    enricher.keyed_lookup_batch_size = 5
+
+    requested_id_groups: list[list[int]] = []
+
+    def fake_request_keyed_lookup_chunk(
+        endpoint_path: str,
+        ids: Sequence[int],
+        extra_query_params: dict | None = None,
+    ) -> dict[str, dict[str, object]]:
+        requested_id_groups.append([int(cmc_id) for cmc_id in ids])
+        raise CoinMarketCapRateLimitError(
+            "CoinMarketCap request failed with status 429 for /v2/cryptocurrency/quotes/latest."
+        )
+
+    enricher._request_keyed_lookup_chunk = fake_request_keyed_lookup_chunk  # type: ignore[method-assign]
+
+    with pytest.raises(CoinMarketCapRateLimitError):
+        enricher._fetch_keyed_lookup(
+            endpoint_path=enricher.latest_quotes_endpoint,
+            ids=[1, 2, 3],
+            extra_query_params={"convert": "USD"},
+        )
+
+    assert requested_id_groups == [[1, 2, 3]]
+
+
+def test_coinmarketcap_context_refresh_reuses_cache_after_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CMC context refreshes should reuse the cached snapshot after a 429."""
+
+    context_path = tmp_path / "coinMarketCapContext.csv"
+    cached_context_df = pd.DataFrame(
+        [
+            {
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "cmc_context_available": 1,
+                "cmc_market_cap": 2_000_000_000_000,
+            }
+        ]
+    )
+    cached_context_df.to_csv(context_path, index=False)
+
+    price_df = pd.DataFrame(
+        [
+            {"product_id": "BTC-USD", "base_currency": "BTC", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+        ]
+    )
+
+    monkeypatch.setenv("COINMARKETCAP_API_KEY", "test-key")
+    enricher = CoinMarketCapContextEnricher(
+        context_path=context_path,
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        should_refresh_context=True,
+        log_progress=False,
+    )
+
+    def fake_fetch_symbol_map_lookup(symbols: list[str]) -> dict[str, dict[str, object]]:
+        raise CoinMarketCapRateLimitError(
+            "CoinMarketCap request failed with status 429 for /v1/cryptocurrency/map."
+        )
+
+    monkeypatch.setattr(enricher, "_fetch_symbol_map_lookup", fake_fetch_symbol_map_lookup)
+
+    refreshed_df = enricher.refresh_context(price_df)
+
+    assert refreshed_df.to_dict("records") == cached_context_df.to_dict("records")
+    assert enricher.last_context_summary["usedCachedSnapshot"] is True
+    assert "status 429" in str(enricher.last_context_summary["warning"])
+
+
+def test_coinmarketcap_market_intelligence_reuses_cache_after_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CMC market intelligence should reuse the cached snapshot after a 429."""
+
+    intelligence_path = tmp_path / "coinMarketCapMarketIntelligence.csv"
+    cached_intelligence_df = pd.DataFrame(
+        [
+            {
+                "cmc_market_intelligence_available": 1,
+                "cmc_market_quote_currency": "USD",
+                "cmc_market_last_updated": "2026-01-01T00:00:00Z",
+                "cmc_market_total_market_cap": 2_300_000_000_000,
+                "cmc_market_total_volume_24h": 75_000_000_000,
+                "cmc_market_total_market_cap_change_24h": 1.8,
+                "cmc_market_total_volume_change_24h": -5.2,
+                "cmc_market_altcoin_market_cap": 966_000_000_000,
+                "cmc_market_altcoin_share": 0.42,
+                "cmc_market_btc_dominance": 58.0,
+                "cmc_market_btc_dominance_change_24h": -0.8,
+                "cmc_market_eth_dominance": 11.0,
+                "cmc_market_stablecoin_market_cap": 280_000_000_000,
+                "cmc_market_stablecoin_share": 0.12,
+                "cmc_market_defi_market_cap": 60_000_000_000,
+                "cmc_market_defi_volume_24h": 8_000_000_000,
+                "cmc_market_derivatives_volume_24h": 580_000_000_000,
+                "cmc_market_fear_greed_value": 68.0,
+                "cmc_market_fear_greed_classification": "Greed",
+            }
+        ]
+    )
+    cached_intelligence_df.to_csv(intelligence_path, index=False)
+
+    monkeypatch.setenv("COINMARKETCAP_API_KEY", "test-key")
+    enricher = CoinMarketCapMarketIntelligenceEnricher(
+        intelligence_path=intelligence_path,
+        api_base_url="https://pro-api.coinmarketcap.com",
+        api_key_env_var="COINMARKETCAP_API_KEY",
+        should_refresh_market_intelligence=True,
+        log_progress=False,
+    )
+
+    def fake_request_json(endpoint_path: str, query_params: dict) -> dict:
+        raise CoinMarketCapRateLimitError(
+            f"CoinMarketCap request failed with status 429 for {endpoint_path}."
+        )
+
+    monkeypatch.setattr(enricher, "_request_json", fake_request_json)
+
+    refreshed_df = enricher.refresh_market_intelligence()
+
+    assert refreshed_df.to_dict("records") == cached_intelligence_df.to_dict("records")
+    assert enricher.last_market_intelligence_summary["usedCachedSnapshot"] is True
+    assert "status 429" in str(enricher.last_market_intelligence_summary["warning"])
+
+
 def test_labeler_shifts_future_returns_within_each_coin() -> None:
     """Future labels should not jump from one coin to another."""
 
@@ -918,6 +1355,121 @@ def test_market_data_refresh_app_reports_context_failure_without_aborting(
     assert result["rowsDownloaded"] > 0
     assert result["coinMarketCapContextStatus"] == "refresh_failed"
     assert "simulated CoinMarketCap failure" in result["coinMarketCapContextError"]
+
+
+def test_market_data_refresh_app_reports_market_intelligence_failure_without_aborting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CMC market-intelligence failure should not erase a successful market-data refresh."""
+
+    config = TrainingConfig(
+        data_file=tmp_path / "marketPrices.csv",
+        coinmarketcap_use_context=False,
+        coinmarketcap_market_intelligence_file=tmp_path / "coinMarketCapMarketIntelligence.csv",
+    )
+    refresh_app = MarketDataRefreshApp(config=config)
+
+    class FakeLoader:
+        last_refresh_summary = {"rowsDownloaded": 2}
+
+        def refresh_data(self) -> pd.DataFrame:
+            return _build_sample_market_frame(total_hours=2)
+
+    class FailingEnricher:
+        def refresh_market_intelligence(self) -> pd.DataFrame:
+            raise RuntimeError("simulated CoinMarketCap market intelligence failure")
+
+    monkeypatch.setattr(refresh_app, "build_market_data_loader", lambda: FakeLoader())
+    monkeypatch.setattr(
+        refresh_app,
+        "build_coinmarketcap_market_intelligence_enricher",
+        lambda should_refresh_market_intelligence=False: FailingEnricher(),
+    )
+
+    result = refresh_app.run()
+
+    assert result["rowsDownloaded"] > 0
+    assert result["coinMarketCapMarketIntelligenceStatus"] == "refresh_failed"
+    assert "market intelligence failure" in result["coinMarketCapMarketIntelligenceError"]
+
+
+def test_market_data_refresh_app_rotates_market_batches_between_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-batch refreshes should advance through ranked market batches automatically."""
+
+    import crypto_signal_ml.app as app_module  # noqa: WPS433
+
+    outputs_dir = tmp_path / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_module, "OUTPUTS_DIR", outputs_dir)
+
+    (outputs_dir / "signalMarketDataRefresh.json").write_text(
+        json.dumps(
+            {
+                "refresh": {
+                    "downloadSummary": {
+                        "batchNumber": 1,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state_path = tmp_path / "marketProductBatchState.json"
+    refresh_app = MarketDataRefreshApp(
+        config=TrainingConfig(
+            data_file=tmp_path / "marketPrices.csv",
+            coinmarketcap_use_context=False,
+            coinmarketcap_use_market_intelligence=False,
+            coinmarketcal_use_events=False,
+            market_product_batch_state_file=state_path,
+            market_product_batch_rotation_enabled=True,
+        )
+    )
+
+    refreshed_batches: list[int] = []
+
+    class FakeLoader:
+        def __init__(self, batch_number: int) -> None:
+            self.batch_number = batch_number
+            self.last_refresh_summary = {
+                "batchNumber": batch_number,
+                "rowsDownloaded": 4,
+            }
+
+        def get_total_batches(self) -> int:
+            return 4
+
+        def refresh_data(self) -> pd.DataFrame:
+            refreshed_batches.append(self.batch_number)
+            return _build_sample_market_frame(total_hours=2)
+
+    monkeypatch.setattr(refresh_app, "build_market_data_loader", lambda: FakeLoader(1))
+    monkeypatch.setattr(
+        refresh_app,
+        "_build_market_data_loader_for_config",
+        lambda config: FakeLoader(config.coinmarketcap_product_batch_number),
+    )
+
+    first_result = refresh_app.run()
+    second_result = refresh_app.run()
+
+    state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+    source_states = state_payload["sources"]
+    rotation_state = next(iter(source_states.values()))
+
+    assert refreshed_batches == [2, 3]
+    assert first_result["batchNumber"] == 2
+    assert first_result["nextBatchNumber"] == 3
+    assert second_result["batchNumber"] == 3
+    assert second_result["nextBatchNumber"] == 4
+    assert rotation_state["lastCompletedBatch"] == 3
+    assert rotation_state["nextBatch"] == 4
+    assert rotation_state["totalBatches"] == 4
 
 
 def test_training_app_writes_model_metadata_sidecar(
@@ -1054,9 +1606,40 @@ def test_rag_knowledge_store_can_ingest_and_search_text_sources(tmp_path: Path) 
 
     assert source["title"] == "Bitcoin ETF research note"
     assert store.get_status()["sourceCount"] == 1
+    assert store.get_status()["storageBackend"] == "sqlite"
     assert search_results
     assert search_results[0]["title"] == "Bitcoin ETF research note"
     assert "inflows" in search_results[0]["content"].lower()
+
+
+def test_conversation_session_store_can_round_trip_messages(tmp_path: Path) -> None:
+    """Assistant session memory should persist and retrieve messages in order."""
+
+    store = ConversationSessionStore(
+        db_path=tmp_path / "assistantSessions.sqlite3",
+    )
+
+    session = store.create_session(title="Research desk")
+    user_message = store.add_message(
+        session_id=session["sessionId"],
+        role="user",
+        content="What does the model think about BTC-USD?",
+        metadata={"productId": "BTC-USD"},
+    )
+    assistant_message = store.add_message(
+        session_id=session["sessionId"],
+        role="assistant",
+        content="BTC-USD is currently a BUY setup.",
+        metadata={"liveSource": "cached"},
+    )
+    messages = store.list_messages(session["sessionId"], limit=10)
+
+    assert session["title"] == "Research desk"
+    assert user_message["role"] == "user"
+    assert assistant_message["role"] == "assistant"
+    assert len(messages) == 2
+    assert messages[0]["content"] == "What does the model think about BTC-USD?"
+    assert messages[1]["content"] == "BTC-USD is currently a BUY setup."
 
 
 def test_market_universe_refresh_app_continues_after_batch_failure(
@@ -1234,6 +1817,861 @@ def test_signal_parameter_tuning_app_returns_best_candidate(
     assert result["confidenceResultsPath"].endswith("signalConfidenceTuningResults.csv")
 
 
+def test_signal_generation_app_refreshes_market_data_before_publishing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Saved signal files should be published from a fresh market refresh, not stale cache."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-03T16:00:00Z",
+                "product_id": "SOL-USD",
+                "base_currency": "SOL",
+                "quote_currency": "USD",
+                "close": 80.5,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.81,
+                "prob_take_profit": 0.05,
+                "prob_hold": 0.14,
+                "prob_buy": 0.81,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            assert list(feature_df.columns) == ["feature_1"]
+            return prediction_df.copy()
+
+    refresh_calls: list[bool] = []
+    saved_json_payloads: dict[str, dict] = {}
+
+    def fake_refresh_run(self: MarketDataRefreshApp) -> dict:
+        refresh_calls.append(True)
+        return {
+            "marketDataSource": "coinbase",
+            "savedPath": "marketPrices.csv",
+            "rowsDownloaded": 1,
+            "uniqueProducts": 1,
+            "firstTimestamp": "2026-04-03T16:00:00Z",
+            "lastTimestamp": "2026-04-03T16:00:00Z",
+        }
+
+    config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        market_data_source="coinbase",
+        signal_excluded_base_currencies=(),
+        signal_refresh_market_data_before_generation=True,
+    )
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+
+    monkeypatch.setattr(MarketDataRefreshApp, "run", fake_refresh_run)
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(
+        app,
+        "save_json",
+        lambda payload, file_path: saved_json_payloads.__setitem__(str(file_path.name), dict(payload)),
+    )
+
+    result = app.run()
+
+    assert refresh_calls == [True]
+    assert result["signalSource"] == "live-market-refresh"
+    assert result["marketDataRefresh"]["lastTimestamp"] == "2026-04-03T16:00:00Z"
+    assert saved_json_payloads["latestSignal.json"]["signalSource"] == "live-market-refresh"
+    assert saved_json_payloads["latestSignal.json"]["marketDataLastTimestamp"] == "2026-04-03T16:00:00Z"
+
+
+def test_signal_generation_app_can_publish_from_fresh_top_market_universe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signal publication should be able to score a fresh top-market universe instead of stale batch data."""
+
+    historical_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-03T16:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "close": 82000.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.83,
+                "prob_take_profit": 0.05,
+                "prob_hold": 0.12,
+                "prob_buy": 0.83,
+            }
+        ]
+    )
+    fresh_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-05T12:00:00Z",
+                "product_id": "SOL-USD",
+                "base_currency": "SOL",
+                "quote_currency": "USD",
+                "close": 80.5,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.81,
+                "prob_take_profit": 0.05,
+                "prob_hold": 0.14,
+                "prob_buy": 0.81,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            assert list(feature_df.columns) == ["feature_1"]
+            return historical_prediction_df.copy()
+
+    refresh_calls: list[bool] = []
+    saved_json_payloads: dict[str, dict] = {}
+
+    def fake_refresh_run(self: MarketDataRefreshApp) -> dict:
+        refresh_calls.append(True)
+        return {
+            "marketDataSource": "coinmarketcapLatestQuotes",
+            "savedPath": "marketPrices.csv",
+            "rowsDownloaded": 25,
+            "uniqueProducts": 25,
+            "firstTimestamp": "2026-04-05T12:00:00Z",
+            "lastTimestamp": "2026-04-05T12:00:00Z",
+        }
+
+    config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        coinmarketcal_use_events=False,
+        coinmarketcap_use_market_intelligence=False,
+        market_data_source="coinmarketcapLatestQuotes",
+        coinmarketcap_fetch_all_quote_products=True,
+        live_fetch_all_quote_products=True,
+        live_max_products=25,
+        signal_excluded_base_currencies=("BTC",),
+        signal_refresh_market_data_before_generation=True,
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+    )
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+
+    monkeypatch.setattr(MarketDataRefreshApp, "run", fake_refresh_run)
+    monkeypatch.setattr(
+        app,
+        "_build_fresh_signal_prediction_frame",
+        lambda: (
+            fresh_prediction_df.copy(),
+            {
+                "mode": "fresh-top-market-universe",
+                "warning": "",
+                "maxProducts": 25,
+                "productsRequested": 25,
+                "totalAvailableProducts": 25,
+                "rowsScored": 1,
+                "productsScored": 1,
+            },
+        ),
+    )
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(
+        app,
+        "save_json",
+        lambda payload, file_path: saved_json_payloads.__setitem__(str(file_path.name), dict(payload)),
+    )
+
+    result = app.run()
+
+    assert refresh_calls == [True]
+    assert result["signalName"] == "BUY"
+    assert result["signalInference"]["mode"] == "fresh-top-market-universe"
+    assert result["signalInference"]["productsScored"] == 1
+    assert saved_json_payloads["latestSignal.json"]["productId"] == "SOL-USD"
+    assert saved_json_payloads["frontendSignalSnapshot.json"]["signalInference"]["mode"] == "fresh-top-market-universe"
+
+
+def test_signal_generation_app_can_emit_watchlist_fallback_after_quiet_period(
+    tmp_path: Path,
+) -> None:
+    """After a long quiet stretch, the feed should surface the strongest watchlist candidate."""
+
+    app = SignalGenerationApp(
+        config=TrainingConfig(
+            signal_watchlist_fallback_enabled=True,
+            signal_watchlist_fallback_hours=24.0,
+            signal_watchlist_min_decision_score=0.30,
+            signal_watchlist_min_confidence=0.55,
+        ),
+    )
+    app.primary_signal_history_path = tmp_path / "primarySignalHistory.json"
+    app._should_publish_watchlist_fallback = lambda: True  # type: ignore[method-assign]
+
+    selected_signal = app._select_watchlist_fallback_signal(
+        [
+            {
+                "productId": "ABT-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "HOLD",
+                "tradeReadiness": "standby",
+                "confidence": 0.91,
+                "policyScore": 1.76,
+                "reasonItems": ["ABT-USD stays on the watchlist."],
+                "signalChat": "ABT-USD stays on the watchlist.",
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.62,
+                },
+                "tradeContext": {
+                    "hasActiveTrade": False,
+                },
+            },
+            {
+                "productId": "SOL-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "BUY",
+                "tradeReadiness": "medium",
+                "confidence": 0.67,
+                "policyScore": 0.98,
+                "reasonItems": ["SOL-USD is close to a breakout entry."],
+                "signalChat": "SOL-USD is close to a breakout entry.",
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.41,
+                },
+                "tradeContext": {
+                    "hasActiveTrade": False,
+                },
+            },
+        ]
+    )
+
+    assert selected_signal is not None
+    assert selected_signal["productId"] == "SOL-USD"
+    assert selected_signal["watchlistFallback"] is True
+    assert selected_signal["publicSignalType"] == "watchlist"
+    assert selected_signal["spotAction"] == "wait"
+    assert selected_signal["reasonSummary"].startswith("No actionable trade cleared the live gate recently")
+
+
+def test_signal_generation_app_persists_watchlist_pool_snapshot(tmp_path: Path) -> None:
+    """Signal generation should persist the strongest watchlist names for live monitoring."""
+
+    watchlist_pool_path = tmp_path / "watchlistPool.json"
+    app = SignalGenerationApp(
+        config=TrainingConfig(
+            signal_watchlist_pool_enabled=True,
+            signal_watchlist_pool_max_products=2,
+            signal_watchlist_pool_path=watchlist_pool_path,
+        )
+    )
+
+    app._save_watchlist_pool_snapshot(
+        [
+            {
+                "productId": "ABT-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "HOLD",
+                "tradeReadiness": "standby",
+                "confidence": 0.91,
+                "policyScore": 1.76,
+                "setupScore": 1.0,
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.62,
+                    "summaryLine": "ABT-USD stays on the watchlist.",
+                },
+                "reasonSummary": "ABT-USD stays on the watchlist.",
+            },
+            {
+                "productId": "AGLD-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "BUY",
+                "tradeReadiness": "blocked",
+                "confidence": 0.60,
+                "policyScore": 0.52,
+                "setupScore": 0.25,
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.41,
+                    "summaryLine": "AGLD-USD is close to a breakout entry.",
+                },
+                "reasonSummary": "AGLD-USD is close to a breakout entry.",
+            },
+            {
+                "productId": "ADA-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "HOLD",
+                "tradeReadiness": "standby",
+                "confidence": 0.69,
+                "policyScore": 1.24,
+                "setupScore": 1.5,
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.37,
+                    "summaryLine": "ADA-USD stays in observation mode.",
+                },
+                "reasonSummary": "ADA-USD stays in observation mode.",
+            },
+        ]
+    )
+
+    pool_store = WatchlistPoolStore(watchlist_pool_path)
+    snapshot = pool_store.get_snapshot()
+
+    assert snapshot["count"] == 2
+    assert snapshot["productIds"] == ["AGLD-USD", "ABT-USD"]
+    assert pool_store.get_monitored_product_ids() == ["AGLD-USD", "ABT-USD"]
+
+
+def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh snapshot scoring should merge the persisted watchlist pool with the top-market universe."""
+
+    import crypto_signal_ml.app as app_module
+
+    watchlist_pool_path = tmp_path / "watchlistPool.json"
+    watchlist_pool_path.write_text(
+        json.dumps(
+            {
+                "generatedAt": "2026-04-07T14:45:00+00:00",
+                "count": 1,
+                "productIds": ["AGLD-USD"],
+                "products": [
+                    {
+                        "productId": "AGLD-USD",
+                        "signalName": "HOLD",
+                        "modelSignalName": "BUY",
+                        "brainDecision": "watchlist",
+                        "decisionScore": 0.41,
+                        "confidence": 0.60,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = TrainingConfig(
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_watchlist_pool_enabled=True,
+        signal_watchlist_pool_max_products=3,
+        signal_watchlist_pool_path=watchlist_pool_path,
+        live_max_products=100,
+    )
+
+    class FakeModel:
+        feature_columns = ("close",)
+        model_type = "fakeModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            return feature_df.copy()
+
+    class FakeLoader:
+        def __init__(self, frame: pd.DataFrame, summary: dict[str, int]) -> None:
+            self._frame = frame
+            self.last_refresh_summary = summary
+
+        def refresh_data(self) -> pd.DataFrame:
+            return self._frame.copy()
+
+    class FakeDatasetBuilder:
+        def __init__(
+            self,
+            config: TrainingConfig,
+            feature_columns: Sequence[str] | None = None,
+            data_loader: FakeLoader | None = None,
+        ) -> None:
+            del config
+            del feature_columns
+            self.data_loader = data_loader
+
+        def build_feature_table(self) -> pd.DataFrame:
+            if self.data_loader is None:
+                raise AssertionError("This fake dataset builder should only be used with an explicit loader.")
+            return self.data_loader.refresh_data()
+
+    top_universe_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "ABT-USD",
+                "base_currency": "ABT",
+                "quote_currency": "USD",
+                "close": 0.38,
+                "predicted_signal": 0,
+                "predicted_name": "HOLD",
+                "confidence": 0.91,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.91,
+                "prob_buy": 0.05,
+            }
+        ]
+    )
+    watchlist_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "AGLD-USD",
+                "base_currency": "AGLD",
+                "quote_currency": "USD",
+                "close": 0.31,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.82,
+                "prob_take_profit": 0.08,
+                "prob_hold": 0.10,
+                "prob_buy": 0.82,
+            }
+        ]
+    )
+
+    def fake_create_market_data_loader(
+        config: TrainingConfig,
+        data_path: Path,
+        should_save_downloaded_data: bool,
+        product_ids: Sequence[str] | None = None,
+        fetch_all_quote_products: bool | None = None,
+        max_products: int | None = None,
+        granularity_seconds: int | None = None,
+        total_candles: int | None = None,
+        request_pause_seconds: float | None = None,
+        save_progress_every_products: int | None = None,
+        log_progress: bool | None = None,
+    ) -> FakeLoader:
+        del config
+        del data_path
+        del should_save_downloaded_data
+        del max_products
+        del granularity_seconds
+        del total_candles
+        del request_pause_seconds
+        del save_progress_every_products
+        del log_progress
+        if fetch_all_quote_products:
+            return FakeLoader(
+                top_universe_prediction_df,
+                {"productsDownloaded": 100, "totalAvailableProducts": 100},
+            )
+        assert tuple(product_ids or ()) == ("AGLD-USD",)
+        return FakeLoader(
+            watchlist_prediction_df,
+            {"productsDownloaded": 1, "totalAvailableProducts": 1},
+        )
+
+    monkeypatch.setattr(app_module, "create_market_data_loader", fake_create_market_data_loader)
+    monkeypatch.setattr(app_module, "CryptoDatasetBuilder", FakeDatasetBuilder)
+
+    app = SignalGenerationApp(
+        config=config,
+        model=FakeModel(config=config),
+    )
+
+    prediction_df, summary = app._build_fresh_signal_prediction_frame()
+
+    assert set(prediction_df["product_id"]) == {"ABT-USD", "AGLD-USD"}
+    assert summary["mode"] == "fresh-top-market-plus-watchlist-pool"
+    assert summary["productsRequested"] == 100
+    assert summary["watchlistPoolProductsRequested"] == 1
+    assert summary["watchlistPoolProductsScored"] == 1
+
+
+def test_signal_generation_app_auto_tracks_new_entry_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generating a fresh BUY signal should automatically create a tracked trade record."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-05T12:00:00Z",
+                "product_id": "ALGO-USD",
+                "base_currency": "ALGO",
+                "quote_currency": "USD",
+                "close": 0.25,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.86,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.10,
+                "prob_buy": 0.86,
+                "breakout_up_20": 0.04,
+                "breakout_down_20": 0.01,
+                "close_vs_ema_5": 0.03,
+                "relative_strength_1": 0.02,
+                "relative_strength_5": 0.05,
+                "momentum_10": 0.07,
+                "range_position_20": 0.93,
+                "rsi_14": 63.0,
+                "trend_score": 0.03,
+                "volatility_ratio": 0.95,
+                "regime_label": "trend_up",
+                "regime_code": 2,
+                "regime_is_trending": 1,
+                "regime_is_high_volatility": 0,
+                "cmc_context_available": 0,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            assert list(feature_df.columns) == ["feature_1"]
+            return prediction_df.copy()
+
+    config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_excluded_base_currencies=(),
+        signal_refresh_market_data_before_generation=False,
+        signal_track_generated_trades=True,
+        signal_generated_trade_status="planned",
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+    )
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(app, "save_json", lambda payload, file_path: None)
+
+    result = app.run()
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=config.portfolio_store_path,
+        default_capital=config.portfolio_default_capital,
+    )
+    tracked_trade = portfolio_store.get_active_trade_for_product("ALGO-USD")
+
+    assert result["trackedTradeSync"]["enabled"] is True
+    assert result["trackedTradeSync"]["createdCount"] == 1
+    assert result["trackedTradeSync"]["refreshedCount"] == 0
+    assert tracked_trade is not None
+    assert tracked_trade["entryPrice"] == 0.25
+    assert tracked_trade["signalName"] == "BUY"
+    assert tracked_trade["status"] == "planned"
+    assert tracked_trade["metadata"]["autoTrackedFromSignalGeneration"] is True
+
+
+def test_signal_generation_app_refreshes_existing_tracked_trade_instead_of_duplication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeating the same BUY setup should refresh the tracked trade, not create duplicates."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-05T13:00:00Z",
+                "product_id": "ALGO-USD",
+                "base_currency": "ALGO",
+                "quote_currency": "USD",
+                "close": 0.30,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.88,
+                "prob_take_profit": 0.03,
+                "prob_hold": 0.09,
+                "prob_buy": 0.88,
+                "breakout_up_20": 0.05,
+                "breakout_down_20": 0.01,
+                "close_vs_ema_5": 0.03,
+                "relative_strength_1": 0.02,
+                "relative_strength_5": 0.05,
+                "momentum_10": 0.07,
+                "range_position_20": 0.94,
+                "rsi_14": 64.0,
+                "trend_score": 0.03,
+                "volatility_ratio": 0.90,
+                "regime_label": "trend_up",
+                "regime_code": 2,
+                "regime_is_trending": 1,
+                "regime_is_high_volatility": 0,
+                "cmc_context_available": 0,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            return prediction_df.copy()
+
+    config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_excluded_base_currencies=(),
+        signal_refresh_market_data_before_generation=False,
+        signal_track_generated_trades=True,
+        signal_generated_trade_status="planned",
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+    )
+    portfolio_store = TradingPortfolioStore(
+        db_path=config.portfolio_store_path,
+        default_capital=config.portfolio_default_capital,
+    )
+    existing_trade = portfolio_store.create_trade(
+        product_id="ALGO-USD",
+        entry_price=0.25,
+        take_profit_price=0.28,
+        stop_loss_price=0.23,
+        current_price=0.25,
+        signal_name="BUY",
+        status="planned",
+        metadata={"autoTrackedFromSignalGeneration": True},
+    )
+
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(app, "save_json", lambda payload, file_path: None)
+
+    result = app.run()
+
+    refreshed_trade = portfolio_store.get_active_trade_for_product("ALGO-USD")
+    all_trades = portfolio_store.list_trades(limit=10)
+
+    assert result["trackedTradeSync"]["createdCount"] == 0
+    assert result["trackedTradeSync"]["refreshedCount"] == 1
+    assert refreshed_trade is not None
+    assert refreshed_trade["tradeId"] == existing_trade["tradeId"]
+    assert refreshed_trade["currentPrice"] == 0.30
+    assert len(all_trades) == 1
+
+
+def test_signal_generation_app_tracks_published_buy_even_when_brain_stays_watchlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Published BUY calls should still start lifecycle tracking when the brain is cautious."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-05T13:00:00Z",
+                "product_id": "ALGO-USD",
+                "base_currency": "ALGO",
+                "quote_currency": "USD",
+                "close": 0.25,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.52,
+                "prob_take_profit": 0.21,
+                "prob_hold": 0.27,
+                "prob_buy": 0.52,
+                "breakout_up_20": 0.04,
+                "breakout_down_20": 0.01,
+                "close_vs_ema_5": 0.01,
+                "relative_strength_1": 0.01,
+                "relative_strength_5": 0.03,
+                "momentum_10": 0.04,
+                "range_position_20": 0.83,
+                "rsi_14": 58.0,
+                "trend_score": 0.02,
+                "volatility_ratio": 1.0,
+                "regime_label": "trend_up",
+                "regime_code": 2,
+                "regime_is_trending": 1,
+                "regime_is_high_volatility": 0,
+                "cmc_context_available": 1,
+                "cmc_market_intelligence_available": 1,
+                "cmc_market_fear_greed_value": 38.0,
+                "cmc_market_fear_greed_classification": "Fear",
+                "cmc_market_btc_dominance": 0.58,
+                "cmc_market_btc_dominance_change_24h": 0.002,
+                "cmc_market_altcoin_share": 0.42,
+                "cmc_market_stablecoin_share": 0.12,
+                "cmc_market_total_market_cap_change_24h": 0.03,
+                "cmc_market_total_volume_change_24h": 0.8,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            return prediction_df.copy()
+
+    config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_excluded_base_currencies=(),
+        signal_refresh_market_data_before_generation=False,
+        signal_track_generated_trades=True,
+        signal_generated_trade_status="planned",
+        backtest_min_confidence=0.50,
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+    )
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(app, "save_json", lambda payload, file_path: None)
+
+    result = app.run()
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=config.portfolio_store_path,
+        default_capital=config.portfolio_default_capital,
+    )
+    tracked_trade = portfolio_store.get_active_trade_for_product("ALGO-USD")
+
+    assert result["trackedTradeSync"]["enabled"] is True
+    assert result["trackedTradeSync"]["createdCount"] == 1
+    assert tracked_trade is not None
+    assert tracked_trade["signalName"] == "BUY"
+    assert tracked_trade["status"] == "planned"
+
+
+def test_portfolio_store_builds_trade_learning_snapshot(tmp_path: Path) -> None:
+    """Closed tracked trades should be summarized into reusable decision memory."""
+
+    store = TradingPortfolioStore(db_path=tmp_path / "tradeLearning.sqlite3")
+    first_trade = store.create_trade(
+        product_id="ALGO-USD",
+        entry_price=1.00,
+        take_profit_price=1.12,
+        stop_loss_price=0.94,
+        quantity=10.0,
+        signal_name="BUY",
+        status="open",
+        opened_at="2026-01-01T00:00:00Z",
+    )
+    second_trade = store.create_trade(
+        product_id="ALGO-USD",
+        entry_price=1.00,
+        take_profit_price=1.14,
+        stop_loss_price=0.95,
+        quantity=10.0,
+        signal_name="BUY",
+        status="open",
+        opened_at="2026-01-03T00:00:00Z",
+    )
+    third_trade = store.create_trade(
+        product_id="ALGO-USD",
+        entry_price=1.00,
+        take_profit_price=1.16,
+        stop_loss_price=0.95,
+        quantity=10.0,
+        signal_name="BUY",
+        status="open",
+        opened_at="2026-01-05T00:00:00Z",
+    )
+
+    store.close_trade(
+        trade_id=first_trade["tradeId"],
+        exit_price=1.08,
+        closed_at="2026-01-02T00:00:00Z",
+        close_reason="take_profit",
+    )
+    store.close_trade(
+        trade_id=second_trade["tradeId"],
+        exit_price=0.96,
+        closed_at="2026-01-04T00:00:00Z",
+        close_reason="stop_loss",
+    )
+    store.close_trade(
+        trade_id=third_trade["tradeId"],
+        exit_price=1.10,
+        closed_at="2026-01-06T00:00:00Z",
+        close_reason="take_profit",
+    )
+
+    snapshot = store.get_trade_learning_snapshot("ALGO-USD", signal_name="BUY")
+    learning_map = store.build_trade_learning_map(
+        [{"productId": "ALGO-USD", "signal_name": "BUY"}]
+    )
+
+    assert snapshot["available"] is True
+    assert snapshot["closedTradeCount"] == 3
+    assert snapshot["winCount"] == 2
+    assert snapshot["lossCount"] == 1
+    assert snapshot["scope"] == "product+signal"
+    assert snapshot["sampleAdequate"] is True
+    assert snapshot["lastOutcome"] == "win"
+    assert snapshot["recentOutcomes"][:3] == ["win", "loss", "win"]
+    assert learning_map["ALGO-USD"]["closedTradeCount"] == 3
+
+
 def test_signal_summaries_explain_buy_and_take_profit_actions() -> None:
     """Signal summaries should expose spot actions and human-readable reasons."""
 
@@ -1307,7 +2745,13 @@ def test_signal_summaries_explain_buy_and_take_profit_actions() -> None:
         ]
     )
 
-    latest_signals = build_latest_signal_summaries(prediction_df)
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+        ),
+    )
     actionable_signals = build_actionable_signal_summaries(latest_signals)
 
     assert latest_signals[0]["signal_name"] == "BUY"
@@ -1322,6 +2766,1383 @@ def test_signal_summaries_explain_buy_and_take_profit_actions() -> None:
     assert "spot take-profit signal" in actionable_signals[1]["signalChat"]
 
 
+def test_signal_policy_downgrades_downtrend_buy_to_hold() -> None:
+    """The trading policy should block fresh BUY signals during a downtrend regime."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "close": 110.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.84,
+                "prob_take_profit": 0.06,
+                "prob_hold": 0.10,
+                "prob_buy": 0.84,
+                "breakout_up_20": 0.03,
+                "close_vs_ema_5": 0.02,
+                "relative_strength_1": 0.01,
+                "relative_strength_5": 0.03,
+                "momentum_10": 0.08,
+                "range_position_20": 0.91,
+                "rsi_14": 62.0,
+                "market_regime_label": "trend_down",
+                "market_regime_code": 3.0,
+                "regime_trend_score": -0.03,
+                "regime_volatility_ratio": 1.0,
+                "regime_is_trending": 1.0,
+                "regime_is_high_volatility": 0.0,
+                "cmcal_has_event_next_7d": 0,
+                "cmcal_event_count_next_7d": 0,
+                "cmcal_event_count_next_30d": 0,
+            }
+        ]
+    )
+
+    latest_signal = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+        ),
+    )[0]
+
+    assert latest_signal["modelSignalName"] == "BUY"
+    assert latest_signal["signal_name"] == "HOLD"
+    assert latest_signal["confidenceGateApplied"] is False
+    assert latest_signal["riskGateApplied"] is True
+    assert latest_signal["tradeReadiness"] == "blocked"
+    assert "downtrend" in latest_signal["gateReasons"][0].lower()
+
+
+def test_signal_summaries_exclude_configured_base_currencies() -> None:
+    """Configured majors and stablecoins should not surface in the signal output."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "close": 110.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.82,
+                "prob_take_profit": 0.06,
+                "prob_hold": 0.12,
+                "prob_buy": 0.82,
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "ETH-USD",
+                "base_currency": "ETH",
+                "quote_currency": "USD",
+                "close": 210.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.79,
+                "prob_take_profit": 0.08,
+                "prob_hold": 0.13,
+                "prob_buy": 0.79,
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "USDT-USD",
+                "base_currency": "USDT",
+                "quote_currency": "USD",
+                "close": 1.0,
+                "predicted_signal": 0,
+                "predicted_name": "HOLD",
+                "confidence": 0.90,
+                "prob_take_profit": 0.02,
+                "prob_hold": 0.90,
+                "prob_buy": 0.08,
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "SOL-USD",
+                "base_currency": "SOL",
+                "quote_currency": "USD",
+                "close": 150.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.76,
+                "prob_take_profit": 0.09,
+                "prob_hold": 0.15,
+                "prob_buy": 0.76,
+            },
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(coinmarketcap_use_context=False),
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["SOL-USD"]
+
+
+def test_live_signal_engine_filters_excluded_default_watchlist_products() -> None:
+    """Live watchlists should drop excluded bases before a refresh request is built."""
+
+    live_engine = LiveSignalEngine(
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_fetch_all_quote_products=False,
+            live_product_ids=("BTC-USD", "ETH-USD", "SOL-USD", "USDC-USD"),
+        )
+    )
+
+    assert live_engine._resolve_requested_products(product_id=None, product_ids=None) == ["SOL-USD"]
+
+
+def test_live_signal_engine_prefers_quote_universe_when_enabled() -> None:
+    """Live mode should use the broader quote universe by default when enabled."""
+
+    live_engine = LiveSignalEngine(
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_fetch_all_quote_products=True,
+            live_product_ids=("BTC-USD", "ETH-USD", "SOL-USD"),
+        )
+    )
+
+    assert live_engine._should_use_quote_universe(product_id=None, product_ids=None) is True
+    assert live_engine._resolve_requested_products(product_id=None, product_ids=None) == []
+
+
+def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live monitoring should merge the persisted watchlist pool and publish a watched BUY immediately."""
+
+    import crypto_signal_ml.live as live_module
+
+    watchlist_pool_path = tmp_path / "watchlistPool.json"
+    watchlist_pool_path.write_text(
+        json.dumps(
+            build_watchlist_pool_snapshot(
+                [
+                    {
+                        "productId": "AGLD-USD",
+                        "signal_name": "HOLD",
+                        "modelSignalName": "BUY",
+                        "tradeReadiness": "blocked",
+                        "confidence": 0.60,
+                        "policyScore": 0.52,
+                        "setupScore": 0.25,
+                        "brain": {
+                            "decision": "watchlist",
+                            "decisionScore": 0.41,
+                            "summaryLine": "AGLD-USD is close to a breakout entry.",
+                        },
+                        "reasonSummary": "AGLD-USD is close to a breakout entry.",
+                    }
+                ],
+                max_products=3,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    config = TrainingConfig(
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_watchlist_pool_enabled=True,
+        signal_watchlist_pool_max_products=3,
+        signal_watchlist_pool_path=watchlist_pool_path,
+        live_fetch_all_quote_products=True,
+        live_max_products=100,
+        live_signal_cache_seconds=60,
+        live_watchlist_pool_cache_seconds=15,
+        portfolio_store_path=tmp_path / "portfolio.sqlite3",
+    )
+
+    class FakeModel:
+        feature_columns = ("close",)
+        model_type = "fakeModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            return feature_df.copy()
+
+    class FakeLoader:
+        def __init__(self, frame: pd.DataFrame) -> None:
+            self._frame = frame
+
+        def refresh_data(self) -> pd.DataFrame:
+            return self._frame.copy()
+
+    class FakeDatasetBuilder:
+        def __init__(
+            self,
+            config: TrainingConfig,
+            feature_columns: Sequence[str] | None = None,
+            data_loader: FakeLoader | None = None,
+        ) -> None:
+            del config
+            del feature_columns
+            self.data_loader = data_loader
+
+        def build_feature_table(self) -> pd.DataFrame:
+            if self.data_loader is None:
+                raise AssertionError("This fake dataset builder should only be used with an explicit loader.")
+            return self.data_loader.refresh_data()
+
+    top_universe_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "ABT-USD",
+                "base_currency": "ABT",
+                "quote_currency": "USD",
+                "close": 0.38,
+                "predicted_signal": 0,
+                "predicted_name": "HOLD",
+                "confidence": 0.91,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.91,
+                "prob_buy": 0.05,
+                "market_regime_label": "range",
+                "market_regime_code": 0,
+                "regime_is_high_volatility": 0,
+                "cmcal_has_event_next_7d": 0,
+            }
+        ]
+    )
+    watchlist_prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "AGLD-USD",
+                "base_currency": "AGLD",
+                "quote_currency": "USD",
+                "close": 0.31,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.82,
+                "prob_take_profit": 0.08,
+                "prob_hold": 0.10,
+                "prob_buy": 0.82,
+                "market_regime_label": "trend_up",
+                "market_regime_code": 2,
+                "regime_is_trending": 1,
+                "regime_is_high_volatility": 0,
+                "cmcal_has_event_next_7d": 0,
+            }
+        ]
+    )
+
+    def fake_create_market_data_loader(
+        config: TrainingConfig,
+        data_path: Path,
+        should_save_downloaded_data: bool,
+        product_ids: Sequence[str] | None = None,
+        fetch_all_quote_products: bool | None = None,
+        max_products: int | None = None,
+        granularity_seconds: int | None = None,
+        total_candles: int | None = None,
+        request_pause_seconds: float | None = None,
+        save_progress_every_products: int | None = None,
+        log_progress: bool | None = None,
+    ) -> FakeLoader:
+        del config
+        del data_path
+        del should_save_downloaded_data
+        del max_products
+        del granularity_seconds
+        del total_candles
+        del request_pause_seconds
+        del save_progress_every_products
+        del log_progress
+        if fetch_all_quote_products:
+            return FakeLoader(top_universe_prediction_df)
+        assert tuple(product_ids or ()) == ("AGLD-USD",)
+        return FakeLoader(watchlist_prediction_df)
+
+    live_engine = LiveSignalEngine(config=config)
+
+    monkeypatch.setattr(live_module, "create_market_data_loader", fake_create_market_data_loader)
+    monkeypatch.setattr(live_module, "CryptoDatasetBuilder", FakeDatasetBuilder)
+    monkeypatch.setattr(live_engine, "_load_model", lambda: FakeModel(config=config))
+
+    snapshot = live_engine.get_live_snapshot(force_refresh=True)
+
+    assert snapshot["requestMode"] == "quote-universe-plus-watchlist-pool"
+    assert snapshot["liveSignalCacheSeconds"] == 15
+    assert snapshot["watchlistPool"]["active"] is True
+    assert snapshot["watchlistPool"]["productIds"] == ["AGLD-USD"]
+    assert snapshot["marketSummary"]["actionableSignals"] == 1
+    assert snapshot["primarySignal"]["productId"] == "AGLD-USD"
+    assert snapshot["primarySignal"]["signal_name"] == "BUY"
+    assert snapshot["signals"][0]["productId"] == "AGLD-USD"
+
+
+def test_signal_monitor_service_runs_initial_generation_before_serving() -> None:
+    """The single-command monitor should seed signals before starting the live API."""
+
+    refresh_calls: list[str] = []
+    create_app_calls: list[dict[str, object]] = []
+    uvicorn_calls: list[dict[str, object]] = []
+
+    class FakeSignalGenerationApp:
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+
+        def run(self) -> dict[str, object]:
+            refresh_calls.append("run")
+            return {
+                "signalsGenerated": 1,
+                "actionableSignalsGenerated": 0,
+                "signalName": "BUY",
+            }
+
+    fake_app = object()
+
+    def fake_create_app(**kwargs):
+        create_app_calls.append(kwargs)
+        return fake_app
+
+    import crypto_signal_ml.monitor as monitor_module
+
+    original_uvicorn_run = monitor_module.uvicorn.run
+
+    def fake_uvicorn_run(app, host: str, port: int) -> None:
+        uvicorn_calls.append(
+            {
+                "app": app,
+                "host": host,
+                "port": port,
+            }
+        )
+
+    monitor_module.uvicorn.run = fake_uvicorn_run
+    try:
+        service = SignalMonitorService(
+            config=TrainingConfig(
+                signal_monitor_run_initial_generation=True,
+                signal_monitor_refresh_interval_seconds=0,
+            ),
+            signal_generation_app_factory=FakeSignalGenerationApp,
+            app_factory=fake_create_app,
+        )
+
+        service.serve()
+    finally:
+        monitor_module.uvicorn.run = original_uvicorn_run
+
+    assert refresh_calls == ["run"]
+    assert len(create_app_calls) == 1
+    assert create_app_calls[0]["config"].signal_monitor_run_initial_generation is True
+    assert len(uvicorn_calls) == 1
+    assert uvicorn_calls[0] == {
+        "app": fake_app,
+        "host": "127.0.0.1",
+        "port": 8100,
+    }
+
+
+def test_signal_summaries_exclude_numeric_only_base_currencies() -> None:
+    """Numeric-only tickers should be filtered even when stale rows exist locally."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "00-USD",
+                "base_currency": "00",
+                "quote_currency": "USD",
+                "close": 0.0045,
+                "predicted_signal": -1,
+                "predicted_name": "TAKE_PROFIT",
+                "confidence": 0.84,
+                "prob_take_profit": 0.84,
+                "prob_hold": 0.08,
+                "prob_buy": 0.08,
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "SOL-USD",
+                "base_currency": "SOL",
+                "quote_currency": "USD",
+                "close": 150.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.76,
+                "prob_take_profit": 0.09,
+                "prob_hold": 0.15,
+                "prob_buy": 0.76,
+            },
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+        ),
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["SOL-USD"]
+
+
+def test_signal_summaries_exclude_short_digit_tickers_from_public_output() -> None:
+    """Short digit-mixed tickers like 2Z should not surface in public signals."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "2Z-USD",
+                "base_currency": "2Z",
+                "quote_currency": "USD",
+                "close": 0.08,
+                "predicted_signal": -1,
+                "predicted_name": "TAKE_PROFIT",
+                "confidence": 0.91,
+                "prob_take_profit": 0.91,
+                "prob_hold": 0.04,
+                "prob_buy": 0.05,
+                "cmc_name": "DoubleZero",
+                "cmc_category": "token",
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "SOL-USD",
+                "base_currency": "SOL",
+                "quote_currency": "USD",
+                "close": 150.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.76,
+                "prob_take_profit": 0.09,
+                "prob_hold": 0.15,
+                "prob_buy": 0.76,
+                "cmc_name": "Solana",
+                "cmc_category": "coin",
+            },
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+        ),
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["SOL-USD"]
+
+
+def test_signal_summaries_exclude_usd_pegged_assets_even_when_not_in_base_exclusions() -> None:
+    """USD-pegged assets should not surface as public opportunities."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "USDS-USD",
+                "base_currency": "USDS",
+                "quote_currency": "USD",
+                "close": 1.001,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.81,
+                "prob_take_profit": 0.08,
+                "prob_hold": 0.11,
+                "prob_buy": 0.81,
+                "cmc_name": "USD Stable",
+                "cmc_category": "stablecoin",
+                "cmc_percent_change_24h": 0.001,
+                "cmc_percent_change_7d": 0.003,
+            },
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "ADA-USD",
+                "base_currency": "ADA",
+                "quote_currency": "USD",
+                "close": 1.12,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.77,
+                "prob_take_profit": 0.09,
+                "prob_hold": 0.14,
+                "prob_buy": 0.77,
+                "cmc_name": "Cardano",
+                "cmc_category": "coin",
+                "cmc_percent_change_24h": 0.05,
+                "cmc_percent_change_7d": 0.14,
+            },
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+        ),
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["ADA-USD"]
+
+
+def test_take_profit_is_suppressed_without_prior_trade_context() -> None:
+    """Exit-only calls without a tracked trade should stay internal and unpublishable."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "ALGO-USD",
+                "signal_name": "TAKE_PROFIT",
+                "spotAction": "take_profit",
+                "actionable": True,
+                "tradeReadiness": "medium",
+                "reasonItems": ["The raw model wants to take profit."],
+                "reasonSummary": "The raw model wants to take profit.",
+                "signalChat": "ALGO-USD is a TAKE_PROFIT setup for spot trading.",
+                "close": 0.25,
+                "quoteCurrency": "USD",
+                "baseCurrency": "ALGO",
+                "coinName": "Algorand",
+                "coinCategory": "coin",
+                "marketContext": {
+                    "cmcPercentChange24h": 0.03,
+                    "cmcPercentChange7d": 0.08,
+                },
+            }
+        ],
+        active_trade_product_ids=[],
+    )
+
+    assert contextualized_signals[0]["signal_name"] == "HOLD"
+    assert contextualized_signals[0]["spotAction"] == "wait"
+    assert contextualized_signals[0]["actionable"] is False
+    assert contextualized_signals[0]["takeProfitSuppressed"] is True
+    assert contextualized_signals[0]["takeProfitEligible"] is False
+    assert filter_published_signal_summaries(contextualized_signals) == []
+
+
+def test_take_profit_survives_when_prior_trade_context_exists() -> None:
+    """Tracked positions should keep TAKE_PROFIT public and actionable."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "ALGO-USD",
+                "signal_name": "TAKE_PROFIT",
+                "spotAction": "take_profit",
+                "actionable": True,
+                "tradeReadiness": "medium",
+                "reasonItems": ["The raw model wants to take profit."],
+                "reasonSummary": "The raw model wants to take profit.",
+                "signalChat": "ALGO-USD is a TAKE_PROFIT setup for spot trading.",
+                "close": 0.25,
+                "quoteCurrency": "USD",
+                "baseCurrency": "ALGO",
+                "coinName": "Algorand",
+                "coinCategory": "coin",
+                "marketContext": {
+                    "cmcPercentChange24h": 0.03,
+                    "cmcPercentChange7d": 0.08,
+                },
+            }
+        ],
+        active_trade_product_ids=["ALGO-USD"],
+    )
+
+    assert contextualized_signals[0]["signal_name"] == "TAKE_PROFIT"
+    assert contextualized_signals[0]["spotAction"] == "take_profit"
+    assert contextualized_signals[0]["actionable"] is True
+    assert contextualized_signals[0]["takeProfitEligible"] is True
+
+
+def test_buy_signal_becomes_hold_when_trade_is_already_active() -> None:
+    """Fresh BUY calls should become HOLD once the system is already tracking the trade."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "ALGO-USD",
+                "signal_name": "BUY",
+                "spotAction": "buy",
+                "actionable": True,
+                "tradeReadiness": "medium",
+                "reasonItems": ["The raw model wants to buy."],
+                "reasonSummary": "The raw model wants to buy.",
+                "signalChat": "ALGO-USD is a BUY setup.",
+                "close": 0.25,
+                "quoteCurrency": "USD",
+                "baseCurrency": "ALGO",
+                "coinName": "Algorand",
+                "coinCategory": "coin",
+            }
+        ],
+        active_trade_product_ids=["ALGO-USD"],
+    )
+
+    assert contextualized_signals[0]["signal_name"] == "HOLD"
+    assert contextualized_signals[0]["spotAction"] == "wait"
+    assert contextualized_signals[0]["actionable"] is False
+    assert contextualized_signals[0]["tradeLifecycleApplied"] is True
+    assert contextualized_signals[0]["tradeLifecycleSignalName"] == "HOLD"
+    published_signals = filter_published_signal_summaries(contextualized_signals)
+    assert len(published_signals) == 1
+    assert published_signals[0]["signal_name"] == "HOLD"
+
+
+def test_profitable_active_trade_switches_public_signal_to_take_profit() -> None:
+    """Tracked trades in profit should publish TAKE_PROFIT instead of a fresh BUY."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "SOL-USD",
+                "signal_name": "BUY",
+                "spotAction": "buy",
+                "actionable": True,
+                "tradeReadiness": "medium",
+                "reasonItems": ["The raw model still likes the long."],
+                "reasonSummary": "The raw model still likes the long.",
+                "signalChat": "SOL-USD is a BUY setup.",
+                "close": 109.0,
+                "quoteCurrency": "USD",
+                "baseCurrency": "SOL",
+                "coinName": "Solana",
+                "coinCategory": "coin",
+            }
+        ],
+        active_trade_product_ids=["SOL-USD"],
+        active_signal_context_by_product={
+            "SOL-USD": {
+                "entryPrice": 100.0,
+                "takeProfitPrice": 108.0,
+            }
+        },
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+            brain_profit_lock_threshold=0.08,
+        ),
+    )
+
+    assert contextualized_signals[0]["signal_name"] == "TAKE_PROFIT"
+    assert contextualized_signals[0]["spotAction"] == "take_profit"
+    assert contextualized_signals[0]["actionable"] is True
+    assert contextualized_signals[0]["tradeContext"]["profitLockTriggered"] is True
+
+
+def test_losing_active_trade_switches_public_signal_to_loss() -> None:
+    """Tracked trades below the loss budget should publish LOSS for risk control."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "ADA-USD",
+                "signal_name": "HOLD",
+                "spotAction": "wait",
+                "actionable": False,
+                "tradeReadiness": "standby",
+                "reasonItems": ["The raw model is indecisive."],
+                "reasonSummary": "The raw model is indecisive.",
+                "signalChat": "ADA-USD is a HOLD setup.",
+                "close": 94.0,
+                "quoteCurrency": "USD",
+                "baseCurrency": "ADA",
+                "coinName": "Cardano",
+                "coinCategory": "coin",
+            }
+        ],
+        active_trade_product_ids=["ADA-USD"],
+        active_signal_context_by_product={
+            "ADA-USD": {
+                "entryPrice": 100.0,
+                "stopLossPrice": 95.0,
+            }
+        },
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+            brain_loss_cut_threshold=-0.05,
+        ),
+    )
+
+    assert contextualized_signals[0]["signal_name"] == "LOSS"
+    assert contextualized_signals[0]["spotAction"] == "cut_loss"
+    assert contextualized_signals[0]["actionable"] is True
+    assert contextualized_signals[0]["tradeReadiness"] == "high"
+
+
+def test_watchlist_hold_without_trade_context_stays_internal_only() -> None:
+    """Neutral watchlist rows should not appear in the published public feed."""
+
+    contextualized_signals = apply_signal_trade_context(
+        [
+            {
+                "productId": "LINK-USD",
+                "signal_name": "HOLD",
+                "spotAction": "wait",
+                "actionable": False,
+                "tradeReadiness": "standby",
+                "reasonItems": ["The setup is still forming."],
+                "reasonSummary": "The setup is still forming.",
+                "signalChat": "LINK-USD is a HOLD setup.",
+                "close": 18.5,
+                "quoteCurrency": "USD",
+                "baseCurrency": "LINK",
+                "coinName": "Chainlink",
+                "coinCategory": "coin",
+            }
+        ],
+        active_trade_product_ids=[],
+    )
+
+    assert len(contextualized_signals) == 1
+    assert filter_published_signal_summaries(contextualized_signals) == []
+
+
+def test_signal_summaries_drop_stale_products_after_batch_rotation() -> None:
+    """Older products should not surface as live signals once a fresher batch has been refreshed."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "ABT-USD",
+                "base_currency": "ABT",
+                "quote_currency": "USD",
+                "close": 1.2,
+                "predicted_signal": -1,
+                "predicted_name": "TAKE_PROFIT",
+                "confidence": 0.91,
+                "prob_take_profit": 0.91,
+                "prob_hold": 0.05,
+                "prob_buy": 0.04,
+            },
+            {
+                "time_step": 2,
+                "timestamp": "2026-01-02T12:00:00Z",
+                "product_id": "ALGO-USD",
+                "base_currency": "ALGO",
+                "quote_currency": "USD",
+                "close": 0.12,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.72,
+                "prob_take_profit": 0.11,
+                "prob_hold": 0.17,
+                "prob_buy": 0.72,
+            },
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            signal_excluded_base_currencies=(),
+            signal_max_staleness_hours=3.0,
+        ),
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["ALGO-USD"]
+
+
+def test_backtester_skips_buys_blocked_by_policy() -> None:
+    """The backtester should not open positions that the trading policy downgraded to HOLD."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "BTC-USD",
+                "future_return": -0.04,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.82,
+                "prob_take_profit": 0.07,
+                "prob_hold": 0.11,
+                "prob_buy": 0.82,
+                "market_regime_label": "trend_down",
+                "market_regime_code": 3.0,
+                "regime_is_trending": 1.0,
+                "regime_is_high_volatility": 0.0,
+                "cmcal_has_event_next_7d": 0,
+            },
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "ETH-USD",
+                "future_return": 0.05,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.83,
+                "prob_take_profit": 0.05,
+                "prob_hold": 0.12,
+                "prob_buy": 0.83,
+                "market_regime_label": "trend_up",
+                "market_regime_code": 2.0,
+                "regime_is_trending": 1.0,
+                "regime_is_high_volatility": 0.0,
+                "cmcal_has_event_next_7d": 0,
+            },
+        ]
+    )
+
+    backtester = EqualWeightSignalBacktester(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            backtest_min_confidence=0.65,
+            backtest_max_positions_per_timestamp=2,
+        )
+    )
+    result = backtester.run(prediction_df)
+
+    assert result["summary"]["tradeCount"] == 1
+    assert result["trade_df"].iloc[0]["product_id"] == "ETH-USD"
+
+
+def test_trader_brain_builds_offensive_entry_plan() -> None:
+    """The trader brain should rank and size fresh long candidates."""
+
+    signal_summaries = [
+        {
+            "productId": "BTC-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.84,
+            "probabilityMargin": 0.22,
+            "setupScore": 4.6,
+            "policyScore": 1.02,
+            "tradeReadiness": "high",
+            "marketState": {
+                "label": "trend_up",
+                "isTrending": True,
+                "isHighVolatility": False,
+                "volatilityRatio": 1.02,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 64000.0,
+        },
+        {
+            "productId": "ETH-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.78,
+            "probabilityMargin": 0.15,
+            "setupScore": 3.8,
+            "policyScore": 0.90,
+            "tradeReadiness": "medium",
+            "marketState": {
+                "label": "trend_up",
+                "isTrending": True,
+                "isHighVolatility": False,
+                "volatilityRatio": 1.05,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 3200.0,
+        },
+        {
+            "productId": "SOL-USD",
+            "signal_name": "HOLD",
+            "spotAction": "wait",
+            "confidence": 0.66,
+            "probabilityMargin": 0.05,
+            "setupScore": 0.0,
+            "policyScore": 0.45,
+            "tradeReadiness": "standby",
+            "marketState": {
+                "label": "trend_up",
+                "isTrending": True,
+                "isHighVolatility": False,
+                "volatilityRatio": 0.98,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 140.0,
+        },
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            brain_max_entry_positions=2,
+            brain_max_portfolio_risk_fraction=0.25,
+        )
+    ).build_plan(signal_summaries=signal_summaries, capital=10000.0)
+
+    assert plan["marketStance"] == "offensive"
+    assert plan["plan"]["newEntryCount"] == 2
+    assert plan["plan"]["entries"][0]["productId"] == "BTC-USD"
+    assert plan["plan"]["entries"][0]["allocationFraction"] > 0
+    assert plan["signals"][0]["brain"]["decision"] == "enter_long"
+
+
+def test_primary_signal_rotation_can_feature_a_different_strong_coin() -> None:
+    """The featured signal should rotate away from the same recent coin when alternatives are close."""
+
+    signal_summaries = [
+        {
+            "productId": "ALGO-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.76,
+            "setupScore": 4.4,
+            "policyScore": 1.04,
+            "tradeReadiness": "high",
+        },
+        {
+            "productId": "APE-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.73,
+            "setupScore": 4.1,
+            "policyScore": 0.97,
+            "tradeReadiness": "high",
+        },
+        {
+            "productId": "ABT-USD",
+            "signal_name": "TAKE_PROFIT",
+            "spotAction": "take_profit",
+            "confidence": 0.71,
+            "setupScore": 3.7,
+            "policyScore": 0.86,
+            "tradeReadiness": "medium",
+        },
+    ]
+
+    primary_signal = select_primary_signal(
+        signal_summaries,
+        config=TrainingConfig(
+            signal_primary_rotation_enabled=True,
+            signal_primary_rotation_lookback=2,
+            signal_primary_rotation_candidate_window=3,
+            signal_primary_rotation_min_score_ratio=0.88,
+        ),
+        recent_primary_product_ids=["ALGO-USD"],
+    )
+
+    assert primary_signal["productId"] == "APE-USD"
+
+
+def test_primary_signal_rotation_keeps_the_top_coin_when_others_are_much_weaker() -> None:
+    """Rotation should not demote the headline signal when the gap is too large."""
+
+    signal_summaries = [
+        {
+            "productId": "ALGO-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.82,
+            "setupScore": 5.0,
+            "policyScore": 1.18,
+            "tradeReadiness": "high",
+        },
+        {
+            "productId": "APE-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.66,
+            "setupScore": 2.5,
+            "policyScore": 0.55,
+            "tradeReadiness": "medium",
+        },
+    ]
+
+    primary_signal = select_primary_signal(
+        signal_summaries,
+        config=TrainingConfig(
+            signal_primary_rotation_enabled=True,
+            signal_primary_rotation_lookback=2,
+            signal_primary_rotation_candidate_window=3,
+            signal_primary_rotation_min_score_ratio=0.92,
+        ),
+        recent_primary_product_ids=["ALGO-USD"],
+    )
+
+    assert primary_signal["productId"] == "ALGO-USD"
+
+
+def test_trader_brain_respects_risk_off_market_intelligence() -> None:
+    """Risk-off CMC intelligence should downgrade fresh entries into watchlist mode."""
+
+    signal_summaries = [
+        {
+            "productId": "SOL-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.79,
+            "probabilityMargin": 0.16,
+            "setupScore": 4.2,
+            "policyScore": 0.96,
+            "tradeReadiness": "medium",
+            "marketState": {
+                "label": "trend_up",
+                "isTrending": True,
+                "isHighVolatility": False,
+                "volatilityRatio": 1.01,
+            },
+            "marketContext": {
+                "marketIntelligence": {
+                    "available": True,
+                    "fearGreedValue": 22,
+                    "fearGreedClassification": "Extreme Fear",
+                    "btcDominance": 0.58,
+                    "btcDominanceChange24h": 0.01,
+                    "riskMode": "risk_off",
+                }
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 145.0,
+        }
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            coinmarketcap_use_market_intelligence=True,
+        )
+    ).build_plan(signal_summaries=signal_summaries, capital=10000.0)
+
+    assert plan["marketStance"] == "defensive"
+    assert plan["signals"][0]["brain"]["decision"] == "watchlist"
+    assert plan["signals"][0]["brain"]["macroRiskMode"] == "risk_off"
+
+
+def test_trader_brain_surfaces_structured_decision_evidence() -> None:
+    """Each signal should now carry a structured evidence, memo, and critic review block."""
+
+    signal_summaries = [
+        {
+            "productId": "AAVE-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.83,
+            "probabilityMargin": 0.17,
+            "setupScore": 4.6,
+            "policyScore": 1.02,
+            "tradeReadiness": "high",
+            "marketState": {
+                "label": "trend_up",
+                "isTrending": True,
+                "isHighVolatility": False,
+                "volatilityRatio": 1.02,
+            },
+            "marketContext": {
+                "marketIntelligence": {
+                    "available": True,
+                    "fearGreedValue": 67,
+                    "fearGreedClassification": "Greed",
+                    "btcDominance": 0.52,
+                    "btcDominanceChange24h": -0.01,
+                    "riskMode": "risk_on",
+                }
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 108.0,
+        }
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            coinmarketcap_use_market_intelligence=True,
+        )
+    ).build_plan(signal_summaries=signal_summaries, capital=10000.0)
+
+    brain = plan["signals"][0]["brain"]
+
+    assert brain["evidence"]["edgeScore"] > 0.70
+    assert brain["decisionMemo"]["thesis"]
+    assert brain["criticReview"]["verdict"] in {"approve", "caution"}
+    assert brain["decision"] in {"enter_long", "watchlist"}
+
+
+def test_trader_brain_critic_blocks_entry_when_trade_memory_and_risk_conflict() -> None:
+    """Weak tracked-trade history should help block fragile fresh entries."""
+
+    signal_summaries = [
+        {
+            "productId": "SOL-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.84,
+            "probabilityMargin": 0.18,
+            "setupScore": 4.5,
+            "policyScore": 1.00,
+            "tradeReadiness": "high",
+            "marketState": {
+                "label": "trend_up_high_volatility",
+                "isTrending": True,
+                "isHighVolatility": True,
+                "volatilityRatio": 1.28,
+            },
+            "marketContext": {
+                "marketIntelligence": {
+                    "available": True,
+                    "fearGreedValue": 25,
+                    "fearGreedClassification": "Fear",
+                    "btcDominance": 0.58,
+                    "btcDominanceChange24h": 0.01,
+                    "riskMode": "risk_off",
+                }
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 145.0,
+        }
+    ]
+    trade_memory_by_product = {
+        "SOL-USD": {
+            "available": True,
+            "scope": "product+signal",
+            "closedTradeCount": 4,
+            "winRate": 0.25,
+            "averageRealizedReturn": -0.05,
+            "recentLossStreak": 1,
+            "lastOutcome": "loss",
+            "sampleAdequate": True,
+        }
+    }
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            coinmarketcap_use_market_intelligence=True,
+        )
+    ).build_plan(
+        signal_summaries=signal_summaries,
+        capital=10000.0,
+        trade_memory_by_product=trade_memory_by_product,
+    )
+
+    brain = plan["signals"][0]["brain"]
+
+    assert brain["decision"] == "watchlist"
+    assert brain["criticReview"]["verdict"] == "block"
+    assert brain["criticReview"]["approvedDecision"] == "watchlist"
+    assert brain["evidence"]["tradeMemory"]["bias"] == "cautious"
+
+
+def test_trader_brain_can_exit_existing_position_on_take_profit_signal() -> None:
+    """The trader brain should escalate to an exit when risk rises against an open position."""
+
+    signal_summaries = [
+        {
+            "productId": "BTC-USD",
+            "signal_name": "TAKE_PROFIT",
+            "spotAction": "take_profit",
+            "confidence": 0.81,
+            "probabilityMargin": 0.19,
+            "setupScore": 4.0,
+            "policyScore": 0.95,
+            "tradeReadiness": "medium",
+            "marketState": {
+                "label": "trend_down_high_volatility",
+                "isTrending": True,
+                "isHighVolatility": True,
+                "volatilityRatio": 1.35,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 61000.0,
+        }
+    ]
+
+    plan = TraderBrain(TrainingConfig(coinmarketcap_use_context=False)).build_plan(
+        signal_summaries=signal_summaries,
+        positions=[
+            {
+                "productId": "BTC-USD",
+                "quantity": 0.2,
+                "entryPrice": 59000.0,
+                "currentPrice": 61000.0,
+                "positionFraction": 0.12,
+            }
+        ],
+        capital=10000.0,
+    )
+
+    assert plan["plan"]["exitCount"] == 1
+    assert plan["signals"][0]["brain"]["decision"] == "exit_position"
+    assert plan["signals"][0]["brain"]["suggestedReduceFraction"] == 1.0
+
+
+def test_trader_brain_cuts_loser_when_drawdown_breaks_loss_limit() -> None:
+    """A losing position should be exited once the configured loss budget is breached."""
+
+    signal_summaries = [
+        {
+            "productId": "ETH-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "confidence": 0.74,
+            "probabilityMargin": 0.10,
+            "setupScore": 2.4,
+            "policyScore": 0.58,
+            "tradeReadiness": "medium",
+            "marketState": {
+                "label": "trend_down_high_volatility",
+                "isTrending": True,
+                "isHighVolatility": True,
+                "volatilityRatio": 1.42,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 92.0,
+        }
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            brain_loss_cut_threshold=-0.05,
+        )
+    ).build_plan(
+        signal_summaries=signal_summaries,
+        positions=[
+            {
+                "productId": "ETH-USD",
+                "quantity": 1.0,
+                "entryPrice": 100.0,
+                "currentPrice": 92.0,
+                "positionFraction": 0.10,
+                "ageHours": 18.0,
+            }
+        ],
+        capital=10000.0,
+    )
+
+    assert plan["plan"]["exitCount"] == 1
+    assert plan["signals"][0]["brain"]["decision"] == "exit_position"
+    assert plan["signals"][0]["brain"]["lossCutTriggered"] is True
+    assert "loss" in plan["signals"][0]["brain"]["reasonSummary"].lower()
+
+
+def test_trader_brain_reduces_stale_hold_position_without_follow_through() -> None:
+    """A stale position without a fresh BUY should be trimmed instead of passively held."""
+
+    signal_summaries = [
+        {
+            "productId": "SOL-USD",
+            "signal_name": "HOLD",
+            "spotAction": "wait",
+            "confidence": 0.61,
+            "probabilityMargin": 0.04,
+            "setupScore": 0.0,
+            "policyScore": 0.41,
+            "tradeReadiness": "standby",
+            "marketState": {
+                "label": "range",
+                "isTrending": False,
+                "isHighVolatility": False,
+                "volatilityRatio": 0.97,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 145.0,
+        }
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            brain_stale_position_age_hours=72.0,
+            brain_reduce_fraction=0.40,
+        )
+    ).build_plan(
+        signal_summaries=signal_summaries,
+        positions=[
+            {
+                "productId": "SOL-USD",
+                "quantity": 10.0,
+                "entryPrice": 143.0,
+                "currentPrice": 145.0,
+                "positionFraction": 0.12,
+                "ageHours": 96.0,
+            }
+        ],
+        capital=10000.0,
+    )
+
+    assert plan["plan"]["reduceCount"] == 1
+    assert plan["signals"][0]["brain"]["decision"] == "reduce_position"
+    assert plan["signals"][0]["brain"]["thesisAgeIsStale"] is True
+    assert plan["signals"][0]["brain"]["suggestedReduceFraction"] == 0.40
+
+
+def test_trader_brain_locks_in_profit_even_without_high_volatility() -> None:
+    """Strong unrealized gains should still exit on a take-profit signal even in calmer tape."""
+
+    signal_summaries = [
+        {
+            "productId": "BTC-USD",
+            "signal_name": "TAKE_PROFIT",
+            "spotAction": "take_profit",
+            "confidence": 0.70,
+            "probabilityMargin": 0.12,
+            "setupScore": 2.8,
+            "policyScore": 0.70,
+            "tradeReadiness": "medium",
+            "marketState": {
+                "label": "range",
+                "isTrending": False,
+                "isHighVolatility": False,
+                "volatilityRatio": 1.01,
+            },
+            "eventContext": {"hasEventNext7d": False},
+            "close": 111.0,
+        }
+    ]
+
+    plan = TraderBrain(
+        TrainingConfig(
+            coinmarketcap_use_context=False,
+            brain_profit_lock_threshold=0.08,
+        )
+    ).build_plan(
+        signal_summaries=signal_summaries,
+        positions=[
+            {
+                "productId": "BTC-USD",
+                "quantity": 0.1,
+                "entryPrice": 100.0,
+                "currentPrice": 111.0,
+                "positionFraction": 0.11,
+                "ageHours": 30.0,
+            }
+        ],
+        capital=10000.0,
+    )
+
+    assert plan["plan"]["exitCount"] == 1
+    assert plan["signals"][0]["brain"]["decision"] == "exit_position"
+    assert plan["signals"][0]["brain"]["profitLockTriggered"] is True
+
+
 def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> None:
     """The frontend snapshot store should return overview, filters, and product detail quickly."""
 
@@ -1333,6 +4154,18 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
             "confidence": 0.82,
             "setupScore": 4.0,
             "signalChat": "BTC-USD is a BUY setup.",
+            "marketContext": {
+                "marketIntelligence": {
+                    "available": True,
+                    "fearGreedValue": 68,
+                    "fearGreedClassification": "Greed",
+                    "btcDominance": 0.58,
+                    "btcDominanceChange24h": -0.008,
+                    "altcoinShare": 0.42,
+                    "stablecoinShare": 0.12,
+                    "riskMode": "risk_on",
+                }
+            },
             "marketState": {
                 "label": "trend_up",
                 "code": 2,
@@ -1397,6 +4230,8 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
     assert overview["marketSummary"]["signalCounts"]["buy"] == 1
     assert overview["marketSummary"]["signalCounts"]["take_profit"] == 1
     assert overview["marketSummary"]["signalCounts"]["wait"] == 1
+    assert overview["marketIntelligence"]["available"] is True
+    assert overview["marketIntelligence"]["riskMode"] == "risk_on"
     assert market_state["highVolatilitySignals"] == 1
     assert market_state["trendingSignals"] == 2
     assert len(buy_signals) == 1
@@ -1404,6 +4239,23 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
     assert len(actionable_list) == 2
     assert eth_signal is not None
     assert eth_signal["signal_name"] == "TAKE_PROFIT"
+    assert overview["traderBrain"] == {}
+
+
+def test_frontend_snapshot_can_represent_an_empty_public_feed() -> None:
+    """The cached snapshot should stay valid even when nothing is ready to publish."""
+
+    snapshot_payload = build_frontend_signal_snapshot(
+        model_type="histGradientBoostingSignalModel",
+        primary_signal=None,
+        latest_signals=[],
+        actionable_signals=[],
+    )
+
+    assert snapshot_payload["primarySignal"] is None
+    assert snapshot_payload["marketSummary"]["totalSignals"] == 0
+    assert snapshot_payload["marketSummary"]["actionableSignals"] == 0
+    assert snapshot_payload["marketSummary"]["signalCounts"]["wait"] == 0
 
 
 def test_backtester_builds_strategy_summary() -> None:

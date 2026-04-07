@@ -23,12 +23,31 @@ def main() -> None:
     print(f"Frontend snapshot saved to: {results['frontendSignalSnapshotPath']}")
     print(f"Signals generated: {results['signalsGenerated']}")
     print(f"Actionable signals generated: {results['actionableSignalsGenerated']}")
-    print(
-        "Latest model output: "
-        f"{results['signalName']} "
-        f"(confidence={results['confidence']:.4f})"
-    )
-    print(f"Signal explanation: {results['signalChat']}")
+    print(f"Signal source: {results['signalSource']}")
+    if results.get("marketDataRefresh"):
+        print(
+            "Market data refreshed: "
+            f"{results['marketDataRefresh']['rowsDownloaded']} rows across "
+            f"{results['marketDataRefresh']['uniqueProducts']} products"
+        )
+        print(
+            "Market data window: "
+            f"{results['marketDataRefresh']['firstTimestamp']} -> "
+            f"{results['marketDataRefresh']['lastTimestamp']}"
+        )
+    if results.get("signalName") is None:
+        print("Latest model output: no public signal is currently published.")
+        print(
+            "Signal explanation: candidates remain on the internal watchlist until a BUY appears "
+            "or an open trade needs HOLD, TAKE_PROFIT, or LOSS management."
+        )
+    else:
+        print(
+            "Latest model output: "
+            f"{results['signalName']} "
+            f"(confidence={results['confidence']:.4f})"
+        )
+        print(f"Signal explanation: {results['signalChat']}")
 
 
 if __name__ == "__main__":

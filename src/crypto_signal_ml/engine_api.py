@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .assistant import ConversationSessionStore, TradingAssistantService
 from .charting import MarketChartService
-from .config import MODELS_DIR, OUTPUTS_DIR, PROJECT_ROOT, TrainingConfig
+from .config import (
+    MODELS_DIR,
+    OUTPUTS_DIR,
+    PROJECT_ROOT,
+    TrainingConfig,
+    is_coinmarketcap_market_data_source,
+)
 from .frontend import SignalSnapshotStore
 from .live import LiveSignalEngine
 from .modeling import BaseSignalModel, get_model_class
 from .rag import RagKnowledgeStore
+from .trading.portfolio import TradingPortfolioStore
+from .trading.trader_brain import TraderBrain
+
+INTERNAL_API_KEY_HEADER = "x-ai-engine-key"
 
 
 def _timestamp_to_isoformat(timestamp_value: float) -> str:
@@ -212,6 +225,74 @@ class RagSearchRequest(BaseModel):
     limit: int | None = None
 
 
+class TraderCapitalRequest(BaseModel):
+    """Request payload for updating the tracked portfolio capital."""
+
+    capital: float
+
+
+class TraderPositionRequest(BaseModel):
+    """Request payload for creating or updating one tracked position."""
+
+    productId: str
+    quantity: float = 0.0
+    entryPrice: float | None = None
+    currentPrice: float | None = None
+    positionFraction: float | None = None
+    openedAt: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TraderExecutionRequest(BaseModel):
+    """Request payload for recording one executed spot fill."""
+
+    productId: str
+    side: str
+    quantity: float
+    price: float
+    fee: float = 0.0
+    currentPrice: float | None = None
+    executedAt: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TraderTrackedTradeRequest(BaseModel):
+    """Request payload for recording one tracked trade idea or live entry."""
+
+    productId: str
+    entryPrice: float
+    takeProfitPrice: float | None = None
+    stopLossPrice: float | None = None
+    quantity: float | None = None
+    currentPrice: float | None = None
+    signalName: str | None = None
+    status: str = "planned"
+    openedAt: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TraderTrackedTradeFromSignalRequest(BaseModel):
+    """Request payload for promoting a cached or live signal into a tracked trade."""
+
+    live: bool = False
+    forceRefresh: bool = False
+    entryPrice: float | None = None
+    quantity: float | None = None
+    status: str = "planned"
+    metadata: dict[str, Any] | None = None
+
+
+class TraderTrackedTradeCloseRequest(BaseModel):
+    """Request payload for closing a tracked trade and recording the outcome."""
+
+    exitPrice: float
+    closedAt: str | None = None
+    closeReason: str | None = None
+    currentPrice: float | None = None
+    outcome: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
 class ModelArtifactStore:
     """Load and summarize the latest trained model artifact if one exists."""
 
@@ -246,7 +327,7 @@ class ModelArtifactStore:
     def _resolve_quote_currency(config: TrainingConfig) -> str:
         """Return the active quote currency for the configured market source."""
 
-        if config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(config.market_data_source):
             return config.coinmarketcap_quote_currency
 
         return config.coinbase_quote_currency
@@ -255,7 +336,7 @@ class ModelArtifactStore:
     def _resolve_product_mode(config: TrainingConfig) -> str:
         """Return the active product-mode label for the configured market source."""
 
-        if config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(config.market_data_source):
             fetch_all = bool(config.coinmarketcap_fetch_all_quote_products)
             quote_currency = config.coinmarketcap_quote_currency
         else:
@@ -386,7 +467,10 @@ def create_app(
     chart_service: MarketChartService | None = None,
     assistant_service: TradingAssistantService | None = None,
     session_store: ConversationSessionStore | None = None,
+    portfolio_store: TradingPortfolioStore | None = None,
     knowledge_store: RagKnowledgeStore | None = None,
+    require_internal_api_key: bool = False,
+    internal_api_key: str | None = None,
 ) -> FastAPI:
     """Create the Python AI engine service."""
 
@@ -402,11 +486,18 @@ def create_app(
     )
     chart_service = chart_service or MarketChartService(config=runtime_config)
     session_store = session_store or ConversationSessionStore(
-        OUTPUTS_DIR / "assistantSessions.sqlite3"
+        db_path=runtime_config.assistant_store_path,
+        database_url=runtime_config.assistant_store_url,
+    )
+    portfolio_store = portfolio_store or TradingPortfolioStore(
+        db_path=runtime_config.portfolio_store_path,
+        default_capital=runtime_config.portfolio_default_capital,
+        database_url=runtime_config.portfolio_store_url,
     )
     knowledge_store = knowledge_store or (
         RagKnowledgeStore(
             db_path=runtime_config.rag_store_path,
+            database_url=runtime_config.rag_store_url,
             chunk_size_chars=runtime_config.rag_chunk_size_chars,
             chunk_overlap_chars=runtime_config.rag_chunk_overlap_chars,
             fetch_timeout_seconds=runtime_config.rag_fetch_timeout_seconds,
@@ -447,6 +538,31 @@ def create_app(
         allow_headers=["*"],
     )
 
+    resolved_internal_api_key = str(internal_api_key or "").strip()
+
+    @app.middleware("http")
+    async def require_backend_internal_key(request: Request, call_next):
+        """Reject direct callers when the engine is configured for backend-only access."""
+
+        protected_path = request.url.path.startswith("/api") or request.url.path in {"/docs", "/redoc", "/openapi.json"}
+        if not require_internal_api_key or not protected_path:
+            return await call_next(request)
+
+        if not resolved_internal_api_key:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Internal model-service API key is not configured."},
+            )
+
+        provided_key = str(request.headers.get(INTERNAL_API_KEY_HEADER, "") or "")
+        if not secrets.compare_digest(provided_key, resolved_internal_api_key):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Python model service only accepts requests from the backend."},
+            )
+
+        return await call_next(request)
+
     def require_knowledge_store() -> RagKnowledgeStore:
         """Return the configured knowledge store or fail when RAG is disabled."""
 
@@ -480,6 +596,7 @@ def create_app(
             "marketState": overview.get("marketState", {}),
             "marketSummary": overview["marketSummary"],
             "primarySignal": overview["primarySignal"],
+            "traderBrain": overview.get("traderBrain", {}),
         }
 
     def require_snapshot() -> dict[str, Any]:
@@ -489,6 +606,89 @@ def create_app(
             return snapshot_store.get_snapshot()
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    def resolve_signal_for_tracking(
+        product_id: str,
+        *,
+        live: bool = False,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Return one cached or live signal row for trade tracking."""
+
+        normalized_product_id = str(product_id).strip().upper()
+        try:
+            if live:
+                signal_summary = live_signal_engine.get_signal_by_product(
+                    product_id=normalized_product_id,
+                    force_refresh=force_refresh,
+                )
+            else:
+                require_snapshot()
+                signal_summary = snapshot_store.get_signal_by_product(normalized_product_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except Exception as error:
+            if live:
+                raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+            raise
+
+        if signal_summary is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No {'live ' if live else ''}signal found for {normalized_product_id}.",
+            )
+
+        return signal_summary
+
+    def build_trader_plan_payload(
+        *,
+        force_refresh: bool = False,
+        capital_override: float | None = None,
+    ) -> dict[str, Any]:
+        """Build a portfolio-aware trader plan from live data or cached signals."""
+
+        source = "live"
+        warning = ""
+        try:
+            signal_snapshot = live_signal_engine.get_live_snapshot(force_refresh=force_refresh)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except Exception as error:
+            cached_snapshot = get_cached_snapshot_or_none()
+            if cached_snapshot is None:
+                raise HTTPException(status_code=503, detail=f"Trader plan refresh failed: {error}") from error
+            signal_snapshot = cached_snapshot
+            source = "cached"
+            warning = str(error)
+
+        portfolio = portfolio_store.get_portfolio()
+        resolved_capital = float(capital_override) if capital_override is not None else float(portfolio["capital"])
+        trader_plan = TraderBrain(config=runtime_config).build_plan(
+            signal_summaries=list(signal_snapshot.get("signals", [])),
+            positions=list(portfolio.get("positions", [])),
+            capital=resolved_capital,
+            trade_memory_by_product=portfolio_store.build_trade_learning_map(
+                list(signal_snapshot.get("signals", []))
+            ),
+        )
+
+        return {
+            "source": source,
+            "warning": warning,
+            "portfolio": {
+                **portfolio,
+                "capital": resolved_capital,
+            },
+            "liveSnapshot": {
+                "generatedAt": signal_snapshot.get("generatedAt"),
+                "marketDataSource": signal_snapshot.get("marketDataSource"),
+                "requestMode": signal_snapshot.get("requestMode"),
+                "productsCovered": signal_snapshot.get("productsCovered"),
+                "primarySignal": signal_snapshot.get("primarySignal"),
+                "marketSummary": signal_snapshot.get("marketSummary", {}),
+            },
+            "traderPlan": trader_plan,
+        }
 
     @app.get("/")
     def engine_root() -> dict[str, Any]:
@@ -558,6 +758,11 @@ def create_app(
                 "supportsSessionMemory": True,
                 "supportsRetrieval": bool(runtime_config.assistant_enable_retrieval),
             },
+            "trader": {
+                "brainEnabled": bool(runtime_config.brain_enabled),
+                "portfolio": portfolio_store.get_portfolio(),
+                "supportsLivePlan": True,
+            },
             "rag": knowledge_store.get_status() if knowledge_store is not None else {"enabled": False},
             "model": model_store.get_summary(),
             "modelResearch": MODEL_RESEARCH_ROADMAP,
@@ -586,7 +791,31 @@ def create_app(
                 },
                 {
                     "step": "Start the Python AI engine",
-                    "command": "python model-service/scripts/runAiEngine.py",
+                    "command": "python model-service",
+                },
+                {
+                    "step": "Update tracked portfolio capital",
+                    "command": "POST /api/trader/capital",
+                },
+                {
+                    "step": "Sync one open position into the trader brain",
+                    "command": "POST /api/trader/positions",
+                },
+                {
+                    "step": "Record an executed buy or sell fill",
+                    "command": "POST /api/trader/executions",
+                },
+                {
+                    "step": "Track a trade idea with entry, stop, and take-profit targets",
+                    "command": "POST /api/trader/trades or POST /api/trader/trades/from-signal/{productId}",
+                },
+                {
+                    "step": "Close a tracked trade and label the outcome",
+                    "command": "POST /api/trader/trades/{tradeId}/close",
+                },
+                {
+                    "step": "Build the current portfolio-aware trader plan",
+                    "command": "GET /api/trader/plan?force_refresh=true",
                 },
                 {
                     "step": "Start the TypeScript backend",
@@ -635,6 +864,22 @@ def create_app(
                     "path": "/api/live/signals?action=all&limit=12",
                 },
                 {
+                    "label": "Trader portfolio",
+                    "path": "/api/trader/portfolio",
+                },
+                {
+                    "label": "Trader plan",
+                    "path": "/api/trader/plan?force_refresh=true",
+                },
+                {
+                    "label": "Trader journal",
+                    "path": "/api/trader/journal?limit=50",
+                },
+                {
+                    "label": "Tracked trades",
+                    "path": "/api/trader/trades?limit=50",
+                },
+                {
                     "label": "TradingView config",
                     "path": "/api/tradingview/config",
                 },
@@ -672,6 +917,7 @@ def create_app(
             "marketState": snapshot.get("marketState", {}),
             "marketSummary": snapshot["marketSummary"],
             "primarySignal": snapshot["primarySignal"],
+            "traderBrain": snapshot.get("traderBrain", {}),
         }
 
     @app.get("/api/market-state")
@@ -769,6 +1015,232 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"No live signal found for {product_id}.")
 
         return signal_summary
+
+    @app.get("/api/trader/portfolio")
+    def trader_portfolio() -> dict[str, Any]:
+        """Return the tracked portfolio capital and open positions."""
+
+        return portfolio_store.get_portfolio()
+
+    @app.post("/api/trader/capital")
+    def trader_capital(request: TraderCapitalRequest) -> dict[str, Any]:
+        """Update the tracked portfolio capital."""
+
+        try:
+            return portfolio_store.set_capital(request.capital)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/trader/positions")
+    def trader_upsert_position(request: TraderPositionRequest) -> dict[str, Any]:
+        """Create or update one tracked position."""
+
+        try:
+            position = portfolio_store.upsert_position(
+                product_id=request.productId,
+                quantity=request.quantity,
+                entry_price=request.entryPrice,
+                current_price=request.currentPrice,
+                position_fraction=request.positionFraction,
+                opened_at=request.openedAt,
+                metadata=request.metadata,
+            )
+            return {
+                "status": "upserted",
+                "position": position,
+                "portfolio": portfolio_store.get_portfolio(),
+            }
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/api/trader/positions/{product_id}")
+    def trader_delete_position(product_id: str) -> dict[str, Any]:
+        """Delete one tracked position from the portfolio store."""
+
+        deleted = portfolio_store.delete_position(product_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Tracked position not found: {product_id}")
+
+        return {
+            "status": "deleted",
+            "productId": str(product_id).strip().upper(),
+            "portfolio": portfolio_store.get_portfolio(),
+        }
+
+    @app.get("/api/trader/journal")
+    def trader_journal(
+        limit: Optional[int] = Query(default=50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Return the newest execution-journal rows."""
+
+        journal_rows = portfolio_store.list_journal(limit=limit or 50)
+        return {
+            "count": len(journal_rows),
+            "executions": journal_rows,
+        }
+
+    @app.get("/api/trader/trades")
+    def trader_trades(
+        limit: Optional[int] = Query(default=50, ge=1, le=500),
+        status: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Return tracked trade records for review and post-trade analysis."""
+
+        try:
+            trade_rows = portfolio_store.list_trades(limit=limit or 50, status=status)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        return {
+            "count": len(trade_rows),
+            "status": status,
+            "trades": trade_rows,
+        }
+
+    @app.get("/api/trader/trades/{trade_id}")
+    def trader_trade_detail(trade_id: int) -> dict[str, Any]:
+        """Return one tracked trade record by id."""
+
+        try:
+            trade_row = portfolio_store.get_trade(trade_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        if trade_row is None:
+            raise HTTPException(status_code=404, detail=f"Tracked trade not found: {trade_id}")
+
+        return trade_row
+
+    @app.post("/api/trader/trades")
+    def trader_create_trade(request: TraderTrackedTradeRequest) -> dict[str, Any]:
+        """Create one tracked trade record with entry and target prices."""
+
+        try:
+            trade_row = portfolio_store.create_trade(
+                product_id=request.productId,
+                entry_price=request.entryPrice,
+                take_profit_price=request.takeProfitPrice,
+                stop_loss_price=request.stopLossPrice,
+                quantity=request.quantity,
+                current_price=request.currentPrice,
+                signal_name=request.signalName,
+                status=request.status,
+                opened_at=request.openedAt,
+                metadata=request.metadata,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        return {
+            "status": "tracked",
+            "trade": trade_row,
+            "portfolio": portfolio_store.get_portfolio(),
+        }
+
+    @app.post("/api/trader/trades/from-signal/{product_id}")
+    def trader_create_trade_from_signal(
+        product_id: str,
+        request: TraderTrackedTradeFromSignalRequest,
+    ) -> dict[str, Any]:
+        """Create one tracked trade directly from a cached or live signal row."""
+
+        signal_summary = resolve_signal_for_tracking(
+            product_id=product_id,
+            live=request.live,
+            force_refresh=request.forceRefresh,
+        )
+        brain = signal_summary.get("brain", {}) if isinstance(signal_summary.get("brain"), dict) else {}
+        signal_metadata = {
+            "trackedFromSignal": True,
+            "signalSource": "live" if request.live else "cached",
+            "signalTimestamp": signal_summary.get("timestamp"),
+            "signalName": signal_summary.get("signal_name"),
+            "confidence": signal_summary.get("confidence"),
+            "signalSourceLabel": signal_summary.get("signalSource"),
+            "marketDataSource": signal_summary.get("marketDataSource"),
+            "brainDecision": brain.get("decision"),
+            "brainSummary": brain.get("summaryLine"),
+        }
+        merged_metadata = {**signal_metadata, **(request.metadata or {})}
+
+        try:
+            trade_row = portfolio_store.create_trade(
+                product_id=str(signal_summary.get("productId") or product_id),
+                entry_price=float(request.entryPrice or signal_summary.get("close") or 0.0),
+                take_profit_price=brain.get("takeProfitPrice"),
+                stop_loss_price=brain.get("stopLossPrice"),
+                quantity=request.quantity,
+                current_price=float(signal_summary.get("close") or request.entryPrice or 0.0),
+                signal_name=str(signal_summary.get("signal_name") or ""),
+                status=request.status,
+                opened_at=str(signal_summary.get("timestamp") or ""),
+                metadata=merged_metadata,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        return {
+            "status": "tracked",
+            "trade": trade_row,
+            "signal": signal_summary,
+            "portfolio": portfolio_store.get_portfolio(),
+        }
+
+    @app.post("/api/trader/executions")
+    def trader_record_execution(request: TraderExecutionRequest) -> dict[str, Any]:
+        """Record one executed spot fill and update the tracked portfolio."""
+
+        try:
+            return portfolio_store.record_execution(
+                product_id=request.productId,
+                side=request.side,
+                quantity=request.quantity,
+                price=request.price,
+                fee=request.fee,
+                current_price=request.currentPrice,
+                executed_at=request.executedAt,
+                metadata=request.metadata,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/trader/trades/{trade_id}/close")
+    def trader_close_trade(
+        trade_id: int,
+        request: TraderTrackedTradeCloseRequest,
+    ) -> dict[str, Any]:
+        """Close one tracked trade and compute the outcome summary."""
+
+        try:
+            trade_row = portfolio_store.close_trade(
+                trade_id=trade_id,
+                exit_price=request.exitPrice,
+                closed_at=request.closedAt,
+                close_reason=request.closeReason,
+                current_price=request.currentPrice,
+                outcome=request.outcome,
+                metadata=request.metadata,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        return {
+            "status": "closed",
+            "trade": trade_row,
+            "portfolio": portfolio_store.get_portfolio(),
+        }
+
+    @app.get("/api/trader/plan")
+    def trader_plan(
+        force_refresh: bool = Query(default=False),
+        capital: float | None = Query(default=None, gt=0),
+    ) -> dict[str, Any]:
+        """Return a live or cached trader-brain plan using tracked portfolio state."""
+
+        return build_trader_plan_payload(
+            force_refresh=force_refresh,
+            capital_override=capital,
+        )
 
     @app.get("/api/tradingview/config")
     def tradingview_config() -> dict[str, Any]:
@@ -1057,4 +1529,8 @@ def create_app(
     return app
 
 
-app = create_app()
+_module_internal_api_key = str(os.getenv("AI_ENGINE_INTERNAL_API_KEY", "")).strip()
+app = create_app(
+    require_internal_api_key=bool(_module_internal_api_key),
+    internal_api_key=_module_internal_api_key or None,
+)

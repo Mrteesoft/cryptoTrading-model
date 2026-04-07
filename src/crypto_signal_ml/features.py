@@ -116,6 +116,24 @@ FEATURE_COLUMNS = [
     "cmc_has_layer1_tag",
     "cmc_has_gaming_tag",
     "cmc_has_meme_tag",
+    "cmc_market_intelligence_available",
+    "cmc_market_total_market_cap_log",
+    "cmc_market_total_volume_24h_log",
+    "cmc_market_total_market_cap_change_24h",
+    "cmc_market_total_volume_change_24h",
+    "cmc_market_altcoin_share",
+    "cmc_market_btc_dominance",
+    "cmc_market_btc_dominance_change_24h",
+    "cmc_market_eth_dominance",
+    "cmc_market_stablecoin_share",
+    "cmc_market_defi_market_cap_log",
+    "cmc_market_defi_volume_24h_log",
+    "cmc_market_derivatives_volume_24h_log",
+    "cmc_market_fear_greed_score",
+    "cmc_market_is_fear",
+    "cmc_market_is_greed",
+    "cmc_market_is_extreme_fear",
+    "cmc_market_is_extreme_greed",
 ]
 
 
@@ -145,12 +163,14 @@ class BaseFeatureEngineer(ABC):
         """
 
         feature_df = price_df.copy()
-        self._add_features(feature_df)
+        updated_feature_df = self._add_features(feature_df)
+        if updated_feature_df is not None:
+            feature_df = updated_feature_df
         return feature_df
 
     @abstractmethod
-    def _add_features(self, feature_df: pd.DataFrame) -> None:
-        """Add feature columns to the working DataFrame."""
+    def _add_features(self, feature_df: pd.DataFrame) -> pd.DataFrame | None:
+        """Add feature columns to the working DataFrame and optionally return an updated frame."""
 
     @staticmethod
     def calculate_rsi(close_series: pd.Series, period: int = 14) -> pd.Series:
@@ -666,6 +686,41 @@ class BaseFeatureEngineer(ABC):
         cmc_has_layer1_tag = self._get_numeric_column_or_default(feature_df, "cmc_has_layer1_tag")
         cmc_has_gaming_tag = self._get_numeric_column_or_default(feature_df, "cmc_has_gaming_tag")
         cmc_has_meme_tag = self._get_numeric_column_or_default(feature_df, "cmc_has_meme_tag")
+        cmc_market_intelligence_available = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_intelligence_available",
+        )
+        cmc_market_total_market_cap = self._get_numeric_column_or_default(feature_df, "cmc_market_total_market_cap")
+        cmc_market_total_volume_24h = self._get_numeric_column_or_default(feature_df, "cmc_market_total_volume_24h")
+        cmc_market_total_market_cap_change_24h = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_total_market_cap_change_24h",
+        )
+        cmc_market_total_volume_change_24h = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_total_volume_change_24h",
+        )
+        cmc_market_altcoin_share = self._get_numeric_column_or_default(feature_df, "cmc_market_altcoin_share")
+        cmc_market_btc_dominance = self._get_numeric_column_or_default(feature_df, "cmc_market_btc_dominance")
+        cmc_market_btc_dominance_change_24h = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_btc_dominance_change_24h",
+        )
+        cmc_market_eth_dominance = self._get_numeric_column_or_default(feature_df, "cmc_market_eth_dominance")
+        cmc_market_stablecoin_share = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_stablecoin_share",
+        )
+        cmc_market_defi_market_cap = self._get_numeric_column_or_default(feature_df, "cmc_market_defi_market_cap")
+        cmc_market_defi_volume_24h = self._get_numeric_column_or_default(feature_df, "cmc_market_defi_volume_24h")
+        cmc_market_derivatives_volume_24h = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_derivatives_volume_24h",
+        )
+        cmc_market_fear_greed_value = self._get_numeric_column_or_default(
+            feature_df,
+            "cmc_market_fear_greed_value",
+        )
 
         feature_df["cmc_context_available"] = cmc_context_available
         feature_df["cmc_rank_score"] = self._safe_ratio(
@@ -690,6 +745,32 @@ class BaseFeatureEngineer(ABC):
         feature_df["cmc_has_layer1_tag"] = cmc_has_layer1_tag
         feature_df["cmc_has_gaming_tag"] = cmc_has_gaming_tag
         feature_df["cmc_has_meme_tag"] = cmc_has_meme_tag
+        market_feature_frame = pd.DataFrame(
+            {
+                "cmc_market_intelligence_available": cmc_market_intelligence_available,
+                "cmc_market_total_market_cap_log": np.log1p(cmc_market_total_market_cap.clip(lower=0.0)),
+                "cmc_market_total_volume_24h_log": np.log1p(cmc_market_total_volume_24h.clip(lower=0.0)),
+                "cmc_market_total_market_cap_change_24h": cmc_market_total_market_cap_change_24h / 100.0,
+                "cmc_market_total_volume_change_24h": cmc_market_total_volume_change_24h / 100.0,
+                "cmc_market_altcoin_share": cmc_market_altcoin_share.clip(lower=0.0, upper=1.0),
+                "cmc_market_btc_dominance": (cmc_market_btc_dominance / 100.0).clip(lower=0.0, upper=1.0),
+                "cmc_market_btc_dominance_change_24h": cmc_market_btc_dominance_change_24h / 100.0,
+                "cmc_market_eth_dominance": (cmc_market_eth_dominance / 100.0).clip(lower=0.0, upper=1.0),
+                "cmc_market_stablecoin_share": cmc_market_stablecoin_share.clip(lower=0.0, upper=1.0),
+                "cmc_market_defi_market_cap_log": np.log1p(cmc_market_defi_market_cap.clip(lower=0.0)),
+                "cmc_market_defi_volume_24h_log": np.log1p(cmc_market_defi_volume_24h.clip(lower=0.0)),
+                "cmc_market_derivatives_volume_24h_log": np.log1p(
+                    cmc_market_derivatives_volume_24h.clip(lower=0.0)
+                ),
+                "cmc_market_fear_greed_score": (cmc_market_fear_greed_value / 100.0).clip(lower=0.0, upper=1.0),
+                "cmc_market_is_fear": (cmc_market_fear_greed_value <= 45).astype(float),
+                "cmc_market_is_greed": (cmc_market_fear_greed_value >= 55).astype(float),
+                "cmc_market_is_extreme_fear": (cmc_market_fear_greed_value <= 25).astype(float),
+                "cmc_market_is_extreme_greed": (cmc_market_fear_greed_value >= 75).astype(float),
+            },
+            index=feature_df.index,
+        )
+        feature_df[market_feature_frame.columns] = market_feature_frame
 
 
 class TechnicalFeatureEngineer(BaseFeatureEngineer):
@@ -700,7 +781,7 @@ class TechnicalFeatureEngineer(BaseFeatureEngineer):
     the formulas inside one long function.
     """
 
-    def _add_features(self, feature_df: pd.DataFrame) -> None:
+    def _add_features(self, feature_df: pd.DataFrame) -> pd.DataFrame:
         """
         Create model features from raw OHLCV data.
 
@@ -723,7 +804,11 @@ class TechnicalFeatureEngineer(BaseFeatureEngineer):
         self._add_benchmark_context_features(feature_df)
         self._add_chart_pattern_features(feature_df)
         self._add_time_context_features(feature_df)
+        # The feature table is wide by this point. Copying here keeps the
+        # final CMC context block from triggering pandas fragmentation warnings.
+        feature_df = feature_df.copy()
         self._add_coinmarketcap_context_features(feature_df)
+        return feature_df
 
 
 def calculate_rsi(close_series: pd.Series, period: int = 14) -> pd.Series:

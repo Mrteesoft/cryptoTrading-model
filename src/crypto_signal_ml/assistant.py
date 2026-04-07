@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
-import sqlite3
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 from uuid import uuid4
 
 from .config import TrainingConfig
 from .live import LiveSignalEngine
 from .rag import RagKnowledgeStore
+from .storage.database import DatabaseConnection, DatabaseHandle
 
 
 COMMON_STOP_WORDS = {
@@ -44,11 +44,14 @@ COMMON_STOP_WORDS = {
 
 
 class ConversationSessionStore:
-    """Persist assistant sessions and chat messages in a small SQLite database."""
+    """Persist assistant sessions and chat messages in SQLite or PostgreSQL."""
 
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Path, database_url: str | None = None) -> None:
+        self.database = DatabaseHandle(
+            sqlite_path=db_path,
+            database_url=database_url,
+        )
+        self.db_path = self.database.sqlite_path
         self._initialize_schema()
 
     def create_session(self, title: str | None = None) -> Dict[str, Any]:
@@ -117,13 +120,14 @@ class ConversationSessionStore:
         metadata_json = json.dumps(metadata or {})
 
         with self._connect() as connection:
-            cursor = connection.execute(
+            row = connection.execute(
                 """
                 INSERT INTO assistant_messages (session_id, role, content, created_at, metadata_json)
                 VALUES (?, ?, ?, ?, ?)
+                RETURNING message_id, session_id, role, content, created_at, metadata_json
                 """,
                 (session_id, role, content, timestamp, metadata_json),
-            )
+            ).fetchone()
             connection.execute(
                 """
                 UPDATE assistant_sessions
@@ -132,9 +136,8 @@ class ConversationSessionStore:
                 """,
                 (timestamp, session_id),
             )
-            message_id = int(cursor.lastrowid)
 
-        return self.get_message(message_id) or {}
+        return self._row_to_message_dict(row) if row is not None else {}
 
     def get_message(self, message_id: int) -> Optional[Dict[str, Any]]:
         """Return one saved chat message."""
@@ -152,14 +155,7 @@ class ConversationSessionStore:
         if row is None:
             return None
 
-        return {
-            "messageId": int(row["message_id"]),
-            "sessionId": str(row["session_id"]),
-            "role": str(row["role"]),
-            "content": str(row["content"]),
-            "createdAt": str(row["created_at"]),
-            "metadata": json.loads(str(row["metadata_json"]) or "{}"),
-        }
+        return self._row_to_message_dict(row)
 
     def list_messages(
         self,
@@ -185,17 +181,20 @@ class ConversationSessionStore:
                 (session_id, query_limit),
             ).fetchall()
 
-        return [
-            {
-                "messageId": int(row["message_id"]),
-                "sessionId": str(row["session_id"]),
-                "role": str(row["role"]),
-                "content": str(row["content"]),
-                "createdAt": str(row["created_at"]),
-                "metadata": json.loads(str(row["metadata_json"]) or "{}"),
-            }
-            for row in rows
-        ]
+        return [self._row_to_message_dict(row) for row in rows]
+
+    @staticmethod
+    def _row_to_message_dict(row: Mapping[str, Any]) -> Dict[str, Any]:
+        """Convert one stored assistant message row into the public response shape."""
+
+        return {
+            "messageId": int(row["message_id"]),
+            "sessionId": str(row["session_id"]),
+            "role": str(row["role"]),
+            "content": str(row["content"]),
+            "createdAt": str(row["created_at"]),
+            "metadata": json.loads(str(row["metadata_json"]) or "{}"),
+        }
 
     def _initialize_schema(self) -> None:
         """Create the SQLite schema if it does not exist yet."""
@@ -211,26 +210,39 @@ class ConversationSessionStore:
                 )
                 """
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assistant_messages (
-                    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY(session_id) REFERENCES assistant_sessions(session_id)
+            if self.database.storage_backend == "postgresql":
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS assistant_messages (
+                        message_id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        FOREIGN KEY(session_id) REFERENCES assistant_sessions(session_id)
+                    )
+                    """
                 )
-                """
-            )
+            else:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS assistant_messages (
+                        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL DEFAULT '{}',
+                        FOREIGN KEY(session_id) REFERENCES assistant_sessions(session_id)
+                    )
+                    """
+                )
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a SQLite connection with dict-like row access."""
+    def _connect(self) -> DatabaseConnection:
+        """Open a backend-aware connection with dict-like row access."""
 
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return self.database.connect()
 
 
 class TradingAssistantService:
@@ -415,7 +427,9 @@ class TradingAssistantService:
                 score += 5
             if "buy" in question_tokens and str(signal_summary.get("signal_name")) == "BUY":
                 score += 1
-            if "sell" in question_tokens and str(signal_summary.get("signal_name")) == "TAKE_PROFIT":
+            if "sell" in question_tokens and str(signal_summary.get("signal_name")) in {"TAKE_PROFIT", "LOSS"}:
+                score += 1
+            if "loss" in question_tokens and str(signal_summary.get("signal_name")) == "LOSS":
                 score += 1
             if "hold" in question_tokens and str(signal_summary.get("signal_name")) == "HOLD":
                 score += 1
@@ -490,7 +504,7 @@ class TradingAssistantService:
             if resolved_product_id
             else None
         )
-        primary_signal = (live_snapshot or {}).get("primarySignal", {})
+        primary_signal = (live_snapshot or {}).get("primarySignal") or {}
         market_summary = (live_snapshot or {}).get("marketSummary", {})
         actionable_signals = list((live_snapshot or {}).get("actionableSignals", []))
 
@@ -514,13 +528,20 @@ class TradingAssistantService:
         elif live_snapshot is not None:
             actionable_count = int(market_summary.get("actionableSignals") or 0)
             total_signals = int(market_summary.get("totalSignals") or 0)
-            lead_pair = primary_signal.get("productId", "the lead pair")
-            lead_signal = primary_signal.get("signal_name", "HOLD")
-            lead_confidence = self._format_percent(primary_signal.get("confidence"))
-            paragraphs.append(
-                f"Live market overview: {actionable_count} actionable setups across {total_signals} tracked pairs. "
-                f"The lead signal is {lead_pair} with a {lead_signal} call at {lead_confidence} confidence."
-            )
+            if total_signals <= 0:
+                paragraphs.append(
+                    "Live market overview: there are no published trade-ready signals right now. "
+                    "The engine is keeping candidates on the internal watchlist until a BUY appears "
+                    "or an open trade needs HOLD, TAKE_PROFIT, or LOSS management."
+                )
+            else:
+                lead_pair = primary_signal.get("productId", "the lead pair")
+                lead_signal = primary_signal.get("signal_name", "HOLD")
+                lead_confidence = self._format_percent(primary_signal.get("confidence"))
+                paragraphs.append(
+                    f"Live market overview: {actionable_count} actionable setups across {total_signals} tracked pairs. "
+                    f"The lead signal is {lead_pair} with a {lead_signal} call at {lead_confidence} confidence."
+                )
 
             if actionable_signals:
                 top_lines = [
@@ -603,6 +624,12 @@ class TradingAssistantService:
             return (
                 "Tactical read: the model is not calling for a short here. It is warning that a recent long "
                 "position may be better trimmed or de-risked."
+            )
+
+        if signal_name == "LOSS":
+            return (
+                "Tactical read: the trade has moved against the plan enough that the system prefers cutting risk "
+                "instead of waiting for a rebound."
             )
 
         return (

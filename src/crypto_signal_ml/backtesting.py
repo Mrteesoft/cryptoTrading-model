@@ -6,6 +6,7 @@ from typing import Any, Dict
 import pandas as pd
 
 from .config import TrainingConfig
+from .trading.policy import evaluate_trading_decision
 
 
 class BaseSignalBacktester(ABC):
@@ -62,11 +63,45 @@ class BaseSignalBacktester(ABC):
 
         candidates = prediction_df.copy()
         candidates = candidates.dropna(subset=["future_return"])
-        candidates = candidates[candidates["predicted_signal"] == 1].copy()
-        candidates = candidates[candidates["confidence"] >= self.config.backtest_min_confidence].copy()
+        if candidates.empty:
+            return candidates
 
-        sort_columns = ["timestamp", "confidence"]
-        ascending = [True, False]
+        policy_rows = [
+            evaluate_trading_decision(
+                signal_row=signal_row,
+                minimum_action_confidence=self.config.backtest_min_confidence,
+                config=self.config,
+            )
+            for _, signal_row in candidates.iterrows()
+        ]
+        policy_df = pd.DataFrame(
+            [
+                {
+                    "policy_signal_name": policy_row["signalName"],
+                    "policy_spot_action": policy_row["spotAction"],
+                    "policy_trade_readiness": policy_row["tradeReadiness"],
+                    "policy_score": policy_row["policyScore"],
+                    "policy_probability_margin": policy_row["probabilityMargin"],
+                    "policy_required_action_confidence": policy_row["requiredActionConfidence"],
+                    "policy_confidence_gate_applied": policy_row["confidenceGateApplied"],
+                    "policy_risk_gate_applied": policy_row["riskGateApplied"],
+                }
+                for policy_row in policy_rows
+            ],
+            index=candidates.index,
+        )
+        candidates = pd.concat([candidates, policy_df], axis=1)
+        candidates = candidates[candidates["policy_spot_action"] == "buy"].copy()
+
+        if "policy_score" in candidates.columns:
+            sort_columns = ["timestamp", "policy_score", "confidence"]
+            ascending = [True, False, False]
+        else:
+            sort_columns = ["timestamp", "confidence"]
+            ascending = [True, False]
+        if "policy_probability_margin" in candidates.columns:
+            sort_columns.append("policy_probability_margin")
+            ascending.append(False)
         if "product_id" in candidates.columns:
             sort_columns.append("product_id")
             ascending.append(True)

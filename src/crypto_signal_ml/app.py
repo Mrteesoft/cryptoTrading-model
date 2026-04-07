@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -11,23 +11,41 @@ from typing import Any, Dict, List, Type
 import pandas as pd
 
 from .backtesting import BaseSignalBacktester, EqualWeightSignalBacktester
-from .config import MODELS_DIR, OUTPUTS_DIR, PROCESSED_DATA_DIR, TrainingConfig, config_to_dict, ensure_project_directories
+from .config import (
+    MODELS_DIR,
+    OUTPUTS_DIR,
+    PROCESSED_DATA_DIR,
+    TrainingConfig,
+    apply_runtime_market_data_settings,
+    config_to_dict,
+    ensure_project_directories,
+    is_coinmarketcap_market_data_source,
+)
 from .data import (
     CoinMarketCalEventEnricher,
     CoinMarketCapContextEnricher,
+    CoinMarketCapMarketIntelligenceEnricher,
     CsvPriceDataLoader,
     create_market_data_loader,
 )
-from .frontend import build_frontend_signal_snapshot
+from .frontend import (
+    WatchlistPoolStore,
+    build_frontend_signal_snapshot,
+    build_watchlist_pool_snapshot,
+)
 from .labels import create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
+from .trading.portfolio import TradingPortfolioStore
 from .regime_modeling import MarketRegimeModel
-from .signals import (
+from .trading.signals import (
+    apply_signal_trade_context,
     build_actionable_signal_summaries,
     build_latest_signal_summaries,
+    filter_published_signal_summaries,
     select_primary_signal,
 )
+from .trading.trader_brain import TraderBrain
 
 
 class BaseSignalApp:
@@ -145,7 +163,7 @@ class BaseSignalApp:
     def _resolve_market_quote_currency(self) -> str:
         """Return the active quote currency for the configured market source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return self.config.coinmarketcap_quote_currency
 
         return self.config.coinbase_quote_currency
@@ -153,7 +171,7 @@ class BaseSignalApp:
     def _resolve_market_fetch_all_quote_products(self) -> bool:
         """Return whether the active market source is in quote-universe mode."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return bool(self.config.coinmarketcap_fetch_all_quote_products)
 
         return bool(self.config.coinbase_fetch_all_quote_products)
@@ -161,7 +179,7 @@ class BaseSignalApp:
     def _resolve_market_granularity_seconds(self) -> int:
         """Return the active base-candle size for the configured market source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_granularity_seconds)
 
         return int(self.config.coinbase_granularity_seconds)
@@ -169,10 +187,20 @@ class BaseSignalApp:
     def _resolve_market_product_batch_number(self) -> int:
         """Return the active product-batch index for the configured market source."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_product_batch_number)
 
         return int(self.config.coinbase_product_batch_number)
+
+    def _resolve_market_product_batch_size(self) -> int | None:
+        """Return the active product-batch size for the configured market source."""
+
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
+            batch_size = self.config.coinmarketcap_product_batch_size
+        else:
+            batch_size = self.config.coinbase_product_batch_size
+
+        return None if batch_size is None else int(batch_size)
 
     def _with_market_product_batch_number(
         self,
@@ -180,7 +208,7 @@ class BaseSignalApp:
     ) -> TrainingConfig:
         """Clone the config with the active source's product batch number updated."""
 
-        if self.config.market_data_source == "coinmarketcap":
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return replace(
                 self.config,
                 coinmarketcap_product_batch_number=int(batch_number),
@@ -190,6 +218,154 @@ class BaseSignalApp:
             self.config,
             coinbase_product_batch_number=int(batch_number),
         )
+
+    def _market_product_batch_state_key(self) -> str:
+        """Build one stable key for batch rotation state across different market sources."""
+
+        batch_size = self._resolve_market_product_batch_size()
+        return (
+            f"{self.config.market_data_source}:"
+            f"{self._resolve_market_quote_currency().upper()}:"
+            f"{batch_size if batch_size is not None else 'all'}"
+        )
+
+    def _load_market_product_batch_state(self) -> dict[str, Any]:
+        """Load the persisted market-batch rotation state when present."""
+
+        state_path = Path(self.config.market_product_batch_state_file)
+        if not state_path.exists():
+            return {}
+
+        try:
+            with state_path.open("r", encoding="utf-8") as state_file:
+                payload = json.load(state_file)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_last_market_refresh_batch_number(self) -> int | None:
+        """Read the most recent published refresh batch when no explicit rotation state exists yet."""
+
+        candidate_paths = (
+            OUTPUTS_DIR / "signalMarketDataRefresh.json",
+            OUTPUTS_DIR / "marketDataRefreshOnDemand.json",
+        )
+
+        for candidate_path in candidate_paths:
+            if not candidate_path.exists():
+                continue
+
+            try:
+                with candidate_path.open("r", encoding="utf-8") as refresh_file:
+                    payload = json.load(refresh_file)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            refresh_payload = payload.get("refresh", payload)
+            if not isinstance(refresh_payload, dict):
+                continue
+
+            download_summary = refresh_payload.get("downloadSummary", {})
+            if not isinstance(download_summary, dict):
+                continue
+
+            try:
+                batch_number = int(download_summary.get("batchNumber") or 0)
+            except (TypeError, ValueError):
+                batch_number = 0
+
+            if batch_number > 0:
+                return batch_number
+
+        return None
+
+    def _resolve_rotated_market_product_batch_number(
+        self,
+        total_batches: int,
+    ) -> tuple[int, dict[str, Any]]:
+        """Resolve the active batch number for one rotating market refresh."""
+
+        configured_batch_number = self._resolve_market_product_batch_number()
+        if total_batches <= 0:
+            return configured_batch_number, {
+                "enabled": False,
+                "activeBatchNumber": configured_batch_number,
+                "nextBatchNumber": configured_batch_number,
+                "totalBatches": 0,
+            }
+
+        normalized_configured_batch = ((configured_batch_number - 1) % total_batches) + 1
+        state_payload = self._load_market_product_batch_state()
+        source_states = state_payload.get("sources", {}) if isinstance(state_payload, dict) else {}
+        source_state = (
+            source_states.get(self._market_product_batch_state_key(), {})
+            if isinstance(source_states, dict)
+            else {}
+        )
+
+        active_batch_number = 0
+        if isinstance(source_state, dict):
+            try:
+                active_batch_number = int(source_state.get("nextBatch") or 0)
+            except (TypeError, ValueError):
+                active_batch_number = 0
+
+        if active_batch_number <= 0:
+            last_refresh_batch_number = self._load_last_market_refresh_batch_number()
+            if last_refresh_batch_number is not None:
+                active_batch_number = (int(last_refresh_batch_number) % total_batches) + 1
+
+        if active_batch_number <= 0:
+            active_batch_number = normalized_configured_batch
+
+        active_batch_number = ((active_batch_number - 1) % total_batches) + 1
+        next_batch_number = (active_batch_number % total_batches) + 1
+
+        return active_batch_number, {
+            "enabled": True,
+            "stateKey": self._market_product_batch_state_key(),
+            "statePath": str(self.config.market_product_batch_state_file),
+            "configuredBatchNumber": normalized_configured_batch,
+            "activeBatchNumber": active_batch_number,
+            "nextBatchNumber": next_batch_number,
+            "totalBatches": int(total_batches),
+        }
+
+    def _save_market_product_batch_state(
+        self,
+        active_batch_number: int,
+        total_batches: int,
+    ) -> dict[str, Any]:
+        """Persist the next batch that should be used for the following refresh."""
+
+        state_path = Path(self.config.market_product_batch_state_file)
+        state_payload = self._load_market_product_batch_state()
+        source_states = state_payload.get("sources", {}) if isinstance(state_payload, dict) else {}
+        if not isinstance(source_states, dict):
+            source_states = {}
+
+        next_batch_number = (int(active_batch_number) % int(total_batches)) + 1
+        source_state = {
+            "marketDataSource": str(self.config.market_data_source),
+            "quoteCurrency": self._resolve_market_quote_currency().upper(),
+            "batchSize": self._resolve_market_product_batch_size(),
+            "lastCompletedBatch": int(active_batch_number),
+            "nextBatch": int(next_batch_number),
+            "totalBatches": int(total_batches),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+
+        source_states[self._market_product_batch_state_key()] = source_state
+        persisted_payload = {
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+            "sources": source_states,
+        }
+        self.save_json(persisted_payload, state_path)
+        return source_state
 
     def _ensure_market_data_available(self) -> None:
         """
@@ -295,6 +471,18 @@ class BaseSignalApp:
             should_save_downloaded_data=True,
         )
 
+    def _build_market_data_loader_for_config(
+        self,
+        config: TrainingConfig,
+    ):
+        """Create one market loader for an explicit config snapshot."""
+
+        return create_market_data_loader(
+            config=config,
+            data_path=config.data_file,
+            should_save_downloaded_data=True,
+        )
+
     def build_coinmarketcap_context_enricher(
         self,
         should_refresh_context: bool = False,
@@ -317,6 +505,24 @@ class BaseSignalApp:
             request_pause_seconds=self.config.coinmarketcap_request_pause_seconds,
             should_refresh_context=should_refresh_context,
             log_progress=self.config.coinmarketcap_log_progress,
+        )
+
+    def build_coinmarketcap_market_intelligence_enricher(
+        self,
+        should_refresh_market_intelligence: bool = False,
+    ) -> CoinMarketCapMarketIntelligenceEnricher:
+        """Create the configured CoinMarketCap market-intelligence helper."""
+
+        return CoinMarketCapMarketIntelligenceEnricher(
+            intelligence_path=self.config.coinmarketcap_market_intelligence_file,
+            api_base_url=self.config.coinmarketcap_api_base_url,
+            api_key_env_var=self.config.coinmarketcap_api_key_env_var,
+            quote_currency=self.config.coinmarketcap_quote_currency,
+            request_pause_seconds=self.config.coinmarketcap_request_pause_seconds,
+            should_refresh_market_intelligence=should_refresh_market_intelligence,
+            log_progress=self.config.coinmarketcap_log_progress,
+            global_metrics_endpoint=self.config.coinmarketcap_global_metrics_endpoint,
+            fear_greed_latest_endpoint=self.config.coinmarketcap_fear_greed_latest_endpoint,
         )
 
     def build_coinmarketcal_event_enricher(
@@ -1463,6 +1669,531 @@ class ModelComparisonApp(TrainingApp):
 class SignalGenerationApp(BaseSignalApp):
     """Load a trained model and generate historical plus latest signals."""
 
+    primary_signal_history_path = OUTPUTS_DIR / "primarySignalHistory.json"
+
+    def _should_score_fresh_signal_universe(self) -> bool:
+        """Return whether publication should score a fresh top-market universe."""
+
+        return bool(
+            self.config.signal_refresh_market_data_before_generation
+            and self._resolve_market_fetch_all_quote_products()
+            and self.config.live_fetch_all_quote_products
+        )
+
+    def _build_unbatched_market_loader_config(self) -> TrainingConfig:
+        """Clone the runtime config with product batching disabled for live scoring."""
+
+        if is_coinmarketcap_market_data_source(self.config.market_data_source):
+            return replace(
+                self.config,
+                coinmarketcap_product_batch_size=None,
+                coinmarketcap_product_batch_number=1,
+            )
+
+        return replace(
+            self.config,
+            coinbase_product_batch_size=None,
+            coinbase_product_batch_number=1,
+        )
+
+    def _load_watchlist_pool_product_ids(self) -> list[str]:
+        """Return the persisted watchlist pool product ids that deserve extra monitoring."""
+
+        if not bool(getattr(self.config, "signal_watchlist_pool_enabled", True)):
+            return []
+
+        max_products = int(getattr(self.config, "signal_watchlist_pool_max_products", 12) or 12)
+        pool_store = WatchlistPoolStore(Path(self.config.signal_watchlist_pool_path))
+        return pool_store.get_monitored_product_ids(limit=max_products)
+
+    def _build_explicit_signal_prediction_frame(
+        self,
+        product_ids: List[str],
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Score one explicit set of products for watchlist-pool promotion checks."""
+
+        if self.model is None:
+            raise ValueError("A loaded model is required before scoring explicit signal products.")
+
+        normalized_product_ids = [
+            str(product_id).strip().upper()
+            for product_id in product_ids
+            if str(product_id).strip()
+        ]
+        if not normalized_product_ids:
+            raise ValueError("At least one explicit product id is required for signal scoring.")
+
+        loader_config = self._build_unbatched_market_loader_config()
+        explicit_loader = create_market_data_loader(
+            config=loader_config,
+            data_path=loader_config.data_file,
+            should_save_downloaded_data=False,
+            product_ids=tuple(normalized_product_ids),
+            fetch_all_quote_products=False,
+            max_products=None,
+            granularity_seconds=loader_config.live_granularity_seconds,
+            total_candles=loader_config.live_total_candles,
+            request_pause_seconds=loader_config.live_request_pause_seconds,
+            save_progress_every_products=0,
+            log_progress=False,
+        )
+        explicit_dataset_builder = CryptoDatasetBuilder(
+            config=loader_config,
+            feature_columns=self.model.feature_columns,
+            data_loader=explicit_loader,
+        )
+        explicit_feature_df = explicit_dataset_builder.build_feature_table()
+        explicit_prediction_df = self.model.predict(explicit_feature_df)
+
+        return explicit_prediction_df, {
+            "productsRequested": len(normalized_product_ids),
+            "rowsScored": int(len(explicit_prediction_df)),
+            "productsScored": (
+                int(explicit_prediction_df["product_id"].nunique())
+                if "product_id" in explicit_prediction_df.columns
+                else int(len(explicit_prediction_df))
+            ),
+        }
+
+    def _save_watchlist_pool_snapshot(self, signal_summaries: List[Dict[str, Any]]) -> None:
+        """Persist the strongest watchlist names for more aggressive live monitoring."""
+
+        if not bool(getattr(self.config, "signal_watchlist_pool_enabled", True)):
+            return
+
+        max_products = int(getattr(self.config, "signal_watchlist_pool_max_products", 12) or 12)
+        watchlist_pool_snapshot = build_watchlist_pool_snapshot(
+            signal_summaries=signal_summaries,
+            max_products=max_products,
+        )
+        self.save_json(
+            watchlist_pool_snapshot,
+            Path(self.config.signal_watchlist_pool_path),
+        )
+
+    def _build_fresh_signal_prediction_frame(self) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Score a fresh top-market universe for the published signal snapshot."""
+
+        if self.model is None:
+            raise ValueError("A loaded model is required before scoring the fresh signal universe.")
+
+        loader_config = self._build_unbatched_market_loader_config()
+        fresh_market_loader = create_market_data_loader(
+            config=loader_config,
+            data_path=loader_config.data_file,
+            should_save_downloaded_data=False,
+            fetch_all_quote_products=True,
+            max_products=loader_config.live_max_products,
+            granularity_seconds=loader_config.live_granularity_seconds,
+            total_candles=loader_config.live_total_candles,
+            request_pause_seconds=loader_config.live_request_pause_seconds,
+            save_progress_every_products=0,
+            log_progress=False,
+        )
+        fresh_dataset_builder = CryptoDatasetBuilder(
+            config=loader_config,
+            feature_columns=self.model.feature_columns,
+            data_loader=fresh_market_loader,
+        )
+        fresh_feature_df = fresh_dataset_builder.build_feature_table()
+        fresh_prediction_df = self.model.predict(fresh_feature_df)
+        loader_summary = dict(getattr(fresh_market_loader, "last_refresh_summary", {}))
+
+        signal_inference_summary = {
+            "mode": "fresh-top-market-universe",
+            "warning": "",
+            "maxProducts": (
+                int(loader_config.live_max_products)
+                if loader_config.live_max_products is not None
+                else None
+            ),
+            "productsRequested": int(loader_summary.get("productsDownloaded", 0) or 0),
+            "totalAvailableProducts": int(loader_summary.get("totalAvailableProducts", 0) or 0),
+            "rowsScored": int(len(fresh_prediction_df)),
+            "productsScored": (
+                int(fresh_prediction_df["product_id"].nunique())
+                if "product_id" in fresh_prediction_df.columns
+                else int(len(fresh_prediction_df))
+            ),
+        }
+        prediction_frames = [fresh_prediction_df]
+
+        watchlist_pool_product_ids = self._load_watchlist_pool_product_ids()
+        if watchlist_pool_product_ids:
+            explicit_prediction_df, explicit_summary = self._build_explicit_signal_prediction_frame(
+                watchlist_pool_product_ids,
+            )
+            if not explicit_prediction_df.empty:
+                prediction_frames.append(explicit_prediction_df)
+                signal_inference_summary["mode"] = "fresh-top-market-plus-watchlist-pool"
+                signal_inference_summary["watchlistPoolProductsRequested"] = explicit_summary["productsRequested"]
+                signal_inference_summary["watchlistPoolRowsScored"] = explicit_summary["rowsScored"]
+                signal_inference_summary["watchlistPoolProductsScored"] = explicit_summary["productsScored"]
+                signal_inference_summary["watchlistPoolProductIds"] = watchlist_pool_product_ids
+
+        combined_prediction_df = pd.concat(prediction_frames, ignore_index=True)
+        duplicate_subset = [
+            column_name
+            for column_name in ("product_id", "timestamp", "time_step")
+            if column_name in combined_prediction_df.columns
+        ]
+        if duplicate_subset:
+            combined_prediction_df = combined_prediction_df.drop_duplicates(
+                subset=duplicate_subset,
+                keep="last",
+            )
+
+        return combined_prediction_df, signal_inference_summary
+
+    def _build_signal_tracking_metadata(
+        self,
+        signal_summary: Dict[str, Any],
+        signal_source: str,
+    ) -> dict[str, Any]:
+        """Build one compact metadata payload for an auto-tracked signal trade."""
+
+        brain = signal_summary.get("brain", {}) if isinstance(signal_summary.get("brain"), dict) else {}
+        return {
+            "autoTrackedFromSignalGeneration": True,
+            "signalSource": signal_source,
+            "signalTimestamp": signal_summary.get("timestamp"),
+            "signalName": signal_summary.get("signal_name"),
+            "confidence": signal_summary.get("confidence"),
+            "productId": signal_summary.get("productId"),
+            "marketDataSource": signal_summary.get("marketDataSource"),
+            "brainDecision": brain.get("decision"),
+            "brainSummary": brain.get("summaryLine"),
+        }
+
+    def _sync_generated_signal_trades(
+        self,
+        latest_signals: list[Dict[str, Any]],
+        signal_source: str,
+        portfolio_store: TradingPortfolioStore | None = None,
+    ) -> dict[str, Any]:
+        """Create tracked trade records for fresh BUY signals and refresh active records."""
+
+        if not bool(getattr(self.config, "signal_track_generated_trades", False)):
+            return {
+                "enabled": False,
+                "createdCount": 0,
+                "refreshedCount": 0,
+                "skippedCount": 0,
+                "trackedTradeIds": [],
+            }
+
+        portfolio_store = portfolio_store or TradingPortfolioStore(
+            db_path=self.config.portfolio_store_path,
+            default_capital=self.config.portfolio_default_capital,
+            database_url=self.config.portfolio_store_url,
+        )
+        created_count = 0
+        refreshed_count = 0
+        skipped_count = 0
+        tracked_trade_ids: list[int] = []
+
+        for signal_summary in latest_signals:
+            product_id = str(signal_summary.get("productId", "")).strip().upper()
+            if not product_id:
+                skipped_count += 1
+                continue
+
+            signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
+            brain = signal_summary.get("brain", {}) if isinstance(signal_summary.get("brain"), dict) else {}
+            signal_metadata = self._build_signal_tracking_metadata(signal_summary, signal_source)
+            active_trade = portfolio_store.get_active_trade_for_product(product_id)
+
+            if active_trade is not None:
+                refreshed_trade = portfolio_store.refresh_trade(
+                    trade_id=int(active_trade["tradeId"]),
+                    current_price=float(signal_summary.get("close") or 0.0) or None,
+                    stop_loss_price=brain.get("stopLossPrice"),
+                    take_profit_price=brain.get("takeProfitPrice"),
+                    signal_name=signal_name or None,
+                    metadata=signal_metadata,
+                )
+                refreshed_count += 1
+                tracked_trade_ids.append(int(refreshed_trade["tradeId"]))
+                continue
+
+            if signal_name != "BUY":
+                skipped_count += 1
+                continue
+            if not bool(signal_summary.get("actionable", False)):
+                skipped_count += 1
+                continue
+
+            entry_price = float(signal_summary.get("close") or 0.0)
+            if entry_price <= 0:
+                skipped_count += 1
+                continue
+
+            tracked_trade = portfolio_store.create_trade(
+                product_id=product_id,
+                entry_price=entry_price,
+                take_profit_price=brain.get("takeProfitPrice"),
+                stop_loss_price=brain.get("stopLossPrice"),
+                quantity=0.0,
+                current_price=entry_price,
+                signal_name=signal_name,
+                status=str(getattr(self.config, "signal_generated_trade_status", "planned") or "planned"),
+                opened_at=str(signal_summary.get("timestamp") or "") or None,
+                metadata=signal_metadata,
+            )
+            created_count += 1
+            tracked_trade_ids.append(int(tracked_trade["tradeId"]))
+
+        return {
+            "enabled": True,
+            "createdCount": created_count,
+            "refreshedCount": refreshed_count,
+            "skippedCount": skipped_count,
+            "trackedTradeIds": tracked_trade_ids,
+            "storageBackend": portfolio_store.database.storage_backend,
+            "databaseTarget": portfolio_store.database.database_target,
+        }
+
+    def _load_recent_primary_product_ids(self) -> list[str]:
+        """Load the recently featured primary-signal products from disk when available."""
+
+        if not self.primary_signal_history_path.exists():
+            latest_signal_path = OUTPUTS_DIR / "latestSignal.json"
+            if not latest_signal_path.exists():
+                return []
+
+            try:
+                with latest_signal_path.open("r", encoding="utf-8") as latest_signal_file:
+                    latest_signal_payload = json.load(latest_signal_file)
+            except (OSError, json.JSONDecodeError):
+                return []
+
+            latest_product_id = str(latest_signal_payload.get("productId", "")).strip().upper()
+            return [latest_product_id] if latest_product_id else []
+
+        try:
+            with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
+                history_payload = json.load(history_file)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        history_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
+        if not isinstance(history_entries, list):
+            return []
+
+        return [
+            str(history_entry.get("productId", "")).strip().upper()
+            for history_entry in history_entries
+            if isinstance(history_entry, dict) and str(history_entry.get("productId", "")).strip()
+        ]
+
+    def _save_primary_signal_history(
+        self,
+        top_signal: Dict[str, Any],
+        signal_source: str,
+    ) -> None:
+        """Persist a small recent history of featured primary signals for rotation."""
+
+        recent_entries: list[dict[str, Any]] = []
+        if self.primary_signal_history_path.exists():
+            try:
+                with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
+                    history_payload = json.load(history_file)
+                previous_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
+                if isinstance(previous_entries, list):
+                    recent_entries = [
+                        entry
+                        for entry in previous_entries
+                        if isinstance(entry, dict)
+                    ]
+            except (OSError, json.JSONDecodeError):
+                recent_entries = []
+
+        new_entry = {
+            "productId": str(top_signal.get("productId", "")),
+            "signalName": str(top_signal.get("signal_name", "")),
+            "generatedAt": str(top_signal.get("marketDataRefreshedAt") or datetime.now(timezone.utc).isoformat()),
+            "signalSource": str(signal_source),
+            "confidence": float(top_signal.get("confidence", 0.0) or 0.0),
+            "policyScore": float(top_signal.get("policyScore", 0.0) or 0.0),
+            "setupScore": float(top_signal.get("setupScore", 0.0) or 0.0),
+        }
+        recent_entries = [new_entry] + recent_entries
+
+        deduped_entries: list[dict[str, Any]] = []
+        seen_products: set[str] = set()
+        max_history_entries = max(
+            int(getattr(self.config, "signal_primary_rotation_candidate_window", 4)) * 2,
+            int(getattr(self.config, "signal_primary_rotation_lookback", 3)),
+            6,
+        )
+        for history_entry in recent_entries:
+            product_id = str(history_entry.get("productId", "")).strip().upper()
+            if not product_id or product_id in seen_products:
+                continue
+            seen_products.add(product_id)
+            deduped_entries.append(history_entry)
+            if len(deduped_entries) >= max_history_entries:
+                break
+
+        self.save_json(
+            {
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+                "entries": deduped_entries,
+            },
+            self.primary_signal_history_path,
+        )
+
+    def _load_last_primary_signal_generated_at(self) -> datetime | None:
+        """Return when the most recent non-empty primary signal was published."""
+
+        timestamp_candidates: list[str] = []
+
+        if self.primary_signal_history_path.exists():
+            try:
+                with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
+                    history_payload = json.load(history_file)
+                history_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
+                if isinstance(history_entries, list):
+                    timestamp_candidates.extend(
+                        str(history_entry.get("generatedAt", "")).strip()
+                        for history_entry in history_entries
+                        if isinstance(history_entry, dict) and str(history_entry.get("generatedAt", "")).strip()
+                    )
+            except (OSError, json.JSONDecodeError):
+                timestamp_candidates = []
+
+        latest_signal_path = OUTPUTS_DIR / "latestSignal.json"
+        if latest_signal_path.exists():
+            try:
+                with latest_signal_path.open("r", encoding="utf-8") as latest_signal_file:
+                    latest_signal_payload = json.load(latest_signal_file)
+                if isinstance(latest_signal_payload, dict) and latest_signal_payload:
+                    for field_name in ("marketDataRefreshedAt", "generatedAt", "timestamp"):
+                        raw_value = str(latest_signal_payload.get(field_name, "")).strip()
+                        if raw_value:
+                            timestamp_candidates.append(raw_value)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        for raw_timestamp in timestamp_candidates:
+            parsed_timestamp = pd.to_datetime(raw_timestamp, utc=True, errors="coerce")
+            if pd.notna(parsed_timestamp):
+                return parsed_timestamp.to_pydatetime()
+
+        return None
+
+    def _should_publish_watchlist_fallback(self) -> bool:
+        """Return whether the public feed should emit a watchlist fallback signal."""
+
+        if not bool(getattr(self.config, "signal_watchlist_fallback_enabled", True)):
+            return False
+
+        quiet_period_hours = max(
+            float(getattr(self.config, "signal_watchlist_fallback_hours", 12.0) or 0.0),
+            0.0,
+        )
+        last_primary_signal_at = self._load_last_primary_signal_generated_at()
+        if last_primary_signal_at is None:
+            return True
+        if quiet_period_hours <= 0:
+            return True
+
+        return (datetime.now(timezone.utc) - last_primary_signal_at) >= timedelta(hours=quiet_period_hours)
+
+    def _select_watchlist_fallback_signal(
+        self,
+        signal_summaries: list[Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        """Choose one strong watchlist candidate when the public feed would otherwise be empty."""
+
+        if not self._should_publish_watchlist_fallback():
+            return None
+
+        readiness_priority = {
+            "high": 0,
+            "medium": 1,
+            "standby": 2,
+            "blocked": 3,
+        }
+        minimum_decision_score = float(
+            getattr(self.config, "signal_watchlist_min_decision_score", 0.30) or 0.30
+        )
+        minimum_confidence = float(
+            getattr(self.config, "signal_watchlist_min_confidence", 0.55) or 0.55
+        )
+        ranked_candidates: list[tuple[tuple[Any, ...], Dict[str, Any]]] = []
+
+        for signal_summary in signal_summaries:
+            brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
+            if str(brain.get("decision", "")).strip().lower() != "watchlist":
+                continue
+
+            trade_context = (
+                signal_summary.get("tradeContext")
+                if isinstance(signal_summary.get("tradeContext"), dict)
+                else {}
+            )
+            if bool(trade_context.get("hasActiveTrade", False)):
+                continue
+
+            raw_signal_name = str(signal_summary.get("modelSignalName", "")).strip().upper()
+            final_signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
+            if raw_signal_name == "TAKE_PROFIT" or final_signal_name == "LOSS":
+                continue
+
+            confidence = float(signal_summary.get("confidence", 0.0) or 0.0)
+            decision_score = float(brain.get("decisionScore", 0.0) or 0.0)
+            if confidence < minimum_confidence or decision_score < minimum_decision_score:
+                continue
+
+            trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
+            ranked_candidates.append(
+                (
+                    (
+                        0 if raw_signal_name == "BUY" else 1,
+                        readiness_priority.get(trade_readiness, 99),
+                        -decision_score,
+                        -float(signal_summary.get("policyScore", 0.0) or 0.0),
+                        -confidence,
+                        str(signal_summary.get("productId", "")),
+                    ),
+                    dict(signal_summary),
+                )
+            )
+
+        if not ranked_candidates:
+            return None
+
+        selected_signal = sorted(ranked_candidates, key=lambda item: item[0])[0][1]
+        fallback_note = (
+            "No actionable trade cleared the live gate recently, so this strongest watchlist candidate is surfaced instead."
+        )
+        existing_reason_items = [
+            str(reason_item).strip()
+            for reason_item in list(selected_signal.get("reasonItems", []))
+            if str(reason_item).strip()
+        ]
+        merged_reason_items = [fallback_note]
+        for reason_item in existing_reason_items:
+            if reason_item not in merged_reason_items:
+                merged_reason_items.append(reason_item)
+
+        fallback_signal = dict(selected_signal)
+        fallback_signal["watchlistFallback"] = True
+        fallback_signal["publicSignalType"] = "watchlist"
+        fallback_signal["actionable"] = False
+        fallback_signal["spotAction"] = "wait"
+        fallback_signal["reasonItems"] = merged_reason_items[:4]
+        fallback_signal["reasonSummary"] = merged_reason_items[0]
+        existing_chat = str(fallback_signal.get("signalChat", "")).strip()
+        fallback_signal["signalChat"] = (
+            f"{fallback_note} {existing_chat}".strip()
+            if existing_chat
+            else fallback_note
+        )
+
+        return fallback_signal
+
     def run(self) -> Dict[str, Any]:
         """
         Execute the signal generation workflow.
@@ -1477,36 +2208,246 @@ class SignalGenerationApp(BaseSignalApp):
                 )
 
             self.model = BaseSignalModel.load(self.model_path)
-
-            # The saved model config is the safest source of truth because
-            # it reflects the exact settings used during training.
-            self.config = self.model.config
+            self.config = apply_runtime_market_data_settings(
+                base_config=self.model.config,
+                runtime_config=self.config,
+            )
+            self.model.config = self.config
             self.dataset_builder = CryptoDatasetBuilder(
                 config=self.config,
                 feature_columns=self.model.feature_columns,
             )
 
-        self._ensure_market_data_available()
+        prefetched_signal_prediction_df: pd.DataFrame | None = None
+        prefetched_signal_inference_summary: dict[str, Any] | None = None
+        prefetched_signal_inference_warning = ""
+        if self._should_score_fresh_signal_universe():
+            try:
+                (
+                    prefetched_signal_prediction_df,
+                    prefetched_signal_inference_summary,
+                ) = self._build_fresh_signal_prediction_frame()
+            except Exception as error:
+                prefetched_signal_inference_warning = str(error)
+
+        market_data_refresh = None
+        market_data_refreshed_at = None
+        if self.config.signal_refresh_market_data_before_generation:
+            market_data_refreshed_at = datetime.now(timezone.utc).isoformat()
+            market_data_refresh = MarketDataRefreshApp(config=self.config).run()
+            self.save_json(
+                {
+                    "generatedAt": market_data_refreshed_at,
+                    "mode": "fresh-market-refresh",
+                    "refresh": market_data_refresh,
+                },
+                OUTPUTS_DIR / "signalMarketDataRefresh.json",
+            )
+        else:
+            self._ensure_market_data_available()
+
         feature_df = self.dataset_builder.build_feature_table()
         prediction_df = self.model.predict(feature_df)
         latest_signals = build_latest_signal_summaries(
             prediction_df,
             minimum_action_confidence=self.config.backtest_min_confidence,
+            config=self.config,
         )
+        signal_prediction_df = prediction_df
+        signal_inference_summary = {
+            "mode": "historical-market-data",
+            "warning": "",
+            "maxProducts": None,
+            "productsRequested": (
+                int(prediction_df["product_id"].nunique())
+                if "product_id" in prediction_df.columns
+                else int(len(prediction_df))
+            ),
+            "totalAvailableProducts": None,
+            "rowsScored": int(len(prediction_df)),
+            "productsScored": (
+                int(prediction_df["product_id"].nunique())
+                if "product_id" in prediction_df.columns
+                else int(len(prediction_df))
+            ),
+        }
+        if prefetched_signal_prediction_df is not None and prefetched_signal_inference_summary is not None:
+            fresh_latest_signals = build_latest_signal_summaries(
+                prefetched_signal_prediction_df,
+                minimum_action_confidence=self.config.backtest_min_confidence,
+                config=self.config,
+            )
+            if fresh_latest_signals:
+                signal_prediction_df = prefetched_signal_prediction_df
+                latest_signals = fresh_latest_signals
+                signal_inference_summary = prefetched_signal_inference_summary
+            else:
+                signal_inference_summary["mode"] = "historical-market-data-fallback"
+                signal_inference_summary["warning"] = (
+                    "Fresh top-market signal scoring produced no eligible signal rows, "
+                    "so publication fell back to the persisted market dataset."
+                )
+        elif prefetched_signal_inference_warning:
+            signal_inference_summary["mode"] = "historical-market-data-fallback"
+            signal_inference_summary["warning"] = prefetched_signal_inference_warning
+        if not latest_signals:
+            raise ValueError(
+                "No signal summaries remained after applying the configured signal-universe exclusions."
+            )
+        portfolio_store = TradingPortfolioStore(
+            db_path=self.config.portfolio_store_path,
+            default_capital=self.config.portfolio_default_capital,
+            database_url=self.config.portfolio_store_url,
+        )
+        portfolio = portfolio_store.get_portfolio()
+        positions_by_product = {
+            str(position.get("productId", "")).strip().upper(): position
+            for position in list(portfolio.get("positions", []))
+            if str(position.get("productId", "")).strip()
+        }
+        active_signal_context_by_product: dict[str, dict[str, Any]] = {}
+        for signal_summary in latest_signals:
+            product_id = str(signal_summary.get("productId", "")).strip().upper()
+            if not product_id:
+                continue
+            active_trade = portfolio_store.get_active_trade_for_product(product_id)
+            position = positions_by_product.get(product_id)
+            if active_trade is None and position is None:
+                continue
+            active_signal_context_by_product[product_id] = {
+                "entryPrice": (
+                    position.get("entryPrice")
+                    if position is not None and position.get("entryPrice") is not None
+                    else (active_trade.get("entryPrice") if active_trade is not None else None)
+                ),
+                "currentPrice": (
+                    position.get("currentPrice")
+                    if position is not None and position.get("currentPrice") is not None
+                    else (active_trade.get("currentPrice") if active_trade is not None else None)
+                ),
+                "stopLossPrice": active_trade.get("stopLossPrice") if active_trade is not None else None,
+                "takeProfitPrice": active_trade.get("takeProfitPrice") if active_trade is not None else None,
+                "positionFraction": position.get("positionFraction") if position is not None else None,
+                "quantity": position.get("quantity") if position is not None else None,
+                "openedAt": (
+                    position.get("openedAt")
+                    if position is not None and position.get("openedAt") is not None
+                    else (active_trade.get("openedAt") if active_trade is not None else None)
+                ),
+                "status": active_trade.get("status") if active_trade is not None else None,
+            }
+        latest_signals = apply_signal_trade_context(
+            latest_signals,
+            active_trade_product_ids=portfolio_store.get_active_signal_product_ids(),
+            active_signal_context_by_product=active_signal_context_by_product,
+            config=self.config,
+        )
+        trader_brain_plan = TraderBrain(config=self.config).build_plan(
+            signal_summaries=latest_signals,
+            positions=list(portfolio.get("positions", [])),
+            capital=float(portfolio["capital"]),
+            trade_memory_by_product=portfolio_store.build_trade_learning_map(latest_signals),
+        )
+        latest_signals = trader_brain_plan["signals"]
+        self._save_watchlist_pool_snapshot(latest_signals)
+        trader_brain_snapshot = {
+            key: value
+            for key, value in trader_brain_plan.items()
+            if key != "signals"
+        }
+        latest_signals = filter_published_signal_summaries(latest_signals)
+        if not latest_signals:
+            watchlist_fallback_signal = self._select_watchlist_fallback_signal(
+                trader_brain_plan["signals"],
+            )
+            if watchlist_fallback_signal is not None:
+                latest_signals = [watchlist_fallback_signal]
         actionable_signals = build_actionable_signal_summaries(latest_signals)
-        top_signal = select_primary_signal(latest_signals)
+        prediction_timestamps = signal_prediction_df["timestamp"] if "timestamp" in signal_prediction_df.columns else None
+        data_first_timestamp = (
+            str(prediction_timestamps.min())
+            if prediction_timestamps is not None and len(prediction_timestamps) > 0
+            else None
+        )
+        data_last_timestamp = (
+            str(prediction_timestamps.max())
+            if prediction_timestamps is not None and len(prediction_timestamps) > 0
+            else None
+        )
+        signal_source = "live-market-refresh" if market_data_refresh is not None else "cached-market-data"
+        signal_metadata = {
+            "signalSource": signal_source,
+            "marketDataSource": str(self.config.market_data_source),
+            "marketDataPath": str(self.config.data_file),
+            "marketDataFirstTimestamp": (
+                market_data_refresh.get("firstTimestamp")
+                if market_data_refresh is not None
+                else data_first_timestamp
+            ),
+            "marketDataLastTimestamp": (
+                market_data_refresh.get("lastTimestamp")
+                if market_data_refresh is not None
+                else data_last_timestamp
+            ),
+            "marketDataRefreshedAt": market_data_refreshed_at,
+        }
+        latest_signals = [
+            {
+                **signal_summary,
+                **signal_metadata,
+            }
+            for signal_summary in latest_signals
+        ]
+        actionable_signals = [
+            {
+                **signal_summary,
+                **signal_metadata,
+            }
+            for signal_summary in actionable_signals
+        ]
+        recent_primary_product_ids = self._load_recent_primary_product_ids()
+        top_signal = None
+        if latest_signals:
+            top_signal = {
+                **select_primary_signal(
+                    latest_signals,
+                    config=self.config,
+                    recent_primary_product_ids=recent_primary_product_ids,
+                ),
+                **signal_metadata,
+            }
         frontend_signal_snapshot = build_frontend_signal_snapshot(
             model_type=self.model.model_type,
             primary_signal=top_signal,
             latest_signals=latest_signals,
             actionable_signals=actionable_signals,
+            trader_brain=trader_brain_snapshot,
+        )
+        frontend_signal_snapshot.update(
+            {
+                "mode": signal_source,
+                "marketDataSource": str(self.config.market_data_source),
+                "marketDataPath": str(self.config.data_file),
+                "marketDataRefresh": market_data_refresh or {},
+                "marketDataRefreshedAt": market_data_refreshed_at,
+                "marketDataLastTimestamp": signal_metadata["marketDataLastTimestamp"],
+                "marketDataFirstTimestamp": signal_metadata["marketDataFirstTimestamp"],
+                "signalInference": signal_inference_summary,
+            }
         )
 
         self.save_dataframe(prediction_df, OUTPUTS_DIR / "historicalSignals.csv")
-        self.save_json(top_signal, OUTPUTS_DIR / "latestSignal.json")
+        self.save_json(top_signal or {}, OUTPUTS_DIR / "latestSignal.json")
         self.save_json({"signals": latest_signals}, OUTPUTS_DIR / "latestSignals.json")
         self.save_json({"signals": actionable_signals}, OUTPUTS_DIR / "actionableSignals.json")
         self.save_json(frontend_signal_snapshot, OUTPUTS_DIR / "frontendSignalSnapshot.json")
+        if top_signal is not None:
+            self._save_primary_signal_history(top_signal=top_signal, signal_source=signal_source)
+        tracked_trade_sync = self._sync_generated_signal_trades(
+            latest_signals=latest_signals,
+            signal_source=signal_source,
+            portfolio_store=portfolio_store,
+        )
 
         return {
             "modelType": self.model.model_type,
@@ -1517,9 +2458,14 @@ class SignalGenerationApp(BaseSignalApp):
             "frontendSignalSnapshotPath": str(OUTPUTS_DIR / "frontendSignalSnapshot.json"),
             "signalsGenerated": len(latest_signals),
             "actionableSignalsGenerated": len(actionable_signals),
-            "signalName": top_signal["signal_name"],
-            "confidence": top_signal["confidence"],
-            "signalChat": top_signal["signalChat"],
+            "signalName": top_signal.get("signal_name") if top_signal is not None else None,
+            "confidence": top_signal.get("confidence") if top_signal is not None else None,
+            "signalChat": top_signal.get("signalChat") if top_signal is not None else None,
+            "signalSource": signal_source,
+            "marketDataRefresh": market_data_refresh,
+            "marketDataRefreshedAt": market_data_refreshed_at,
+            "signalInference": signal_inference_summary,
+            "trackedTradeSync": tracked_trade_sync,
         }
 
 
@@ -1531,7 +2477,12 @@ class ProductionCycleApp(BaseSignalApp):
 
         market_refresh_result = MarketDataRefreshApp(config=self.config).run()
         training_result = TrainingApp(config=self.config).run()
-        signal_generation_result = SignalGenerationApp(config=self.config).run()
+        signal_generation_result = SignalGenerationApp(
+            config=replace(
+                self.config,
+                signal_refresh_market_data_before_generation=False,
+            )
+        ).run()
 
         return {
             "marketRefresh": market_refresh_result,
@@ -1605,11 +2556,45 @@ class MarketDataRefreshApp(BaseSignalApp):
         Refresh the raw market-data file from the configured live source.
         """
 
-        data_loader = self.build_market_data_loader()
+        effective_config = self.config
+        batch_rotation_summary = {
+            "enabled": False,
+            "activeBatchNumber": self._resolve_market_product_batch_number(),
+            "nextBatchNumber": self._resolve_market_product_batch_number(),
+            "totalBatches": 1,
+            "statePath": str(self.config.market_product_batch_state_file),
+        }
+        preview_loader = self.build_market_data_loader()
+        data_loader = preview_loader
+
+        should_rotate_batches = bool(
+            self.config.market_product_batch_rotation_enabled
+            and self._resolve_market_fetch_all_quote_products()
+            and self._resolve_market_product_batch_size() is not None
+            and hasattr(preview_loader, "get_total_batches")
+        )
+        if should_rotate_batches:
+            total_batches = int(preview_loader.get_total_batches())
+            active_batch_number, batch_rotation_summary = self._resolve_rotated_market_product_batch_number(
+                total_batches=total_batches,
+            )
+            if active_batch_number != self._resolve_market_product_batch_number():
+                effective_config = self._with_market_product_batch_number(active_batch_number)
+                data_loader = self._build_market_data_loader_for_config(effective_config)
+
         price_df = data_loader.refresh_data()
+        persisted_batch_state: Dict[str, Any] = {}
+        if batch_rotation_summary.get("enabled"):
+            persisted_batch_state = self._save_market_product_batch_state(
+                active_batch_number=int(batch_rotation_summary["activeBatchNumber"]),
+                total_batches=int(batch_rotation_summary["totalBatches"]),
+            )
         coinmarketcap_context_status = "disabled"
         coinmarketcap_context_rows = 0
         coinmarketcap_context_error = ""
+        coinmarketcap_market_intelligence_status = "disabled"
+        coinmarketcap_market_intelligence_error = ""
+        coinmarketcap_market_intelligence_summary: Dict[str, Any] = {}
         coinmarketcal_events_status = "disabled"
         coinmarketcal_events_rows = 0
         coinmarketcal_events_error = ""
@@ -1622,7 +2607,12 @@ class MarketDataRefreshApp(BaseSignalApp):
             if self.config.coinmarketcap_refresh_context_after_market_refresh:
                 try:
                     context_df = context_enricher.refresh_context(price_df)
-                    coinmarketcap_context_status = "refreshed"
+                    context_summary = dict(getattr(context_enricher, "last_context_summary", {}))
+                    if context_summary.get("usedCachedSnapshot"):
+                        coinmarketcap_context_status = "rate_limited_cached_only"
+                        coinmarketcap_context_error = str(context_summary.get("warning", ""))
+                    else:
+                        coinmarketcap_context_status = "refreshed"
                     coinmarketcap_context_rows = len(context_df)
                 except Exception as error:
                     error_message = str(error)
@@ -1633,6 +2623,40 @@ class MarketDataRefreshApp(BaseSignalApp):
                         coinmarketcap_context_error = error_message
             else:
                 coinmarketcap_context_status = "enabled_cached_only"
+
+        if self.config.coinmarketcap_use_market_intelligence:
+            market_intelligence_enricher = self.build_coinmarketcap_market_intelligence_enricher(
+                should_refresh_market_intelligence=(
+                    self.config.coinmarketcap_refresh_market_intelligence_after_market_refresh
+                ),
+            )
+
+            if self.config.coinmarketcap_refresh_market_intelligence_after_market_refresh:
+                try:
+                    market_intelligence_enricher.refresh_market_intelligence()
+                    coinmarketcap_market_intelligence_summary = dict(
+                        getattr(
+                            market_intelligence_enricher,
+                            "last_market_intelligence_summary",
+                            {},
+                        )
+                    )
+                    if coinmarketcap_market_intelligence_summary.get("usedCachedSnapshot"):
+                        coinmarketcap_market_intelligence_status = "rate_limited_cached_only"
+                        coinmarketcap_market_intelligence_error = str(
+                            coinmarketcap_market_intelligence_summary.get("warning", "")
+                        )
+                    else:
+                        coinmarketcap_market_intelligence_status = "refreshed"
+                except Exception as error:
+                    error_message = str(error)
+                    if "requires an API key" in error_message:
+                        coinmarketcap_market_intelligence_status = "skipped_missing_api_key"
+                    else:
+                        coinmarketcap_market_intelligence_status = "refresh_failed"
+                        coinmarketcap_market_intelligence_error = error_message
+            else:
+                coinmarketcap_market_intelligence_status = "enabled_cached_only"
 
         if self.config.coinmarketcal_use_events:
             event_enricher = self.build_coinmarketcal_event_enricher(
@@ -1661,6 +2685,12 @@ class MarketDataRefreshApp(BaseSignalApp):
                 if self._resolve_market_fetch_all_quote_products()
                 else "explicit-product-list"
             ),
+            "batchRotationEnabled": bool(batch_rotation_summary.get("enabled")),
+            "batchNumber": int(batch_rotation_summary.get("activeBatchNumber", self._resolve_market_product_batch_number())),
+            "nextBatchNumber": int(batch_rotation_summary.get("nextBatchNumber", self._resolve_market_product_batch_number())),
+            "totalBatches": int(batch_rotation_summary.get("totalBatches", 1)),
+            "batchRotationStatePath": str(batch_rotation_summary.get("statePath", self.config.market_product_batch_state_file)),
+            "batchRotationState": persisted_batch_state,
             "granularitySeconds": self._resolve_market_granularity_seconds(),
             "savedPath": str(self.config.data_file),
             "rowsDownloaded": len(price_df),
@@ -1672,6 +2702,10 @@ class MarketDataRefreshApp(BaseSignalApp):
             "coinMarketCapContextRows": coinmarketcap_context_rows,
             "coinMarketCapContextError": coinmarketcap_context_error,
             "coinMarketCapContextPath": str(self.config.coinmarketcap_context_file),
+            "coinMarketCapMarketIntelligenceStatus": coinmarketcap_market_intelligence_status,
+            "coinMarketCapMarketIntelligenceError": coinmarketcap_market_intelligence_error,
+            "coinMarketCapMarketIntelligencePath": str(self.config.coinmarketcap_market_intelligence_file),
+            "coinMarketCapMarketIntelligenceSummary": coinmarketcap_market_intelligence_summary,
             "coinMarketCalEventsStatus": coinmarketcal_events_status,
             "coinMarketCalEventsRows": coinmarketcal_events_rows,
             "coinMarketCalEventsError": coinmarketcal_events_error,
@@ -1740,7 +2774,10 @@ class MarketUniverseRefreshApp(BaseSignalApp):
         batch_results = []
         failed_batches = []
         for batch_number in range(start_batch, total_batches + 1):
-            batch_config = self._with_market_product_batch_number(batch_number)
+            batch_config = replace(
+                self._with_market_product_batch_number(batch_number),
+                market_product_batch_rotation_enabled=False,
+            )
             batch_app = MarketDataRefreshApp(config=batch_config)
             try:
                 batch_result = batch_app.run()

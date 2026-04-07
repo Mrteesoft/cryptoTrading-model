@@ -23,6 +23,7 @@ from crypto_signal_ml.api import create_signal_api  # noqa: E402
 from crypto_signal_ml.engine_api import create_app  # noqa: E402
 from crypto_signal_ml.frontend import build_frontend_signal_snapshot  # noqa: E402
 from crypto_signal_ml.modeling import RandomForestSignalModel  # noqa: E402
+from crypto_signal_ml.portfolio import TradingPortfolioStore  # noqa: E402
 from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
 
 
@@ -281,6 +282,28 @@ def test_engine_api_reports_missing_snapshot_cleanly(tmp_path: Path) -> None:
     assert signals_response.status_code == 404
 
 
+def test_engine_api_can_require_backend_internal_api_key(tmp_path: Path) -> None:
+    """Protected engine routes should reject direct callers without the backend key."""
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            require_internal_api_key=True,
+            internal_api_key="test-backend-key",
+        )
+    )
+
+    unauthorized_response = client.get("/api/health")
+    authorized_response = client.get(
+        "/api/health",
+        headers={"x-ai-engine-key": "test-backend-key"},
+    )
+
+    assert unauthorized_response.status_code == 403
+    assert authorized_response.status_code == 200
+
+
 def test_model_summary_exposes_lifecycle_metadata_when_sidecar_exists(tmp_path: Path) -> None:
     """The model API should surface training metadata for production readiness checks."""
 
@@ -435,6 +458,381 @@ def test_engine_api_exposes_live_signal_endpoints(tmp_path: Path) -> None:
     assert detail_response.status_code == 200
     assert detail_response.json()["productId"] == "BTC-USD"
     assert detail_response.json()["signal_name"] == "BUY"
+
+
+def test_engine_api_supports_trader_portfolio_and_plan_endpoints(tmp_path: Path) -> None:
+    """The engine should persist portfolio state and build a portfolio-aware trader plan."""
+
+    live_snapshot = build_frontend_signal_snapshot(
+        model_type="randomForestSignalModel",
+        primary_signal={
+            "productId": "BTC-USD",
+            "signal_name": "TAKE_PROFIT",
+            "spotAction": "take_profit",
+            "confidence": 0.82,
+            "setupScore": 4.1,
+            "signalChat": "BTC-USD is a TAKE_PROFIT setup on the latest live candle.",
+            "close": 65250.0,
+            "marketState": {
+                "label": "trend_down_high_volatility",
+                "code": 5,
+                "trendScore": -0.03,
+                "volatilityRatio": 1.35,
+                "isTrending": True,
+                "isHighVolatility": True,
+            },
+            "eventContext": {
+                "hasEventNext7d": False,
+            },
+        },
+        latest_signals=[
+            {
+                "productId": "BTC-USD",
+                "signal_name": "TAKE_PROFIT",
+                "spotAction": "take_profit",
+                "confidence": 0.82,
+                "setupScore": 4.1,
+                "signalChat": "BTC-USD is a TAKE_PROFIT setup on the latest live candle.",
+                "close": 65250.0,
+                "marketState": {
+                    "label": "trend_down_high_volatility",
+                    "code": 5,
+                    "trendScore": -0.03,
+                    "volatilityRatio": 1.35,
+                    "isTrending": True,
+                    "isHighVolatility": True,
+                },
+                "eventContext": {
+                    "hasEventNext7d": False,
+                },
+            },
+            {
+                "productId": "ETH-USD",
+                "signal_name": "BUY",
+                "spotAction": "buy",
+                "confidence": 0.81,
+                "setupScore": 4.0,
+                "signalChat": "ETH-USD is a BUY setup on the latest live candle.",
+                "close": 3320.0,
+                "marketState": {
+                    "label": "trend_up",
+                    "code": 2,
+                    "trendScore": 0.02,
+                    "volatilityRatio": 1.02,
+                    "isTrending": True,
+                    "isHighVolatility": False,
+                },
+                "eventContext": {
+                    "hasEventNext7d": False,
+                },
+            },
+        ],
+        actionable_signals=[
+            {
+                "productId": "BTC-USD",
+                "signal_name": "TAKE_PROFIT",
+                "spotAction": "take_profit",
+                "confidence": 0.82,
+                "setupScore": 4.1,
+                "signalChat": "BTC-USD is a TAKE_PROFIT setup on the latest live candle.",
+                "close": 65250.0,
+                "marketState": {
+                    "label": "trend_down_high_volatility",
+                    "code": 5,
+                    "trendScore": -0.03,
+                    "volatilityRatio": 1.35,
+                    "isTrending": True,
+                    "isHighVolatility": True,
+                },
+                "eventContext": {
+                    "hasEventNext7d": False,
+                },
+            },
+            {
+                "productId": "ETH-USD",
+                "signal_name": "BUY",
+                "spotAction": "buy",
+                "confidence": 0.81,
+                "setupScore": 4.0,
+                "signalChat": "ETH-USD is a BUY setup on the latest live candle.",
+                "close": 3320.0,
+                "marketState": {
+                    "label": "trend_up",
+                    "code": 2,
+                    "trendScore": 0.02,
+                    "volatilityRatio": 1.02,
+                    "isTrending": True,
+                    "isHighVolatility": False,
+                },
+                "eventContext": {
+                    "hasEventNext7d": False,
+                },
+            },
+        ],
+    )
+    live_snapshot.update(
+        {
+            "mode": "live",
+            "marketDataSource": "coinbaseExchangeRest",
+            "requestMode": "configured-watchlist",
+            "requestedProducts": ["BTC-USD", "ETH-USD"],
+            "productsCovered": 2,
+            "featureRowsScored": 40,
+            "granularitySeconds": 3600,
+            "liveSignalCacheSeconds": 60,
+            "modelPath": "models/randomForestSignalModel.pkl",
+        }
+    )
+
+    class FakeLiveSignalEngine:
+        def get_status(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "modelPath": "models/randomForestSignalModel.pkl",
+                "cacheAgeSeconds": 0,
+                "cacheTtlSeconds": 60,
+                "lastGeneratedAt": live_snapshot["generatedAt"],
+            }
+
+        def get_live_snapshot(self, force_refresh: bool = False, product_id: str | None = None) -> dict[str, object]:
+            del force_refresh
+            del product_id
+            return live_snapshot
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=5000.0,
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            live_signal_engine=FakeLiveSignalEngine(),
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    capital_response = client.post("/api/trader/capital", json={"capital": 12000.0})
+    position_response = client.post(
+        "/api/trader/positions",
+        json={
+            "productId": "BTC-USD",
+            "quantity": 0.15,
+            "entryPrice": 60000.0,
+            "currentPrice": 65250.0,
+            "positionFraction": 0.10,
+        },
+    )
+    portfolio_response = client.get("/api/trader/portfolio")
+    plan_response = client.get("/api/trader/plan?force_refresh=true")
+    delete_response = client.delete("/api/trader/positions/BTC-USD")
+
+    assert capital_response.status_code == 200
+    assert capital_response.json()["capital"] == 12000.0
+    assert position_response.status_code == 200
+    assert position_response.json()["position"]["productId"] == "BTC-USD"
+    assert portfolio_response.status_code == 200
+    assert portfolio_response.json()["positionCount"] == 1
+    assert portfolio_response.json()["storageBackend"] == "sqlite"
+    assert plan_response.status_code == 200
+    assert plan_response.json()["portfolio"]["positionCount"] == 1
+    assert plan_response.json()["traderPlan"]["plan"]["exitCount"] == 1
+    assert plan_response.json()["traderPlan"]["signals"][0]["brain"]["decision"] == "exit_position"
+    assert delete_response.status_code == 200
+    assert delete_response.json()["portfolio"]["positionCount"] == 0
+
+
+def test_engine_api_records_executions_and_serves_trader_journal(tmp_path: Path) -> None:
+    """Executed fills should update portfolio state, realized PnL, and the journal feed."""
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=10000.0,
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    capital_response = client.post("/api/trader/capital", json={"capital": 10000.0})
+    buy_response = client.post(
+        "/api/trader/executions",
+        json={
+            "productId": "BTC-USD",
+            "side": "buy",
+            "quantity": 0.10,
+            "price": 50000.0,
+            "fee": 10.0,
+            "currentPrice": 51000.0,
+            "metadata": {"source": "test-buy"},
+        },
+    )
+    sell_response = client.post(
+        "/api/trader/executions",
+        json={
+            "productId": "BTC-USD",
+            "side": "sell",
+            "quantity": 0.05,
+            "price": 52000.0,
+            "fee": 5.0,
+            "currentPrice": 52000.0,
+            "metadata": {"source": "test-sell"},
+        },
+    )
+    journal_response = client.get("/api/trader/journal?limit=10")
+    portfolio_response = client.get("/api/trader/portfolio")
+
+    assert capital_response.status_code == 200
+    assert buy_response.status_code == 200
+    assert buy_response.json()["position"]["quantity"] == 0.10
+    assert sell_response.status_code == 200
+    assert sell_response.json()["execution"]["side"] == "sell"
+    assert sell_response.json()["execution"]["realizedPnl"] == 90.0
+    assert sell_response.json()["position"]["quantity"] == 0.05
+    assert journal_response.status_code == 200
+    assert journal_response.json()["count"] == 2
+    assert journal_response.json()["executions"][0]["side"] == "sell"
+    assert journal_response.json()["executions"][1]["side"] == "buy"
+    assert portfolio_response.status_code == 200
+    assert portfolio_response.json()["positionCount"] == 1
+    assert portfolio_response.json()["performance"]["executionCount"] == 2
+    assert portfolio_response.json()["performance"]["sellCount"] == 1
+    assert portfolio_response.json()["performance"]["winningSellCount"] == 1
+    assert portfolio_response.json()["performance"]["realizedPnl"] == 90.0
+
+
+def test_engine_api_tracks_trade_records_and_closed_outcomes(tmp_path: Path) -> None:
+    """Tracked trades should preserve entry/target prices and record losing outcomes cleanly."""
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=10000.0,
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    create_response = client.post(
+        "/api/trader/trades",
+        json={
+            "productId": "SOL-USD",
+            "entryPrice": 100.0,
+            "takeProfitPrice": 112.0,
+            "stopLossPrice": 95.0,
+            "quantity": 2.0,
+            "status": "open",
+            "signalName": "BUY",
+            "metadata": {"source": "manual-test"},
+        },
+    )
+    trade_id = create_response.json()["trade"]["tradeId"]
+    close_response = client.post(
+        f"/api/trader/trades/{trade_id}/close",
+        json={
+            "exitPrice": 92.0,
+            "closeReason": "stop_loss_hit",
+        },
+    )
+    list_response = client.get("/api/trader/trades?limit=10")
+    detail_response = client.get(f"/api/trader/trades/{trade_id}")
+    portfolio_response = client.get("/api/trader/portfolio")
+
+    assert create_response.status_code == 200
+    assert create_response.json()["trade"]["entryPrice"] == 100.0
+    assert create_response.json()["trade"]["takeProfitPrice"] == 112.0
+    assert create_response.json()["trade"]["stopLossPrice"] == 95.0
+    assert close_response.status_code == 200
+    assert close_response.json()["trade"]["status"] == "closed"
+    assert close_response.json()["trade"]["outcome"] == "loss"
+    assert close_response.json()["trade"]["realizedPnl"] == -16.0
+    assert round(close_response.json()["trade"]["realizedReturn"], 4) == -0.08
+    assert list_response.status_code == 200
+    assert list_response.json()["count"] == 1
+    assert detail_response.status_code == 200
+    assert detail_response.json()["closeReason"] == "stop_loss_hit"
+    assert portfolio_response.status_code == 200
+    assert portfolio_response.json()["trackedTrades"]["tradeCount"] == 1
+    assert portfolio_response.json()["trackedTrades"]["closedTradeCount"] == 1
+    assert portfolio_response.json()["trackedTrades"]["losingTradeCount"] == 1
+    assert portfolio_response.json()["trackedTrades"]["closedRealizedPnl"] == -16.0
+
+
+def test_engine_api_can_track_trade_directly_from_cached_signal(tmp_path: Path) -> None:
+    """The engine should be able to promote a signal into a tracked trade record."""
+
+    snapshot_path = tmp_path / "outputs" / "frontendSignalSnapshot.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    signal_row = {
+        "productId": "ADA-USD",
+        "signal_name": "BUY",
+        "spotAction": "buy",
+        "confidence": 0.78,
+        "setupScore": 4.4,
+        "signalChat": "ADA-USD is a BUY setup.",
+        "symbol": "ADA",
+        "close": 0.50,
+        "timestamp": "2026-04-05T10:00:00+00:00",
+        "brain": {
+            "decision": "enter_long",
+            "summaryLine": "Trend and confidence support a new entry.",
+            "stopLossPrice": 0.47,
+            "takeProfitPrice": 0.56,
+        },
+        "marketState": {
+            "label": "trend_up",
+            "code": 2,
+            "trendScore": 0.03,
+            "volatilityRatio": 1.10,
+            "isTrending": True,
+            "isHighVolatility": False,
+        },
+    }
+    snapshot_payload = build_frontend_signal_snapshot(
+        model_type="randomForestSignalModel",
+        primary_signal=signal_row,
+        latest_signals=[signal_row],
+        actionable_signals=[signal_row],
+    )
+    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
+
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=10000.0,
+    )
+    client = TestClient(
+        create_app(
+            snapshot_path=snapshot_path,
+            model_dir=tmp_path / "models",
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    track_response = client.post(
+        "/api/trader/trades/from-signal/ADA-USD",
+        json={
+            "quantity": 1000.0,
+            "status": "planned",
+        },
+    )
+
+    assert track_response.status_code == 200
+    assert track_response.json()["trade"]["productId"] == "ADA-USD"
+    assert track_response.json()["trade"]["entryPrice"] == 0.50
+    assert track_response.json()["trade"]["takeProfitPrice"] == 0.56
+    assert track_response.json()["trade"]["stopLossPrice"] == 0.47
+    assert track_response.json()["trade"]["status"] == "planned"
+    assert track_response.json()["trade"]["metadata"]["trackedFromSignal"] is True
+    assert track_response.json()["trade"]["metadata"]["brainDecision"] == "enter_long"
 
 
 def test_engine_api_exposes_tradingview_chart_and_event_endpoints(tmp_path: Path) -> None:
@@ -712,6 +1110,7 @@ def test_engine_api_exposes_rag_ingest_and_search_endpoints(tmp_path: Path) -> N
     assert ingest_response.status_code == 200
     assert ingest_response.json()["source"]["title"] == "Ethereum staking memo"
     assert status_response.status_code == 200
+    assert status_response.json()["storageBackend"] == "sqlite"
     assert status_response.json()["sourceCount"] == 1
     assert sources_response.status_code == 200
     assert sources_response.json()["count"] == 1

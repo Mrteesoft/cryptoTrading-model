@@ -16,9 +16,89 @@ import pandas as pd
 import numpy as np
 
 from .config import TrainingConfig
+from .trading.symbols import is_signal_eligible_base_currency, normalize_base_currency
 
 
 REQUIRED_PRICE_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+
+class CoinMarketCapApiError(ValueError):
+    """Base error for CoinMarketCap request failures."""
+
+
+class CoinMarketCapRateLimitError(CoinMarketCapApiError):
+    """Raised when CoinMarketCap rejects a request with HTTP 429."""
+
+
+def _is_coinmarketcap_rate_limit_error(error: Exception) -> bool:
+    """Return whether the error represents a CoinMarketCap rate-limit response."""
+
+    return isinstance(error, CoinMarketCapRateLimitError)
+
+
+def _request_coinmarketcap_json(
+    api_base_url: str,
+    endpoint_path: str,
+    query_params: Dict[str, object],
+    api_key: str,
+    request_pause_seconds: float,
+) -> Dict[str, object]:
+    """Send one CoinMarketCap request and decode the JSON payload."""
+
+    request_url = api_base_url.rstrip("/") + endpoint_path
+    if query_params:
+        request_url += "?" + urlencode(query_params, doseq=True)
+
+    request = Request(
+        request_url,
+        headers={
+            "Accept": "application/json",
+            "Accepts": "application/json",
+            "X-CMC_PRO_API_KEY": api_key,
+            "User-Agent": "crypto-signal-ml/0.1",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        error_body = ""
+        try:
+            error_body = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = ""
+
+        query_summary = urlencode(query_params, doseq=True)[:200]
+        body_summary = error_body.strip().replace("\n", " ")[:300]
+        message = (
+            "CoinMarketCap request failed "
+            f"with status {error.code} for {endpoint_path}. "
+            f"Query: {query_summary or '<none>'}."
+        )
+        if body_summary:
+            message += f" Response: {body_summary}"
+
+        if error.code == 429:
+            raise CoinMarketCapRateLimitError(message) from error
+
+        raise CoinMarketCapApiError(message) from error
+    except URLError as error:
+        raise CoinMarketCapApiError(
+            "CoinMarketCap request failed "
+            f"for {endpoint_path}. Reason: {error.reason}"
+        ) from error
+
+    if request_pause_seconds > 0:
+        time.sleep(request_pause_seconds)
+
+    if not isinstance(response_payload, dict):
+        raise CoinMarketCapApiError(
+            "Unexpected response received from CoinMarketCap. "
+            f"Response type: {type(response_payload)}"
+        )
+
+    return response_payload
 
 
 class BasePriceDataLoader(ABC):
@@ -372,11 +452,37 @@ class CoinMarketCapContextEnricher(BasePriceDataEnricher):
         if symbol_frame.empty:
             return pd.DataFrame()
 
-        map_lookup = self._fetch_symbol_map_lookup(symbol_frame["base_currency"].tolist())
-        context_df = self._build_context_frame(
-            symbol_frame=symbol_frame,
-            map_lookup=map_lookup,
-        )
+        try:
+            map_lookup = self._fetch_symbol_map_lookup(symbol_frame["base_currency"].tolist())
+            context_df = self._build_context_frame(
+                symbol_frame=symbol_frame,
+                map_lookup=map_lookup,
+            )
+        except CoinMarketCapRateLimitError as error:
+            if not self.context_path.exists():
+                raise
+
+            cached_context_df = pd.read_csv(self.context_path)
+            cached_rows = len(cached_context_df)
+            self.last_context_summary = {
+                "contextPath": str(self.context_path),
+                "coinsRequested": int(len(symbol_frame)),
+                "coinsMatched": int(
+                    cached_context_df.get("cmc_context_available", pd.Series(dtype=float)).fillna(0).sum()
+                )
+                if not cached_context_df.empty
+                else 0,
+                "rowsSaved": 0,
+                "existingRowsMerged": cached_rows,
+                "finalRowsSaved": cached_rows,
+                "usedCachedSnapshot": True,
+                "warning": str(error),
+            }
+            self._log_progress(
+                "CoinMarketCap context refresh hit the rate limit. "
+                f"Reusing cached snapshot from {self.context_path}."
+            )
+            return cached_context_df
 
         existing_row_count = 0
         final_context_df = context_df.copy()
@@ -505,6 +611,12 @@ class CoinMarketCapContextEnricher(BasePriceDataEnricher):
                 )
                 all_rows.extend(self._extract_list_payload(response_payload))
             except Exception as error:
+                if _is_coinmarketcap_rate_limit_error(error):
+                    self._log_progress(
+                        "CoinMarketCap symbol-map chunk hit the rate limit. "
+                        "Skipping one-by-one retries so the cached context snapshot can be reused."
+                    )
+                    raise
                 self._log_progress(
                     "CoinMarketCap symbol-map chunk failed for "
                     f"{len(symbol_chunk)} symbols. Retrying one by one. Error: {error}"
@@ -634,6 +746,12 @@ class CoinMarketCapContextEnricher(BasePriceDataEnricher):
                     )
                 )
             except Exception as error:
+                if _is_coinmarketcap_rate_limit_error(error):
+                    self._log_progress(
+                        "CoinMarketCap keyed lookup hit the rate limit. "
+                        "Skipping one-by-one retries so the cached context snapshot can be reused."
+                    )
+                    raise
                 self._log_progress(
                     "CoinMarketCap keyed lookup failed for "
                     f"{endpoint_path} on {len(id_chunk)} ids. Retrying one by one. Error: {error}"
@@ -812,56 +930,296 @@ class CoinMarketCapContextEnricher(BasePriceDataEnricher):
     ) -> Dict[str, object]:
         """Send one CoinMarketCap request and decode the JSON payload."""
 
-        request_url = self.api_base_url + endpoint_path
-        if query_params:
-            request_url += "?" + urlencode(query_params, doseq=True)
-
-        request = Request(
-            request_url,
-            headers={
-                "Accept": "application/json",
-                "Accepts": "application/json",
-                "X-CMC_PRO_API_KEY": self.api_key,
-                "User-Agent": "crypto-signal-ml/0.1",
-            },
+        return _request_coinmarketcap_json(
+            api_base_url=self.api_base_url,
+            endpoint_path=endpoint_path,
+            query_params=query_params,
+            api_key=self.api_key,
+            request_pause_seconds=self.request_pause_seconds,
         )
 
+    def _log_progress(self, message: str) -> None:
+        """Print enrichment progress when verbose mode is enabled."""
+
+        if self.log_progress:
+            print(message)
+
+
+class CoinMarketCapMarketIntelligenceEnricher(BasePriceDataEnricher):
+    """
+    Attach cached market-wide CoinMarketCap intelligence to every candle row.
+
+    Unlike the per-coin CMC context cache, this snapshot is global and reflects
+    the broader crypto tape at refresh time. The goal is to give the model and
+    trader brain a shared view of:
+    - market-wide capitalization and volume
+    - BTC / ETH dominance
+    - stablecoin and DeFi participation
+    - the current Fear & Greed reading
+    """
+
+    global_metrics_endpoint = "/v1/global-metrics/quotes/latest"
+    fear_greed_latest_endpoint = "/v3/fear-and-greed/latest"
+
+    def __init__(
+        self,
+        intelligence_path: Path,
+        api_base_url: str,
+        api_key_env_var: str,
+        quote_currency: str = "USD",
+        request_pause_seconds: float = 0.2,
+        should_refresh_market_intelligence: bool = False,
+        log_progress: bool = True,
+        global_metrics_endpoint: str | None = None,
+        fear_greed_latest_endpoint: str | None = None,
+    ) -> None:
+        self.intelligence_path = intelligence_path
+        self.api_base_url = api_base_url.rstrip("/")
+        self.api_key_env_var = api_key_env_var
+        self.quote_currency = str(quote_currency).strip().upper() or "USD"
+        self.request_pause_seconds = request_pause_seconds
+        self.should_refresh_market_intelligence = should_refresh_market_intelligence
+        self.log_progress = log_progress
+        self.last_market_intelligence_summary: Dict[str, object] = {}
+        if global_metrics_endpoint:
+            self.global_metrics_endpoint = str(global_metrics_endpoint)
+        if fear_greed_latest_endpoint:
+            self.fear_greed_latest_endpoint = str(fear_greed_latest_endpoint)
+
+    @property
+    def api_key(self) -> str:
+        """Read the API key lazily from the configured environment variable."""
+
+        return os.getenv(self.api_key_env_var, "")
+
+    def enrich(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Broadcast the cached market snapshot across every row in the table."""
+
+        intelligence_df = self._load_or_refresh_market_intelligence()
+        if intelligence_df.empty:
+            return self._attach_default_market_intelligence_columns(price_df)
+
+        intelligence_row = intelligence_df.iloc[0].to_dict()
+        return self._attach_market_intelligence_snapshot(price_df, intelligence_row)
+
+    def refresh_market_intelligence(self) -> pd.DataFrame:
+        """Download a fresh market-intelligence snapshot and save it to disk."""
+
+        if not self.api_key:
+            raise ValueError(
+                "CoinMarketCap market-intelligence refresh requires an API key in the "
+                f"`{self.api_key_env_var}` environment variable."
+            )
+
         try:
-            with urlopen(request, timeout=30) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            error_body = ""
-            try:
-                error_body = error.read().decode("utf-8", errors="replace")
-            except Exception:
-                error_body = ""
-
-            query_summary = urlencode(query_params, doseq=True)[:200]
-            body_summary = error_body.strip().replace("\n", " ")[:300]
-            message = (
-                "CoinMarketCap request failed "
-                f"with status {error.code} for {endpoint_path}. "
-                f"Query: {query_summary or '<none>'}."
+            global_metrics_payload = self._request_json(
+                endpoint_path=self.global_metrics_endpoint,
+                query_params={"convert": self.quote_currency},
             )
-            if body_summary:
-                message += f" Response: {body_summary}"
-            raise ValueError(message) from error
-        except URLError as error:
-            raise ValueError(
-                "CoinMarketCap request failed "
-                f"for {endpoint_path}. Reason: {error.reason}"
-            ) from error
-
-        if self.request_pause_seconds > 0:
-            time.sleep(self.request_pause_seconds)
-
-        if not isinstance(response_payload, dict):
-            raise ValueError(
-                "Unexpected response received from CoinMarketCap. "
-                f"Response type: {type(response_payload)}"
+            fear_greed_payload = self._request_json(
+                endpoint_path=self.fear_greed_latest_endpoint,
+                query_params={},
             )
+            intelligence_row = self._build_market_intelligence_row(
+                global_metrics_payload=global_metrics_payload,
+                fear_greed_payload=fear_greed_payload,
+            )
+            intelligence_df = pd.DataFrame([intelligence_row])
+        except CoinMarketCapRateLimitError as error:
+            if not self.intelligence_path.exists():
+                raise
 
-        return response_payload
+            cached_intelligence_df = pd.read_csv(self.intelligence_path)
+            cached_row = cached_intelligence_df.iloc[0].to_dict() if not cached_intelligence_df.empty else {}
+            self.last_market_intelligence_summary = {
+                "intelligencePath": str(self.intelligence_path),
+                "lastUpdated": str(cached_row.get("cmc_market_last_updated", "")),
+                "fearGreedValue": float(cached_row.get("cmc_market_fear_greed_value", 0.0) or 0.0),
+                "fearGreedClassification": str(
+                    cached_row.get("cmc_market_fear_greed_classification", "")
+                ),
+                "usedCachedSnapshot": True,
+                "warning": str(error),
+            }
+            self._log_progress(
+                "CoinMarketCap market-intelligence refresh hit the rate limit. "
+                f"Reusing cached snapshot from {self.intelligence_path}."
+            )
+            return cached_intelligence_df
+
+        self.intelligence_path.parent.mkdir(parents=True, exist_ok=True)
+        intelligence_df.to_csv(self.intelligence_path, index=False)
+        self.last_market_intelligence_summary = {
+            "intelligencePath": str(self.intelligence_path),
+            "lastUpdated": str(intelligence_row["cmc_market_last_updated"]),
+            "fearGreedValue": float(intelligence_row["cmc_market_fear_greed_value"]),
+            "fearGreedClassification": str(intelligence_row["cmc_market_fear_greed_classification"]),
+        }
+        self._log_progress(
+            "Saved CoinMarketCap market intelligence snapshot "
+            f"to {self.intelligence_path}"
+        )
+
+        return intelligence_df
+
+    def _load_or_refresh_market_intelligence(self) -> pd.DataFrame:
+        """Load the cached market snapshot or refresh it when allowed."""
+
+        if self.should_refresh_market_intelligence and self.api_key:
+            return self.refresh_market_intelligence()
+
+        if self.intelligence_path.exists():
+            return pd.read_csv(self.intelligence_path)
+
+        if self.api_key:
+            return self.refresh_market_intelligence()
+
+        self._log_progress(
+            "CoinMarketCap market intelligence skipped because no cached snapshot was found "
+            f"and `{self.api_key_env_var}` is not set."
+        )
+        return pd.DataFrame()
+
+    def _build_market_intelligence_row(
+        self,
+        global_metrics_payload: Dict[str, object],
+        fear_greed_payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Normalize the two CMC payloads into one flat snapshot row."""
+
+        global_data = global_metrics_payload.get("data", {})
+        if not isinstance(global_data, dict):
+            global_data = {}
+
+        quote_rows = global_data.get("quote", {})
+        if not isinstance(quote_rows, dict):
+            quote_rows = {}
+        quote_details = quote_rows.get(self.quote_currency, {})
+        if not isinstance(quote_details, dict):
+            quote_details = {}
+
+        fear_greed_data = fear_greed_payload.get("data", {})
+        if not isinstance(fear_greed_data, dict):
+            fear_greed_data = {}
+
+        total_market_cap = self._safe_float(quote_details.get("total_market_cap"))
+        altcoin_market_cap = self._safe_float(quote_details.get("altcoin_market_cap"))
+        stablecoin_market_cap = self._safe_float(quote_details.get("stablecoin_market_cap"))
+
+        return {
+            "cmc_market_intelligence_available": 1,
+            "cmc_market_quote_currency": self.quote_currency,
+            "cmc_market_last_updated": (
+                str(quote_details.get("last_updated") or global_data.get("last_updated") or fear_greed_data.get("update_time") or "")
+            ),
+            "cmc_market_total_market_cap": total_market_cap,
+            "cmc_market_total_volume_24h": self._safe_float(quote_details.get("total_volume_24h")),
+            "cmc_market_total_market_cap_change_24h": self._safe_float(
+                quote_details.get("total_market_cap_yesterday_percentage_change")
+            ),
+            "cmc_market_total_volume_change_24h": self._safe_float(
+                quote_details.get("total_volume_24h_yesterday_percentage_change")
+            ),
+            "cmc_market_altcoin_market_cap": altcoin_market_cap,
+            "cmc_market_altcoin_share": self._safe_ratio(altcoin_market_cap, total_market_cap),
+            "cmc_market_btc_dominance": self._safe_float(global_data.get("btc_dominance")),
+            "cmc_market_btc_dominance_change_24h": self._safe_float(
+                global_data.get("btc_dominance_24h_percentage_change")
+            ),
+            "cmc_market_eth_dominance": self._safe_float(global_data.get("eth_dominance")),
+            "cmc_market_stablecoin_market_cap": stablecoin_market_cap,
+            "cmc_market_stablecoin_share": self._safe_ratio(stablecoin_market_cap, total_market_cap),
+            "cmc_market_defi_market_cap": self._safe_float(quote_details.get("defi_market_cap")),
+            "cmc_market_defi_volume_24h": self._safe_float(quote_details.get("defi_volume_24h")),
+            "cmc_market_derivatives_volume_24h": self._safe_float(
+                quote_details.get("derivatives_volume_24h")
+            ),
+            "cmc_market_fear_greed_value": self._safe_float(fear_greed_data.get("value")),
+            "cmc_market_fear_greed_classification": str(
+                fear_greed_data.get("value_classification") or ""
+            ).strip(),
+        }
+
+    def _attach_market_intelligence_snapshot(
+        self,
+        price_df: pd.DataFrame,
+        intelligence_row: Dict[str, object],
+    ) -> pd.DataFrame:
+        """Attach one market-intelligence snapshot to every row in the price table."""
+
+        output_df = self._attach_default_market_intelligence_columns(price_df)
+        for column_name in self._default_market_intelligence_columns():
+            output_df[column_name] = intelligence_row.get(column_name, output_df[column_name])
+        return output_df
+
+    @staticmethod
+    def _default_market_intelligence_columns() -> Dict[str, object]:
+        """Return the default values for every market-intelligence column."""
+
+        return {
+            "cmc_market_intelligence_available": 0.0,
+            "cmc_market_quote_currency": "",
+            "cmc_market_last_updated": "",
+            "cmc_market_total_market_cap": 0.0,
+            "cmc_market_total_volume_24h": 0.0,
+            "cmc_market_total_market_cap_change_24h": 0.0,
+            "cmc_market_total_volume_change_24h": 0.0,
+            "cmc_market_altcoin_market_cap": 0.0,
+            "cmc_market_altcoin_share": 0.0,
+            "cmc_market_btc_dominance": 0.0,
+            "cmc_market_btc_dominance_change_24h": 0.0,
+            "cmc_market_eth_dominance": 0.0,
+            "cmc_market_stablecoin_market_cap": 0.0,
+            "cmc_market_stablecoin_share": 0.0,
+            "cmc_market_defi_market_cap": 0.0,
+            "cmc_market_defi_volume_24h": 0.0,
+            "cmc_market_derivatives_volume_24h": 0.0,
+            "cmc_market_fear_greed_value": 0.0,
+            "cmc_market_fear_greed_classification": "",
+        }
+
+    def _attach_default_market_intelligence_columns(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        """Return the input table with zero-filled market-intelligence columns."""
+
+        output_df = price_df.copy()
+        for column_name, default_value in self._default_market_intelligence_columns().items():
+            if column_name not in output_df.columns:
+                output_df[column_name] = default_value
+        return output_df
+
+    @staticmethod
+    def _safe_float(raw_value: object) -> float:
+        """Convert an optional payload value into a float without raising."""
+
+        try:
+            if raw_value in {None, ""}:
+                return 0.0
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _safe_ratio(numerator: float, denominator: float) -> float:
+        """Divide two floats while preventing divide-by-zero errors."""
+
+        if denominator <= 0:
+            return 0.0
+        return float(numerator) / float(denominator)
+
+    def _request_json(
+        self,
+        endpoint_path: str,
+        query_params: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Send one CoinMarketCap request and decode the JSON payload."""
+
+        return _request_coinmarketcap_json(
+            api_base_url=self.api_base_url,
+            endpoint_path=endpoint_path,
+            query_params=query_params,
+            api_key=self.api_key,
+            request_pause_seconds=self.request_pause_seconds,
+        )
 
     def _log_progress(self, message: str) -> None:
         """Print enrichment progress when verbose mode is enabled."""
@@ -1479,10 +1837,12 @@ class CoinMarketCapOhlcvPriceDataLoader(BaseApiPriceDataLoader):
             if not isinstance(raw_row, dict):
                 continue
 
-            base_currency = str(raw_row.get("symbol", "")).strip().upper()
+            base_currency = normalize_base_currency(raw_row.get("symbol"))
             if not base_currency:
                 continue
             if base_currency in excluded_bases:
+                continue
+            if not is_signal_eligible_base_currency(base_currency):
                 continue
 
             current_row = best_row_by_symbol.get(base_currency)
@@ -1495,11 +1855,17 @@ class CoinMarketCapOhlcvPriceDataLoader(BaseApiPriceDataLoader):
 
         filtered_products = [
             {
-                "product_id": f"{base_currency}-{self.quote_currency.upper()}",
-                "base_currency": base_currency,
+                "product_id": f"{normalize_base_currency(raw_row.get('symbol'))}-{self.quote_currency.upper()}",
+                "base_currency": normalize_base_currency(raw_row.get("symbol")),
                 "quote_currency": self.quote_currency.upper(),
             }
-            for base_currency in sorted(best_row_by_symbol.keys())
+            for raw_row in sorted(
+                best_row_by_symbol.values(),
+                key=lambda row: (
+                    int(row.get("rank") or 10**9),
+                    normalize_base_currency(row.get("symbol")),
+                ),
+            )
         ]
 
         if self.max_products is not None:
@@ -1754,56 +2120,446 @@ class CoinMarketCapOhlcvPriceDataLoader(BaseApiPriceDataLoader):
     ) -> Dict[str, object]:
         """Send one CoinMarketCap request and decode the JSON payload."""
 
-        request_url = self.api_base_url + endpoint_path
-        if query_params:
-            request_url += "?" + urlencode(query_params, doseq=True)
-
-        request = Request(
-            request_url,
-            headers={
-                "Accept": "application/json",
-                "Accepts": "application/json",
-                "X-CMC_PRO_API_KEY": self.api_key,
-                "User-Agent": "crypto-signal-ml/0.1",
-            },
+        return _request_coinmarketcap_json(
+            api_base_url=self.api_base_url,
+            endpoint_path=endpoint_path,
+            query_params=query_params,
+            api_key=self.api_key,
+            request_pause_seconds=self.request_pause_seconds,
         )
 
-        try:
-            with urlopen(request, timeout=30) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            error_body = ""
-            try:
-                error_body = error.read().decode("utf-8", errors="replace")
-            except Exception:
-                error_body = ""
+    def _log_progress(self, message: str) -> None:
+        """Print refresh progress when verbose mode is enabled."""
 
-            query_summary = urlencode(query_params, doseq=True)[:200]
-            body_summary = error_body.strip().replace("\n", " ")[:300]
-            message = (
-                "CoinMarketCap request failed "
-                f"with status {error.code} for {endpoint_path}. "
-                f"Query: {query_summary or '<none>'}."
-            )
-            if body_summary:
-                message += f" Response: {body_summary}"
-            raise ValueError(message) from error
-        except URLError as error:
+        if self.log_progress:
+            print(message)
+
+
+class CoinMarketCapLatestQuotesPriceDataLoader(BaseApiPriceDataLoader):
+    """
+    Build a local time series from supported CoinMarketCap latest-quote snapshots.
+
+    Some CoinMarketCap plans expose `quotes/latest` and `map` but not the
+    historical OHLCV endpoints. This loader records the current quote snapshot
+    on every refresh, appends it to the existing market CSV, and keeps the rest
+    of the pipeline working on an accumulated price history.
+    """
+
+    api_name = "coinmarketcapLatestQuotes"
+    default_quote_request_symbol_batch_size = 100
+
+    def __init__(
+        self,
+        data_path: Path,
+        api_base_url: str,
+        api_key_env_var: str,
+        quote_currency: str,
+        granularity_seconds: int,
+        total_candles: int,
+        request_pause_seconds: float = 0.2,
+        should_save_downloaded_data: bool = True,
+        product_id: Optional[str] = None,
+        product_ids: Sequence[str] = None,
+        fetch_all_quote_products: bool = False,
+        excluded_base_currencies: Sequence[str] = None,
+        max_products: Optional[int] = None,
+        product_batch_size: Optional[int] = None,
+        product_batch_number: int = 1,
+        save_progress_every_products: int = 0,
+        log_progress: bool = True,
+        quotes_latest_endpoint: str = "/v2/cryptocurrency/quotes/latest",
+        map_endpoint: str = "/v1/cryptocurrency/map",
+    ) -> None:
+        super().__init__(data_path=data_path, should_save_downloaded_data=should_save_downloaded_data)
+        self.api_base_url = api_base_url.rstrip("/")
+        self.api_key_env_var = api_key_env_var
+        self.quote_currency = quote_currency
+        self.granularity_seconds = granularity_seconds
+        self.total_candles = total_candles
+        self.request_pause_seconds = request_pause_seconds
+        self.product_id = product_id
+        self.product_ids = tuple(product_ids or ())
+        self.fetch_all_quote_products = fetch_all_quote_products
+        self.excluded_base_currencies = tuple(excluded_base_currencies or ())
+        self.max_products = max_products
+        self.product_batch_size = product_batch_size
+        self.product_batch_number = product_batch_number
+        self.save_progress_every_products = save_progress_every_products
+        self.log_progress = log_progress
+        self.quotes_latest_endpoint = quotes_latest_endpoint
+        self.map_endpoint = map_endpoint
+
+    @property
+    def api_key(self) -> str:
+        """Read the API key lazily from the configured environment variable."""
+
+        return os.getenv(self.api_key_env_var, "")
+
+    def _read_data(self) -> pd.DataFrame:
+        """Download one latest-quote snapshot and merge it with any existing local history."""
+
+        self._validate_download_settings()
+
+        available_products = self._resolve_products_to_download()
+        selected_products, batch_summary = self._slice_products_for_batch(available_products)
+        self._log_progress(
+            "Starting CoinMarketCap latest-quote refresh: "
+            f"{len(selected_products)} products in this batch."
+        )
+
+        snapshot_rows = self._request_latest_quote_rows(selected_products)
+        if not snapshot_rows:
             raise ValueError(
-                "CoinMarketCap request failed "
-                f"for {endpoint_path}. Reason: {error.reason}"
-            ) from error
-
-        if self.request_pause_seconds > 0:
-            time.sleep(self.request_pause_seconds)
-
-        if not isinstance(response_payload, dict):
-            raise ValueError(
-                "Unexpected response received from CoinMarketCap. "
-                f"Response type: {type(response_payload)}"
+                "The CoinMarketCap latest-quotes endpoint returned no rows for the selected products."
             )
 
-        return response_payload
+        snapshot_df = self._build_price_frame(snapshot_rows)
+        final_df = self._merge_with_existing_history(snapshot_df)
+
+        self.last_refresh_summary = {
+            "totalAvailableProducts": len(available_products),
+            "productsDownloaded": len(selected_products),
+            "requestWindowsPerProduct": 1,
+            "batchSize": batch_summary["batchSize"],
+            "batchNumber": batch_summary["batchNumber"],
+            "batchStartIndex": batch_summary["batchStartIndex"],
+            "batchEndIndex": batch_summary["batchEndIndex"],
+            "snapshotRowsDownloaded": len(snapshot_df),
+            "rowsDownloaded": len(final_df),
+            "partialSavePath": str(self.partial_data_path),
+        }
+        self._log_progress(
+            f"Completed CoinMarketCap latest-quote refresh with {len(snapshot_df)} fresh rows "
+            f"and {len(final_df)} total rows in the prepared dataset."
+        )
+        return final_df
+
+    def _save_downloaded_data(self, price_df: pd.DataFrame) -> None:
+        """Persist the merged snapshot history produced by `_read_data`."""
+
+        super()._save_downloaded_data(price_df)
+        self.last_refresh_summary["finalRowsSaved"] = len(price_df)
+
+    def _validate_download_settings(self) -> None:
+        """Validate the snapshot-refresh settings before hitting the API."""
+
+        if not self.api_key:
+            raise ValueError(
+                "CoinMarketCap latest-quote refresh requires an API key in the "
+                f"`{self.api_key_env_var}` environment variable."
+            )
+
+        if self.granularity_seconds <= 0:
+            raise ValueError("coinmarketcap_granularity_seconds must be greater than zero.")
+
+        if self.total_candles <= 0:
+            raise ValueError("coinmarketcap_total_candles must be greater than zero.")
+
+        if self.product_batch_size is not None and self.product_batch_size <= 0:
+            raise ValueError("coinmarketcap_product_batch_size must be greater than zero when provided.")
+
+        if self.product_batch_number <= 0:
+            raise ValueError("coinmarketcap_product_batch_number must be greater than zero.")
+
+    def _resolve_products_to_download(self) -> List[Dict[str, str]]:
+        """Decide which assets belong in the CoinMarketCap snapshot universe."""
+
+        if self.fetch_all_quote_products:
+            return self._fetch_filtered_products()
+
+        explicit_product_ids = list(self.product_ids)
+        if self.product_id:
+            explicit_product_ids.append(self.product_id)
+
+        if not explicit_product_ids:
+            raise ValueError("No CoinMarketCap products were provided for download.")
+
+        return [
+            {
+                "product_id": product_id,
+                "base_currency": product_id.split("-")[0].upper(),
+                "quote_currency": product_id.split("-")[1].upper() if "-" in product_id else self.quote_currency.upper(),
+            }
+            for product_id in explicit_product_ids
+        ]
+
+    def _fetch_filtered_products(self) -> List[Dict[str, str]]:
+        """Fetch the CoinMarketCap asset catalog and keep the configured quote universe."""
+
+        response_payload = self._request_json(
+            endpoint_path=self.map_endpoint,
+            query_params={
+                "listing_status": "active",
+            },
+        )
+        raw_rows = response_payload.get("data", []) if isinstance(response_payload, dict) else []
+        if not isinstance(raw_rows, list):
+            raise ValueError(
+                "Unexpected response received from CoinMarketCap map endpoint. "
+                f"Response type: {type(raw_rows)}"
+            )
+
+        excluded_bases = {currency.upper() for currency in self.excluded_base_currencies}
+        best_row_by_symbol: Dict[str, Dict[str, object]] = {}
+
+        for raw_row in raw_rows:
+            if not isinstance(raw_row, dict):
+                continue
+
+            base_currency = normalize_base_currency(raw_row.get("symbol"))
+            if not base_currency:
+                continue
+            if base_currency in excluded_bases:
+                continue
+            if not is_signal_eligible_base_currency(base_currency):
+                continue
+
+            current_row = best_row_by_symbol.get(base_currency)
+            if current_row is None or int(raw_row.get("rank") or 10**9) < int(current_row.get("rank") or 10**9):
+                best_row_by_symbol[base_currency] = raw_row
+
+        filtered_products = [
+            {
+                "product_id": f"{normalize_base_currency(raw_row.get('symbol'))}-{self.quote_currency.upper()}",
+                "base_currency": normalize_base_currency(raw_row.get("symbol")),
+                "quote_currency": self.quote_currency.upper(),
+            }
+            for raw_row in sorted(
+                best_row_by_symbol.values(),
+                key=lambda row: (
+                    int(row.get("rank") or 10**9),
+                    normalize_base_currency(row.get("symbol")),
+                ),
+            )
+        ]
+
+        if self.max_products is not None:
+            filtered_products = filtered_products[: self.max_products]
+
+        if not filtered_products:
+            raise ValueError("No CoinMarketCap assets matched the configured multi-coin filters.")
+
+        return filtered_products
+
+    def get_available_products(self) -> List[Dict[str, str]]:
+        """Return the filtered asset universe for the current loader settings."""
+
+        self._validate_download_settings()
+        return self._resolve_products_to_download()
+
+    def get_total_batches(self) -> int:
+        """Return how many product batches are needed for the current universe."""
+
+        available_products = self.get_available_products()
+        if self.product_batch_size is None:
+            return 1
+
+        return max(1, math.ceil(len(available_products) / self.product_batch_size))
+
+    def _slice_products_for_batch(
+        self,
+        selected_products: List[Dict[str, str]],
+    ) -> tuple[List[Dict[str, str]], Dict[str, int]]:
+        """Limit a large asset universe to one configured batch."""
+
+        if self.product_batch_size is None:
+            batch_summary = {
+                "batchSize": len(selected_products),
+                "batchNumber": 1,
+                "batchStartIndex": 1,
+                "batchEndIndex": len(selected_products),
+            }
+            return selected_products, batch_summary
+
+        total_products = len(selected_products)
+        total_batches = max(1, math.ceil(total_products / self.product_batch_size))
+
+        if self.product_batch_number > total_batches:
+            raise ValueError(
+                "Requested CoinMarketCap product batch is out of range. "
+                f"Requested batch {self.product_batch_number}, available batches {total_batches}."
+            )
+
+        batch_start_index = (self.product_batch_number - 1) * self.product_batch_size
+        batch_end_index = min(batch_start_index + self.product_batch_size, total_products)
+        batch_products = selected_products[batch_start_index:batch_end_index]
+
+        batch_summary = {
+            "batchSize": len(batch_products),
+            "batchNumber": self.product_batch_number,
+            "batchStartIndex": batch_start_index + 1,
+            "batchEndIndex": batch_end_index,
+        }
+
+        self._log_progress(
+            "Using CoinMarketCap latest-quote product batch "
+            f"{self.product_batch_number}/{total_batches}: "
+            f"products {batch_summary['batchStartIndex']} to {batch_summary['batchEndIndex']}."
+        )
+        return batch_products, batch_summary
+
+    def _request_latest_quote_rows(
+        self,
+        selected_products: Sequence[Dict[str, str]],
+    ) -> List[Dict[str, object]]:
+        """Fetch and normalize the current quote snapshot for the requested symbols."""
+
+        if not selected_products:
+            return []
+
+        product_lookup = {
+            str(product["base_currency"]).upper(): product
+            for product in selected_products
+        }
+        symbol_batches = [
+            list(product_lookup.keys())[start_index : start_index + self.default_quote_request_symbol_batch_size]
+            for start_index in range(0, len(product_lookup), self.default_quote_request_symbol_batch_size)
+        ]
+
+        normalized_rows: List[Dict[str, object]] = []
+        for batch_index, symbol_batch in enumerate(symbol_batches):
+            response_payload = self._request_json(
+                endpoint_path=self.quotes_latest_endpoint,
+                query_params={
+                    "symbol": ",".join(symbol_batch),
+                    "convert": self.quote_currency,
+                },
+            )
+            normalized_rows.extend(
+                self._extract_latest_quote_rows(
+                    response_payload=response_payload,
+                    product_lookup=product_lookup,
+                )
+            )
+
+            if batch_index < len(symbol_batches) - 1 and self.request_pause_seconds > 0:
+                time.sleep(self.request_pause_seconds)
+
+        return normalized_rows
+
+    def _extract_latest_quote_rows(
+        self,
+        response_payload: Dict[str, object],
+        product_lookup: Dict[str, Dict[str, str]],
+    ) -> List[Dict[str, object]]:
+        """Flatten one latest-quote payload into normalized project rows."""
+
+        raw_data = response_payload.get("data", {}) if isinstance(response_payload, dict) else {}
+        if not isinstance(raw_data, dict):
+            raise ValueError(
+                "Unexpected response received from CoinMarketCap latest quotes endpoint. "
+                f"Response type: {type(raw_data)}"
+            )
+
+        normalized_rows: List[Dict[str, object]] = []
+        for asset_rows in raw_data.values():
+            if isinstance(asset_rows, dict):
+                candidate_assets = [asset_rows]
+            elif isinstance(asset_rows, list):
+                candidate_assets = [asset_row for asset_row in asset_rows if isinstance(asset_row, dict)]
+            else:
+                continue
+
+            for asset_payload in candidate_assets:
+                base_currency = str(asset_payload.get("symbol", "")).strip().upper()
+                product_details = product_lookup.get(base_currency)
+                if product_details is None:
+                    continue
+
+                quote_payload = asset_payload.get("quote", {})
+                if not isinstance(quote_payload, dict):
+                    continue
+
+                quote_details = quote_payload.get(self.quote_currency)
+                if not isinstance(quote_details, dict):
+                    continue
+
+                timestamp_value = quote_details.get("last_updated") or response_payload.get("status", {}).get("timestamp")
+                parsed_timestamp = pd.to_datetime(timestamp_value, errors="coerce", utc=True)
+                if pd.isna(parsed_timestamp):
+                    continue
+
+                latest_price = quote_details.get("price")
+                if latest_price is None:
+                    continue
+
+                price_value = float(latest_price)
+                normalized_rows.append(
+                    {
+                        "timestamp": parsed_timestamp,
+                        "open": price_value,
+                        "high": price_value,
+                        "low": price_value,
+                        "close": price_value,
+                        "volume": float(quote_details.get("volume_24h") or 0.0),
+                        "product_id": product_details["product_id"],
+                        "base_currency": product_details["base_currency"],
+                        "quote_currency": product_details["quote_currency"],
+                        "granularity_seconds": self.granularity_seconds,
+                        "source": self.api_name,
+                        "cmc_market_cap": float(quote_details.get("market_cap") or 0.0),
+                        "cmc_volume_change_24h": float(quote_details.get("volume_change_24h") or 0.0),
+                        "cmc_percent_change_1h": float(quote_details.get("percent_change_1h") or 0.0),
+                        "cmc_percent_change_24h": float(quote_details.get("percent_change_24h") or 0.0),
+                        "cmc_percent_change_7d": float(quote_details.get("percent_change_7d") or 0.0),
+                        "cmc_percent_change_30d": float(quote_details.get("percent_change_30d") or 0.0),
+                        "cmc_fully_diluted_market_cap": float(
+                            quote_details.get("fully_diluted_market_cap") or 0.0
+                        ),
+                        "cmc_circulating_supply": float(asset_payload.get("circulating_supply") or 0.0),
+                        "cmc_total_supply": float(asset_payload.get("total_supply") or 0.0),
+                        "cmc_max_supply": float(asset_payload.get("max_supply") or 0.0),
+                    }
+                )
+
+        return normalized_rows
+
+    def _merge_with_existing_history(self, snapshot_df: pd.DataFrame) -> pd.DataFrame:
+        """Append the newest quote snapshot to any existing local market history."""
+
+        final_df = snapshot_df.copy()
+        final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+        existing_row_count = 0
+
+        if self.data_path.exists():
+            existing_df = pd.read_csv(self.data_path)
+            existing_row_count = len(existing_df)
+            if "timestamp" in existing_df.columns:
+                existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
+            final_df = pd.concat([existing_df, final_df], ignore_index=True)
+            final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+            final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")
+
+        if "base_currency" in final_df.columns:
+            final_df = final_df.loc[
+                final_df["base_currency"].map(is_signal_eligible_base_currency)
+            ].copy()
+        final_df = self._sort_rows(final_df)
+
+        self.last_refresh_summary["existingRowsMerged"] = existing_row_count
+        return final_df
+
+    def _build_price_frame(self, normalized_rows: Sequence[Dict[str, object]]) -> pd.DataFrame:
+        """Normalize the full multi-asset snapshot set into the project's schema."""
+
+        price_df = pd.DataFrame(normalized_rows)
+        price_df = price_df.drop_duplicates(subset=["product_id", "timestamp"])
+        return price_df.sort_values(["timestamp", "product_id"]).reset_index(drop=True)
+
+    def _request_json(
+        self,
+        endpoint_path: str,
+        query_params: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Send one CoinMarketCap request and decode the JSON payload."""
+
+        return _request_coinmarketcap_json(
+            api_base_url=self.api_base_url,
+            endpoint_path=endpoint_path,
+            query_params=query_params,
+            api_key=self.api_key,
+            request_pause_seconds=self.request_pause_seconds,
+        )
 
     def _log_progress(self, message: str) -> None:
         """Print refresh progress when verbose mode is enabled."""
@@ -2058,7 +2814,11 @@ class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
             if quote_currency.upper() != self.quote_currency.upper():
                 continue
 
-            if base_currency.upper() in excluded_bases:
+            normalized_base_currency = normalize_base_currency(base_currency)
+            if normalized_base_currency in excluded_bases:
+                continue
+
+            if not is_signal_eligible_base_currency(normalized_base_currency):
                 continue
 
             if status != "online":
@@ -2067,7 +2827,7 @@ class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
             filtered_products.append(
                 {
                     "product_id": product_id,
-                    "base_currency": base_currency,
+                    "base_currency": normalized_base_currency,
                     "quote_currency": quote_currency,
                 }
             )
@@ -2383,6 +3143,61 @@ def create_market_data_loader(
             map_endpoint=config.coinmarketcap_map_endpoint,
         )
 
+    if market_data_source == "coinmarketcapLatestQuotes":
+        return CoinMarketCapLatestQuotesPriceDataLoader(
+            data_path=data_path or config.data_file,
+            api_base_url=config.coinmarketcap_api_base_url,
+            api_key_env_var=config.coinmarketcap_api_key_env_var,
+            quote_currency=config.coinmarketcap_quote_currency,
+            granularity_seconds=int(
+                granularity_seconds
+                if granularity_seconds is not None
+                else config.coinmarketcap_granularity_seconds
+            ),
+            total_candles=int(
+                total_candles
+                if total_candles is not None
+                else config.coinmarketcap_total_candles
+            ),
+            request_pause_seconds=(
+                request_pause_seconds
+                if request_pause_seconds is not None
+                else config.coinmarketcap_request_pause_seconds
+            ),
+            should_save_downloaded_data=should_save_downloaded_data,
+            product_id=product_id if product_id is not None else config.coinmarketcap_product_id,
+            product_ids=(
+                tuple(product_ids)
+                if product_ids is not None
+                else config.coinmarketcap_product_ids
+            ),
+            fetch_all_quote_products=(
+                fetch_all_quote_products
+                if fetch_all_quote_products is not None
+                else config.coinmarketcap_fetch_all_quote_products
+            ),
+            excluded_base_currencies=config.coinmarketcap_excluded_base_currencies,
+            max_products=max_products if max_products is not None else config.coinmarketcap_max_products,
+            product_batch_size=(
+                product_batch_size
+                if product_batch_size is not None
+                else config.coinmarketcap_product_batch_size
+            ),
+            product_batch_number=(
+                int(product_batch_number)
+                if product_batch_number is not None
+                else int(config.coinmarketcap_product_batch_number)
+            ),
+            save_progress_every_products=(
+                int(save_progress_every_products)
+                if save_progress_every_products is not None
+                else int(config.coinmarketcap_save_progress_every_products)
+            ),
+            log_progress=log_progress if log_progress is not None else config.coinmarketcap_log_progress,
+            quotes_latest_endpoint=config.coinmarketcap_quotes_latest_endpoint,
+            map_endpoint=config.coinmarketcap_map_endpoint,
+        )
+
     if market_data_source == "coinbaseExchange":
         return CoinbaseExchangePriceDataLoader(
             data_path=data_path or config.data_file,
@@ -2432,7 +3247,7 @@ def create_market_data_loader(
 
     raise ValueError(
         "Unsupported market_data_source. "
-        "Currently supported: coinmarketcap, coinbaseExchange"
+        "Currently supported: coinmarketcap, coinmarketcapLatestQuotes, coinbaseExchange"
     )
 
 
