@@ -45,6 +45,15 @@ from ..modeling import (
 from ..pipeline import CryptoDatasetBuilder, build_feature_table, build_labeled_dataset
 from ..regime_modeling import MarketRegimeModel
 from ..regimes import MarketRegimeDetector, TrendRegimeBuilder, VolatilityRegimeBuilder
+from .models import (
+    LightGBMClassifierSignalModel,
+    LightGBMRankerSignalModel,
+    RiverOnlineSignalModel,
+    TFTSequenceSignalModel,
+    XGBoostClassifierSignalModel,
+    ensure_registry_loaded,
+    resolve_model_type,
+)
 
 __all__ = [
     "BaseApiPriceDataLoader",
@@ -84,7 +93,14 @@ __all__ = [
     "create_market_data_loader",
     "create_model_from_config",
     "create_regime_labeler_from_config",
+    "ensure_registry_loaded",
     "get_model_class",
+    "LightGBMClassifierSignalModel",
+    "LightGBMRankerSignalModel",
     "register_model",
+    "resolve_model_type",
+    "RiverOnlineSignalModel",
     "signal_to_text",
+    "TFTSequenceSignalModel",
+    "XGBoostClassifierSignalModel",
 ]

@@ -17,6 +17,7 @@ from .pipeline import CryptoDatasetBuilder
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signals import is_signal_product_excluded
 from .application import (
+    SignalContextEnrichmentStage,
     SignalDecisionStage,
     SignalEnrichmentStage,
     SignalGenerationCoordinator,
@@ -267,6 +268,7 @@ class LiveSignalEngine:
         )
         coordinator = SignalGenerationCoordinator(
             inference_stage=inference_stage,
+            context_stage=SignalContextEnrichmentStage(runtime_config),
             enrichment_stage=SignalEnrichmentStage(runtime_config),
             decision_stage=SignalDecisionStage(runtime_config),
         )

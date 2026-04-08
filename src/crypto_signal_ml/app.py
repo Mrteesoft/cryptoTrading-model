@@ -38,6 +38,7 @@ from .trading.signal_store import TradingSignalStore
 from .regime_modeling import MarketRegimeModel
 from .application import (
     PrimarySignalHistoryStore,
+    SignalContextEnrichmentStage,
     SignalDecisionStage,
     SignalEnrichmentStage,
     SignalGenerationCoordinator,
@@ -71,7 +72,14 @@ class BaseSignalApp:
         model_class: Type[BaseSignalModel] = None,
     ) -> None:
         self.config = config or TrainingConfig()
-        self.model_class = model_class or get_model_class(self.config.model_type)
+        if model_class is None:
+            from .ml.models.registry import ensure_registry_loaded, resolve_model_type
+
+            ensure_registry_loaded()
+            resolved_model_type = resolve_model_type(self.config)
+            self.model_class = get_model_class(resolved_model_type)
+        else:
+            self.model_class = model_class
         self.dataset_builder = dataset_builder or CryptoDatasetBuilder(self.config)
         self.model = model
 
@@ -627,6 +635,11 @@ class TrainingApp(BaseSignalApp):
         training_config = training_config or self.config
         if model_type is not None:
             training_config = replace(training_config, model_type=model_type)
+            training_config = replace(
+                training_config,
+                signal_model_family="baseline_current",
+                signal_model_variant="default",
+            )
 
         model = create_model_from_config(
             config=training_config,
@@ -1583,6 +1596,144 @@ class SignalParameterTuningApp(WalkForwardValidationApp):
 class ModelComparisonApp(TrainingApp):
     """Train multiple registered model subclasses on the same dataset split."""
 
+    @staticmethod
+    def _find_regime_column(prediction_df: pd.DataFrame) -> str | None:
+        for column in (
+            "market_regime_label",
+            "market_regime_code",
+            "trend_regime_label",
+            "volatility_regime_label",
+        ):
+            if column in prediction_df.columns:
+                return column
+        return None
+
+    def _build_buy_precision_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        if "target_signal" not in prediction_df.columns or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        predicted_buy = prediction_df["predicted_name"] == "BUY"
+        actual_buy = prediction_df["target_signal"] == 1
+        buy_count = int(predicted_buy.sum())
+        true_positive = int((predicted_buy & actual_buy).sum())
+        false_positive = int((predicted_buy & ~actual_buy).sum())
+
+        return {
+            "available": True,
+            "predictedBuyCount": buy_count,
+            "buyPrecision": float(true_positive / max(buy_count, 1)),
+            "falsePositiveRate": float(false_positive / max(buy_count, 1)),
+        }
+
+    def _build_forward_return_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        if "future_return" not in prediction_df.columns or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        predicted_buy = prediction_df["predicted_name"] == "BUY"
+        buy_returns = prediction_df.loc[predicted_buy, "future_return"]
+        return {
+            "available": True,
+            "averageForwardReturn": float(buy_returns.mean()) if not buy_returns.empty else 0.0,
+            "medianForwardReturn": float(buy_returns.median()) if not buy_returns.empty else 0.0,
+        }
+
+    def _build_promotion_quality_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        required_columns = {"confidence", "prob_buy", "target_signal"}
+        if not required_columns.issubset(prediction_df.columns):
+            return {"available": False}
+
+        promotion_mask = (
+            (prediction_df["confidence"] >= float(self.config.signal_watchlist_promotion_min_confidence))
+            & (prediction_df["prob_buy"] >= float(self.config.signal_watchlist_promotion_min_decision_score))
+        )
+        entry_ready_mask = (
+            (prediction_df["confidence"] >= float(self.config.signal_watchlist_entry_ready_min_confidence))
+            & (prediction_df["prob_buy"] >= float(self.config.signal_watchlist_entry_ready_min_decision_score))
+        )
+        actual_buy = prediction_df["target_signal"] == 1
+
+        def summarize(mask: pd.Series) -> Dict[str, Any]:
+            count = int(mask.sum())
+            true_positive = int((mask & actual_buy).sum())
+            avg_return = None
+            if "future_return" in prediction_df.columns:
+                avg_return = float(prediction_df.loc[mask, "future_return"].mean()) if count > 0 else 0.0
+            return {
+                "count": count,
+                "buyPrecision": float(true_positive / max(count, 1)),
+                "averageForwardReturn": avg_return,
+            }
+
+        return {
+            "available": True,
+            "promotionCandidates": summarize(promotion_mask),
+            "entryReadyCandidates": summarize(entry_ready_mask),
+        }
+
+    def _build_confidence_bucket_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        if "confidence" not in prediction_df.columns or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        buckets = [
+            (0.0, 0.40),
+            (0.40, 0.55),
+            (0.55, 0.70),
+            (0.70, 0.85),
+            (0.85, 1.01),
+        ]
+        actual_buy = prediction_df["target_signal"] == 1 if "target_signal" in prediction_df.columns else None
+
+        bucket_rows = []
+        for lower, upper in buckets:
+            bucket_mask = (prediction_df["confidence"] >= lower) & (prediction_df["confidence"] < upper)
+            predicted_buy = bucket_mask & (prediction_df["predicted_name"] == "BUY")
+            count = int(predicted_buy.sum())
+            precision = None
+            if actual_buy is not None:
+                precision = float((predicted_buy & actual_buy).sum() / max(count, 1))
+            avg_return = None
+            if "future_return" in prediction_df.columns:
+                avg_return = float(prediction_df.loc[predicted_buy, "future_return"].mean()) if count > 0 else 0.0
+
+            bucket_rows.append(
+                {
+                    "bucket": f"{lower:.2f}-{upper:.2f}",
+                    "predictedBuyCount": count,
+                    "buyPrecision": precision,
+                    "averageForwardReturn": avg_return,
+                }
+            )
+
+        return {"available": True, "buckets": bucket_rows}
+
+    def _build_regime_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        regime_column = self._find_regime_column(prediction_df)
+        if regime_column is None or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        actual_buy = prediction_df["target_signal"] == 1 if "target_signal" in prediction_df.columns else None
+        grouped = prediction_df.groupby(regime_column)
+        rows = []
+        for regime_value, group in grouped:
+            predicted_buy = group["predicted_name"] == "BUY"
+            count = int(predicted_buy.sum())
+            precision = None
+            if actual_buy is not None:
+                precision = float((predicted_buy & (group["target_signal"] == 1)).sum() / max(count, 1))
+            avg_return = None
+            if "future_return" in group.columns:
+                avg_return = float(group.loc[predicted_buy, "future_return"].mean()) if count > 0 else 0.0
+            rows.append(
+                {
+                    "regime": str(regime_value),
+                    "predictedBuyCount": count,
+                    "buyPrecision": precision,
+                    "averageForwardReturn": avg_return,
+                }
+            )
+
+        return {"available": True, "regimeColumn": regime_column, "rows": rows[:8]}
+
     def run(self) -> Dict[str, Any]:
         """
         Compare multiple model types and save side-by-side outputs.
@@ -1625,6 +1776,30 @@ class ModelComparisonApp(TrainingApp):
                 feature_importance_path=output_paths["featureImportancePath"],
             )
 
+            backtest_summary = EqualWeightSignalBacktester(self.config).run(prediction_df)["summary"]
+            evaluation_metrics = {
+                "buyPrecision": self._build_buy_precision_metrics(prediction_df),
+                "forwardReturn": self._build_forward_return_metrics(prediction_df),
+                "promotionQuality": self._build_promotion_quality_metrics(prediction_df),
+                "confidenceBuckets": self._build_confidence_bucket_metrics(prediction_df),
+                "regimePerformance": self._build_regime_metrics(prediction_df),
+                "backtestSummary": backtest_summary,
+            }
+
+            walk_forward_summary = None
+            if self.config.comparison_run_walk_forward:
+                walk_forward_app = WalkForwardValidationApp(
+                    config=training_result["config"],
+                    dataset_builder=self.dataset_builder,
+                )
+                walk_forward_result = walk_forward_app._run_walk_forward_validation(
+                    dataset=dataset,
+                    feature_columns=feature_columns,
+                    validation_config=training_result["config"],
+                    backtester=EqualWeightSignalBacktester(training_result["config"]),
+                )
+                walk_forward_summary = walk_forward_result["summary"]
+
             comparison_row = {
                 "modelType": model.model_type,
                 "accuracy": metrics["accuracy"],
@@ -1638,6 +1813,8 @@ class ModelComparisonApp(TrainingApp):
                 {
                     **comparison_row,
                     **saved_artifact_paths,
+                    "evaluation": evaluation_metrics,
+                    "walkForwardSummary": walk_forward_summary,
                 }
             )
 
@@ -1943,6 +2120,7 @@ class SignalGenerationApp(BaseSignalApp):
         )
         coordinator = SignalGenerationCoordinator(
             inference_stage=inference_stage,
+            context_stage=SignalContextEnrichmentStage(self.config),
             enrichment_stage=SignalEnrichmentStage(self.config),
             decision_stage=decision_stage,
             publication_stage=publication_stage,

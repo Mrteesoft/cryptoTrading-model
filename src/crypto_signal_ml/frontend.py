@@ -223,6 +223,7 @@ def build_watchlist_pool_snapshot(
                 "decisionScore": float(brain.get("decisionScore", 0.0) or 0.0),
                 "summaryLine": str(brain.get("summaryLine", signal_summary.get("reasonSummary", "")) or ""),
                 "reasonSummary": str(signal_summary.get("reasonSummary", "") or ""),
+                "watchlistStage": str(brain.get("watchlistStage", "") or ""),
                 "marketStance": str(brain.get("marketStance", market_context.get("marketStance", "")) or ""),
                 "macroRiskMode": str(
                     brain.get(

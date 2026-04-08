@@ -97,6 +97,23 @@ Run these from the repo root.
 - Run walk-forward validation: `python model-service/scripts/runWalkForwardValidation.py`
 - Tune labeling and confidence settings: `python model-service/scripts/tuneSignalParameters.py`
 
+#### Model Families and When to Use Them
+
+Model selection is configuration-driven. The trading engine stays authoritative; model families only change inference.
+
+- Baseline (current default): scikit-learn classifiers tuned for stable, explainable tabular signals.
+- LightGBM classifier: primary challenger for stronger non-linear tabular performance.
+- LightGBM ranker: ranking-only mode for opportunity ordering, not default signal inference.
+- XGBoost classifier: alternative ensemble benchmark against LightGBM.
+- River online model: incremental updates, watchlist progression scoring, and drift-aware experimentation.
+- TFT (PyTorch Forecasting): experimental sequence modeling; only enable when explicitly configured.
+
+Config switches to focus on:
+
+- `SIGNAL_MODEL_FAMILY` (e.g., `baseline_current`, `lightgbm`, `xgboost`, `river`, `tft`)
+- `SIGNAL_MODEL_VARIANT` (e.g., `classifier`, `ranker`, `online_scorer`, `sequence`)
+- `ENABLE_TFT_EXPERIMENTS` to gate TFT usage
+
 ### Signal Publishing
 
 - Generate signal files from the latest data and model artifact: `python model-service/scripts/generateSignals.py`
@@ -188,6 +205,8 @@ Restart the Python process after editing `.env` so a fresh `TrainingConfig` is l
 - If signal generation starts slowly on a fresh setup, the service may be refreshing market data and building the first published snapshot before the API becomes fully useful.
 - If PostgreSQL is not configured, inspect the SQLite files under `outputs/` first when debugging assistant, portfolio, or RAG persistence.#   c r y p t o T r a d i n g - m o d e l  
  #   c r y p t o T r a d i n g - m o d e l  
+ 
+#   c r y p t o T r a d i n g - m o d e l  
  
 #   c r y p t o T r a d i n g - m o d e l  
  

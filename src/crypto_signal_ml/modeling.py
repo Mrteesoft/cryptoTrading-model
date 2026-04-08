@@ -340,6 +340,43 @@ class BaseSignalModel(ABC):
 
         return usable_rows
 
+    def predict_proba(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """Return per-class probabilities for a feature frame."""
+
+        self._validate_trained_model()
+        usable_rows = feature_df.dropna(subset=self.feature_columns).copy()
+        probabilities = self.estimator.predict_proba(usable_rows[self.feature_columns])
+        output_df = self._add_probability_columns(
+            base_df=usable_rows,
+            class_labels=list(self.estimator.classes_),
+            probability_values=probabilities,
+        )
+        output_df["confidence"] = output_df[["prob_take_profit", "prob_hold", "prob_buy"]].max(axis=1)
+        return output_df
+
+    def rank(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Return a ranking score for a feature frame.
+
+        The default implementation ranks by BUY probability.
+        """
+
+        proba_df = self.predict_proba(feature_df)
+        ranked = proba_df.copy()
+        ranked["rank_score"] = ranked["prob_buy"]
+        return ranked
+
+    def metadata(self) -> Dict[str, Any]:
+        """Return a compact metadata payload describing this model."""
+
+        return {
+            "modelType": self.model_type,
+            "featureCount": len(self.feature_columns),
+            "featurePreview": list(self.feature_columns[:10]),
+            "supportsRank": True,
+            "supportsProba": True,
+        }
+
     def get_feature_importance(self) -> Dict[str, float]:
         """
         Return feature importance in descending order when the estimator supports it.
@@ -706,7 +743,11 @@ def create_model_from_config(
     which keeps model selection DRY and centralized.
     """
 
-    model_class = get_model_class(config.model_type)
+    from .ml.models.registry import ensure_registry_loaded, resolve_model_type
+
+    ensure_registry_loaded()
+    resolved_model_type = resolve_model_type(config)
+    model_class = get_model_class(resolved_model_type)
     return model_class(config=config, feature_columns=feature_columns)
 
 

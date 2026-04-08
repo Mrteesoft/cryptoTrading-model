@@ -18,6 +18,8 @@ __all__ = [
     "RegimeWalkForwardValidationApp",
     "SignalDecisionArtifacts",
     "SignalDecisionStage",
+    "SignalContextEnrichmentArtifacts",
+    "SignalContextEnrichmentStage",
     "SignalEnrichmentArtifacts",
     "SignalEnrichmentStage",
     "SignalGenerationApp",
@@ -99,6 +101,18 @@ def __getattr__(name: str) -> Any:
         exported_values = {
             "SignalEnrichmentArtifacts": SignalEnrichmentArtifacts,
             "SignalEnrichmentStage": SignalEnrichmentStage,
+        }
+        return exported_values[name]
+
+    if name in {"SignalContextEnrichmentArtifacts", "SignalContextEnrichmentStage"}:
+        from .signal_context_enrichment import (
+            SignalContextEnrichmentArtifacts,
+            SignalContextEnrichmentStage,
+        )
+
+        exported_values = {
+            "SignalContextEnrichmentArtifacts": SignalContextEnrichmentArtifacts,
+            "SignalContextEnrichmentStage": SignalContextEnrichmentStage,
         }
         return exported_values[name]
 

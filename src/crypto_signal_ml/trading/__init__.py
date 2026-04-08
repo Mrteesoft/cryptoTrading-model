@@ -14,9 +14,11 @@ from .signals import (
 )
 from .symbols import is_signal_eligible_base_currency, normalize_base_currency
 from .trader_brain import TraderBrain
+from .watchlist_state import WatchlistStateStore
 
 __all__ = [
     "TraderBrain",
+    "WatchlistStateStore",
     "TradingDecisionDeliberator",
     "TradingPortfolioStore",
     "TradingSignalStore",

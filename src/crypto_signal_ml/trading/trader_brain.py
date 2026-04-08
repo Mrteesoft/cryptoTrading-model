@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Sequence
 
 from ..config import TrainingConfig
 from .decision_intelligence import TradingDecisionDeliberator
+from .watchlist_state import WatchlistStateStore
 
 
 UPTREND_LABELS = {"trend_up", "trend_up_high_volatility"}
@@ -170,6 +171,7 @@ class TraderBrain:
         exits = []
         holds = []
 
+        watchlist_store = WatchlistStateStore(self.config)
         for signal_summary in copied_signals:
             preliminary_row = self._build_preliminary_signal_plan(
                 signal_summary=signal_summary,
@@ -180,6 +182,7 @@ class TraderBrain:
                     (trade_memory_by_product or {}).get(str(signal_summary.get("productId", "")).upper())
                     or {}
                 ),
+                watchlist_store=watchlist_store,
             )
             preliminary_rows.append(preliminary_row)
 
@@ -279,6 +282,8 @@ class TraderBrain:
                 )
             ),
         }
+
+        watchlist_store.save()
 
         return {
             "version": "trader-brain-v1",
@@ -480,12 +485,15 @@ class TraderBrain:
         market_context: Mapping[str, Any],
         capital: float | None,
         trade_memory: Mapping[str, Any] | None = None,
+        watchlist_store: WatchlistStateStore | None = None,
     ) -> Dict[str, Any]:
         """Build a preliminary action for one signal before portfolio allocation."""
 
         enriched_signal = dict(signal_summary)
         market_state = signal_summary.get("marketState") or {}
         event_context = signal_summary.get("eventContext") or {}
+        news_context = signal_summary.get("newsContext") or {}
+        trend_context = signal_summary.get("trendContext") or {}
         product_id = str(signal_summary.get("productId", signal_summary.get("pairSymbol", ""))).upper()
         signal_name = str(signal_summary.get("signal_name", "HOLD")).upper()
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).lower()
@@ -497,6 +505,12 @@ class TraderBrain:
         regime_label = str(market_state.get("label", "unknown")).strip().lower()
         is_high_volatility = _safe_bool(market_state, "isHighVolatility")
         has_event_next_7d = _safe_bool(event_context, "hasEventNext7d")
+        event_window_active = _safe_bool(event_context, "eventWindowActive")
+        post_event_cooldown_active = _safe_bool(event_context, "postEventCooldownActive")
+        macro_event_risk = _safe_bool(event_context, "macroEventRiskFlag")
+        news_sentiment = _safe_float(news_context, "newsSentiment1h")
+        news_relevance = _safe_float(news_context, "newsRelevanceScore")
+        trend_score = _safe_float(trend_context, "topicTrendScore")
         macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
 
         decision_score = self._build_decision_score(
@@ -511,6 +525,34 @@ class TraderBrain:
             is_high_volatility=is_high_volatility,
             has_event_next_7d=has_event_next_7d,
         )
+
+        positive_news = (
+            news_relevance > 0
+            and news_sentiment >= float(self.config.news_positive_sentiment_threshold)
+        )
+        negative_news = (
+            news_relevance > 0
+            and news_sentiment <= float(self.config.news_negative_sentiment_threshold)
+        )
+        trend_supportive = trend_score >= float(self.config.trend_support_threshold)
+
+        if event_window_active or macro_event_risk:
+            decision_score -= float(self.config.event_risk_decision_penalty)
+        if positive_news or trend_supportive:
+            decision_score += float(self.config.news_positive_decision_boost)
+        if negative_news:
+            decision_score -= float(self.config.news_negative_decision_penalty)
+        decision_score = _clamp(decision_score, 0.0, 1.25)
+
+        watchlist_state = None
+        watchlist_promotion = None
+        if watchlist_store is not None and position is None:
+            watchlist_state, watchlist_promotion = watchlist_store.update_from_signal(
+                signal_summary=enriched_signal,
+                decision_score=decision_score,
+                market_context=dict(market_context),
+            )
+            enriched_signal["watchlistState"] = dict(watchlist_state)
 
         desired_position_fraction = 0.0
         allocation_fraction = 0.0
@@ -532,6 +574,16 @@ class TraderBrain:
             and position_unrealized_return >= float(self.config.brain_profit_lock_threshold)
         )
 
+        additional_hold_reason = None
+        if event_window_active or macro_event_risk:
+            additional_hold_reason = "blocked_by_event_risk"
+        elif post_event_cooldown_active:
+            additional_hold_reason = "await_post_event_confirmation"
+        elif negative_news:
+            additional_hold_reason = "negative_news_conflict"
+        elif positive_news or trend_supportive:
+            additional_hold_reason = "supported_by_positive_news"
+
         if position is None:
             if signal_name == "BUY":
                 if not self.config.brain_enabled:
@@ -543,6 +595,15 @@ class TraderBrain:
                 elif str(market_context["marketStance"]) == "defensive" and trade_readiness != "high":
                     proposed_decision = "watchlist"
                     reasons.append("The wider market posture is defensive, so only the strongest long setups can open.")
+                elif event_window_active or macro_event_risk or post_event_cooldown_active or negative_news:
+                    proposed_decision = "watchlist"
+                    reasons.append("The setup is attractive but needs to wait for cleaner event or news context.")
+                    if event_window_active or macro_event_risk:
+                        reasons.append("Upcoming event risk is too close for a fresh entry.")
+                    if post_event_cooldown_active:
+                        reasons.append("Waiting for post-event confirmation before opening risk.")
+                    if negative_news:
+                        reasons.append("Coin-specific news tone is negative, so fresh entries are paused.")
                 else:
                     proposed_decision = "enter_long_candidate"
                     desired_position_fraction = self._build_position_fraction(
@@ -557,6 +618,8 @@ class TraderBrain:
                         has_event_next_7d=has_event_next_7d,
                     )
                     reasons.append("The setup qualifies as a fresh long candidate under the current market posture.")
+                    if positive_news or trend_supportive:
+                        reasons.append("News or trend context is supportive for follow-through.")
             elif signal_name == "LOSS":
                 proposed_decision = "avoid_long"
                 reasons.append("The lifecycle signal is in loss-cut mode, so the system should avoid fresh long risk.")
@@ -566,6 +629,21 @@ class TraderBrain:
             else:
                 proposed_decision = "watchlist"
                 reasons.append("The setup stays on the watchlist until a stronger directional edge appears.")
+
+            if (
+                proposed_decision == "watchlist"
+                and watchlist_promotion is not None
+                and watchlist_promotion.promotion_ready
+                and signal_name not in {"LOSS", "TAKE_PROFIT"}
+            ):
+                proposed_decision = "enter_long_candidate"
+                reasons.append(
+                    "Watchlist setup matured with improving confidence and decision strength, so it is promoted to an entry candidate."
+                )
+            elif watchlist_promotion is not None and watchlist_promotion.blocked_reason:
+                reasons.append(
+                    "Watchlist setup is progressing, but promotion is blocked by the current regime or risk posture."
+                )
         else:
             if signal_name == "LOSS":
                 proposed_decision = "exit_position"
@@ -654,6 +732,12 @@ class TraderBrain:
             reasons.append("High volatility argues for smaller size and faster risk control.")
         if has_event_next_7d:
             reasons.append("Upcoming event risk reduces the quality of a fresh entry.")
+        if event_window_active or macro_event_risk:
+            reasons.append("The next high-impact event is too close to justify new risk.")
+        if negative_news:
+            reasons.append("News sentiment around this coin is negative, reducing conviction.")
+        if positive_news or trend_supportive:
+            reasons.append("Recent news flow is supportive, improving setup confidence.")
 
         stop_loss_pct, take_profit_pct = self._build_exit_levels(
             signal_name=signal_name,
@@ -738,6 +822,12 @@ class TraderBrain:
             "reasons": reasons[:4],
             "reasonSummary": reasons[0],
             "summaryLine": reasons[0],
+            "watchlistStage": watchlist_state.get("stage") if watchlist_state is not None else None,
+            "holdReason": (
+                watchlist_promotion.hold_reason
+                if watchlist_promotion is not None and watchlist_promotion.hold_reason
+                else additional_hold_reason
+            ),
             "position": position.to_dict() if position is not None else None,
             "evidence": deliberation["evidence"],
             "decisionMemo": decision_memo,

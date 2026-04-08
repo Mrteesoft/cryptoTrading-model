@@ -246,6 +246,39 @@ class TrainingConfig:
     signal_watchlist_pool_enabled: bool = _env_bool("SIGNAL_WATCHLIST_POOL_ENABLED", True)
     signal_watchlist_pool_max_products: int = _env_optional_int("SIGNAL_WATCHLIST_POOL_MAX_PRODUCTS", 12) or 12
     signal_watchlist_pool_path: Path = OUTPUTS_DIR / "watchlistPool.json"
+    signal_watchlist_state_path: Path = OUTPUTS_DIR / "watchlistState.json"
+    signal_watchlist_history_max: int = _env_optional_int("SIGNAL_WATCHLIST_HISTORY_MAX", 6) or 6
+    signal_watchlist_breakout_pct: float = _env_float("SIGNAL_WATCHLIST_BREAKOUT_PCT", 0.01)
+    signal_watchlist_invalidation_pct: float = _env_float("SIGNAL_WATCHLIST_INVALIDATION_PCT", 0.02)
+    signal_watchlist_invalidation_confidence: float = _env_float("SIGNAL_WATCHLIST_INVALIDATION_CONFIDENCE", 0.25)
+    signal_watchlist_promotion_min_confidence: float = _env_float(
+        "SIGNAL_WATCHLIST_PROMOTION_MIN_CONFIDENCE",
+        0.58,
+    )
+    signal_watchlist_promotion_min_decision_score: float = _env_float(
+        "SIGNAL_WATCHLIST_PROMOTION_MIN_DECISION_SCORE",
+        0.55,
+    )
+    signal_watchlist_promotion_min_confidence_gain: float = _env_float(
+        "SIGNAL_WATCHLIST_PROMOTION_MIN_CONFIDENCE_GAIN",
+        0.05,
+    )
+    signal_watchlist_promotion_min_decision_score_gain: float = _env_float(
+        "SIGNAL_WATCHLIST_PROMOTION_MIN_DECISION_SCORE_GAIN",
+        0.08,
+    )
+    signal_watchlist_promotion_min_positive_checks: int = _env_optional_int(
+        "SIGNAL_WATCHLIST_PROMOTION_MIN_POSITIVE_CHECKS",
+        2,
+    ) or 2
+    signal_watchlist_entry_ready_min_confidence: float = _env_float(
+        "SIGNAL_WATCHLIST_ENTRY_READY_MIN_CONFIDENCE",
+        0.62,
+    )
+    signal_watchlist_entry_ready_min_decision_score: float = _env_float(
+        "SIGNAL_WATCHLIST_ENTRY_READY_MIN_DECISION_SCORE",
+        0.62,
+    )
     signal_track_generated_trades: bool = _env_bool("SIGNAL_TRACK_GENERATED_TRADES", False)
     signal_generated_trade_status: str = _env_str("SIGNAL_GENERATED_TRADE_STATUS", "planned")
     live_watchlist_pool_cache_seconds: int = _env_optional_int("LIVE_WATCHLIST_POOL_CACHE_SECONDS", 15) or 15
@@ -272,6 +305,16 @@ class TrainingConfig:
     rag_fetch_timeout_seconds: float = 15.0
     rag_fetch_max_chars: int = 50000
     rag_search_limit: int = 6
+    news_store_path: Path = OUTPUTS_DIR / "newsFeed.json"
+    event_window_minutes: float = _env_float("EVENT_WINDOW_MINUTES", 360.0)
+    event_post_window_minutes: float = _env_float("EVENT_POST_WINDOW_MINUTES", 240.0)
+    event_high_impact_threshold: float = _env_float("EVENT_HIGH_IMPACT_THRESHOLD", 0.65)
+    event_risk_decision_penalty: float = _env_float("EVENT_RISK_DECISION_PENALTY", 0.08)
+    news_positive_sentiment_threshold: float = _env_float("NEWS_POSITIVE_SENTIMENT_THRESHOLD", 0.20)
+    news_negative_sentiment_threshold: float = _env_float("NEWS_NEGATIVE_SENTIMENT_THRESHOLD", -0.20)
+    news_positive_decision_boost: float = _env_float("NEWS_POSITIVE_DECISION_BOOST", 0.04)
+    news_negative_decision_penalty: float = _env_float("NEWS_NEGATIVE_DECISION_PENALTY", 0.08)
+    trend_support_threshold: float = _env_float("TREND_SUPPORT_THRESHOLD", 0.35)
     signal_excluded_base_currencies: Tuple[str, ...] = field(
         default_factory=lambda: _env_csv_tuple(
             "SIGNAL_EXCLUDED_BASE_CURRENCIES",
@@ -283,11 +326,19 @@ class TrainingConfig:
     regime_trend_strength_threshold: float = 0.0125
     regime_high_volatility_ratio_threshold: float = 1.20
     regime_low_volatility_ratio_threshold: float = 0.85
+    signal_model_family: str = _env_str("SIGNAL_MODEL_FAMILY", "baseline_current")
+    signal_model_variant: str = _env_str("SIGNAL_MODEL_VARIANT", "default")
+    enable_online_drift_detection: bool = _env_bool("ENABLE_ONLINE_DRIFT_DETECTION", False)
+    enable_watchlist_progression_model: bool = _env_bool("ENABLE_WATCHLIST_PROGRESSION_MODEL", False)
+    enable_tft_experiments: bool = _env_bool("ENABLE_TFT_EXPERIMENTS", False)
+    comparison_run_walk_forward: bool = _env_bool("COMPARISON_RUN_WALK_FORWARD", False)
     model_type: str = "histGradientBoostingSignalModel"
     comparison_model_types: Tuple[str, ...] = (
         "histGradientBoostingSignalModel",
         "randomForestSignalModel",
         "logisticRegressionSignalModel",
+        "lightgbmClassifierSignalModel",
+        "xgboostClassifierSignalModel",
     )
     train_size: float = 0.80
     walkforward_min_train_size: float = 0.50
@@ -315,6 +366,25 @@ class TrainingConfig:
     hist_gradient_max_depth: int = 6
     hist_gradient_min_samples_leaf: int = 20
     hist_gradient_l2_regularization: float = 0.0
+    lightgbm_n_estimators: int = 400
+    lightgbm_learning_rate: float = 0.05
+    lightgbm_num_leaves: int = 31
+    lightgbm_max_depth: int = -1
+    lightgbm_min_child_samples: int = 20
+    lightgbm_subsample: float = 0.90
+    lightgbm_colsample_bytree: float = 0.90
+    xgboost_n_estimators: int = 400
+    xgboost_learning_rate: float = 0.05
+    xgboost_max_depth: int = 6
+    xgboost_min_child_weight: float = 1.0
+    xgboost_subsample: float = 0.90
+    xgboost_colsample_bytree: float = 0.90
+    xgboost_gamma: float = 0.0
+    tft_max_epochs: int = 25
+    tft_hidden_size: int = 16
+    tft_attention_head_size: int = 4
+    tft_dropout: float = 0.10
+    tft_hidden_continuous_size: int = 8
     random_state: int = 42
     backtest_initial_capital: float = 10000.0
     backtest_trading_fee_rate: float = 0.001

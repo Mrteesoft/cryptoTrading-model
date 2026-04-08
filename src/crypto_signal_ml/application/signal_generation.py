@@ -7,6 +7,7 @@ from typing import Any
 
 from ..frontend import build_frontend_signal_snapshot
 from ..trading.portfolio import TradingPortfolioStore
+from .signal_context_enrichment import SignalContextEnrichmentArtifacts, SignalContextEnrichmentStage
 from .signal_decision import SignalDecisionArtifacts
 from .signal_enrichment import SignalEnrichmentArtifacts, SignalEnrichmentStage
 from .signal_inference import SignalInferenceArtifacts, SignalInferenceStage
@@ -18,6 +19,7 @@ class SignalPipelineArtifacts:
     """End-to-end signal lifecycle outputs before publication."""
 
     inference: SignalInferenceArtifacts
+    context: SignalContextEnrichmentArtifacts | None
     enrichment: SignalEnrichmentArtifacts
     decision: SignalDecisionArtifacts
 
@@ -29,11 +31,13 @@ class SignalGenerationCoordinator:
         self,
         *,
         inference_stage: SignalInferenceStage,
+        context_stage: SignalContextEnrichmentStage | None = None,
         enrichment_stage: SignalEnrichmentStage,
         decision_stage,
         publication_stage: SignalPublicationStage | None = None,
     ) -> None:
         self.inference_stage = inference_stage
+        self.context_stage = context_stage
         self.enrichment_stage = enrichment_stage
         self.decision_stage = decision_stage
         self.publication_stage = publication_stage
@@ -47,16 +51,20 @@ class SignalGenerationCoordinator:
     ) -> SignalPipelineArtifacts:
         """Run enrichment and decision stages for one inference result."""
 
-        enrichment_artifacts = self.enrichment_stage.enrich(
-            inference_artifacts.signal_candidates,
-            portfolio_store,
-        )
+        context_artifacts = None
+        enriched_candidates = inference_artifacts.signal_candidates
+        if self.context_stage is not None:
+            context_artifacts = self.context_stage.enrich(inference_artifacts.signal_candidates)
+            enriched_candidates = context_artifacts.signal_summaries
+
+        enrichment_artifacts = self.enrichment_stage.enrich(enriched_candidates, portfolio_store)
         if save_watchlist_pool_snapshot and self.publication_stage is not None:
             self.publication_stage.save_watchlist_pool_snapshot(enrichment_artifacts.signal_summaries)
 
         decision_artifacts = self.decision_stage.decide(enrichment_artifacts.signal_summaries)
         return SignalPipelineArtifacts(
             inference=inference_artifacts,
+            context=context_artifacts,
             enrichment=enrichment_artifacts,
             decision=decision_artifacts,
         )
