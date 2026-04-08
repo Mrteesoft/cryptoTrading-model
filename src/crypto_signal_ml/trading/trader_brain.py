@@ -494,6 +494,7 @@ class TraderBrain:
         event_context = signal_summary.get("eventContext") or {}
         news_context = signal_summary.get("newsContext") or {}
         trend_context = signal_summary.get("trendContext") or {}
+        chart_context = signal_summary.get("chartContext") or {}
         product_id = str(signal_summary.get("productId", signal_summary.get("pairSymbol", ""))).upper()
         signal_name = str(signal_summary.get("signal_name", "HOLD")).upper()
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).lower()
@@ -511,6 +512,11 @@ class TraderBrain:
         news_sentiment = _safe_float(news_context, "newsSentiment1h")
         news_relevance = _safe_float(news_context, "newsRelevanceScore")
         trend_score = _safe_float(trend_context, "topicTrendScore")
+        breakout_confirmed = _safe_bool(chart_context, "breakoutConfirmed")
+        retest_hold_confirmed = _safe_bool(chart_context, "retestHoldConfirmed")
+        near_resistance = _safe_bool(chart_context, "nearResistance")
+        structure_label = str(chart_context.get("structureLabel", "")).lower()
+        weak_structure = structure_label in {"lower_highs", "lower_lows", "downtrend"}
         macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
 
         decision_score = self._build_decision_score(
@@ -542,6 +548,10 @@ class TraderBrain:
             decision_score += float(self.config.news_positive_decision_boost)
         if negative_news:
             decision_score -= float(self.config.news_negative_decision_penalty)
+        if breakout_confirmed or retest_hold_confirmed or structure_label in {"higher_highs", "higher_lows"}:
+            decision_score += float(self.config.chart_positive_decision_boost)
+        if near_resistance or weak_structure:
+            decision_score -= float(self.config.chart_negative_decision_penalty)
         decision_score = _clamp(decision_score, 0.0, 1.25)
 
         watchlist_state = None
@@ -581,6 +591,10 @@ class TraderBrain:
             additional_hold_reason = "await_post_event_confirmation"
         elif negative_news:
             additional_hold_reason = "negative_news_conflict"
+        elif near_resistance:
+            additional_hold_reason = "near_resistance"
+        elif weak_structure:
+            additional_hold_reason = "weak_chart_structure"
         elif positive_news or trend_supportive:
             additional_hold_reason = "supported_by_positive_news"
 
@@ -604,6 +618,13 @@ class TraderBrain:
                         reasons.append("Waiting for post-event confirmation before opening risk.")
                     if negative_news:
                         reasons.append("Coin-specific news tone is negative, so fresh entries are paused.")
+                elif near_resistance or weak_structure:
+                    proposed_decision = "watchlist"
+                    reasons.append("Chart structure is not strong enough for a fresh breakout entry.")
+                    if near_resistance:
+                        reasons.append("Price is pressing into resistance, so the setup needs a cleaner breakout.")
+                    if weak_structure:
+                        reasons.append("Structure remains weak, so the system waits for higher-high confirmation.")
                 else:
                     proposed_decision = "enter_long_candidate"
                     desired_position_fraction = self._build_position_fraction(
@@ -620,6 +641,8 @@ class TraderBrain:
                     reasons.append("The setup qualifies as a fresh long candidate under the current market posture.")
                     if positive_news or trend_supportive:
                         reasons.append("News or trend context is supportive for follow-through.")
+                    if breakout_confirmed or retest_hold_confirmed:
+                        reasons.append("Chart structure confirms a breakout/retest, accelerating entry readiness.")
             elif signal_name == "LOSS":
                 proposed_decision = "avoid_long"
                 reasons.append("The lifecycle signal is in loss-cut mode, so the system should avoid fresh long risk.")
@@ -738,6 +761,12 @@ class TraderBrain:
             reasons.append("News sentiment around this coin is negative, reducing conviction.")
         if positive_news or trend_supportive:
             reasons.append("Recent news flow is supportive, improving setup confidence.")
+        if near_resistance:
+            reasons.append("Price is too close to resistance, so the chart needs a clearer breakout.")
+        if weak_structure:
+            reasons.append("Chart structure is weak, which reduces confidence in follow-through.")
+        if breakout_confirmed or retest_hold_confirmed:
+            reasons.append("Chart structure confirms a breakout/retest hold that supports the entry thesis.")
 
         stop_loss_pct, take_profit_pct = self._build_exit_levels(
             signal_name=signal_name,

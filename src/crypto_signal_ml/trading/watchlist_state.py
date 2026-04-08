@@ -103,6 +103,7 @@ class WatchlistStateStore:
         event_context = signal_summary.get("eventContext") or {}
         news_context = signal_summary.get("newsContext") or {}
         trend_context = signal_summary.get("trendContext") or {}
+        chart_context = signal_summary.get("chartContext") or {}
         event_window_active = bool(event_context.get("eventWindowActive", False))
         post_event_cooldown_active = bool(event_context.get("postEventCooldownActive", False))
         event_risk_flag = bool(event_context.get("macroEventRiskFlag", False))
@@ -112,6 +113,11 @@ class WatchlistStateStore:
         positive_trend = float(trend_context.get("topicTrendScore", 0.0) or 0.0) >= float(
             self.config.trend_support_threshold
         )
+        breakout_confirmed = bool(chart_context.get("breakoutConfirmed", False))
+        retest_hold_confirmed = bool(chart_context.get("retestHoldConfirmed", False))
+        near_resistance = bool(chart_context.get("nearResistance", False))
+        structure_label = str(chart_context.get("structureLabel", "")).lower()
+        weak_structure = structure_label in {"lower_highs", "lower_lows", "downtrend"}
 
         if not state:
             trigger_pct = float(self.config.signal_watchlist_breakout_pct)
@@ -212,7 +218,11 @@ class WatchlistStateStore:
                 stage = "setup_building"
             if (
                 stage in {"setup_building", "watchlist"}
-                and state.get("consecutivePositiveChecks", 0) >= min_positive_checks
+                and (
+                    state.get("consecutivePositiveChecks", 0) >= min_positive_checks
+                    or breakout_confirmed
+                    or retest_hold_confirmed
+                )
                 and confidence_delta >= min_conf_gain
                 and decision_delta >= min_decision_gain
             ):
@@ -222,6 +232,8 @@ class WatchlistStateStore:
                 if close_price is not None and trigger_price is not None and close_price >= trigger_price:
                     stage = "entry_ready"
                 elif breakout_pct <= 0 and positive_check:
+                    stage = "entry_ready"
+                elif breakout_confirmed or retest_hold_confirmed:
                     stage = "entry_ready"
 
         state["stage"] = stage
@@ -234,6 +246,10 @@ class WatchlistStateStore:
             blocked_reason = "blocked_by_risk"
         elif event_window_active or event_risk_flag:
             blocked_reason = "blocked_by_event_risk"
+        elif near_resistance:
+            blocked_reason = "near_resistance"
+        elif weak_structure:
+            blocked_reason = "weak_chart_structure"
         elif market_stance == "defensive" or macro_risk_mode == "risk_off":
             blocked_reason = "blocked_by_regime"
         elif negative_news:
@@ -251,7 +267,9 @@ class WatchlistStateStore:
         if stage in {"watchlist", "setup_building"}:
             hold_reason = "wait_for_setup_building"
         elif stage == "setup_confirmed":
-            hold_reason = "wait_for_breakout"
+            hold_reason = "wait_for_breakout_confirmation"
+            if retest_hold_confirmed:
+                hold_reason = "wait_for_retest_hold"
         elif stage == "entry_ready" and post_event_cooldown_active:
             hold_reason = "await_post_event_confirmation"
         elif stage == "entry_ready" and blocked_reason is not None:

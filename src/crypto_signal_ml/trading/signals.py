@@ -4,6 +4,8 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from ..chart import build_chart_context, render_chart_snapshot
+
 from ..config import TrainingConfig
 from .policy import evaluate_trading_decision
 from .symbols import is_signal_eligible_base_currency, normalize_base_currency
@@ -814,6 +816,7 @@ def _row_to_signal_summary(
     signal_row: pd.Series,
     minimum_action_confidence: float = 0.0,
     config: TrainingConfig | None = None,
+    chart_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Convert one prediction row into a JSON-friendly signal dictionary."""
 
@@ -850,6 +853,18 @@ def _row_to_signal_summary(
     spot_action = str(decision["spotAction"])
     model_spot_action = SIGNAL_TO_ACTION.get(raw_signal_name, "wait")
 
+    base_chart_context = {
+        "breakoutUp20": _safe_float(signal_row, "breakout_up_20"),
+        "breakoutDown20": _safe_float(signal_row, "breakout_down_20"),
+        "rangePosition20": _safe_float(signal_row, "range_position_20"),
+        "closeVsEma5": _safe_float(signal_row, "close_vs_ema_5"),
+        "relativeStrength1": _safe_float(signal_row, "relative_strength_1"),
+        "relativeStrength5": _safe_float(signal_row, "relative_strength_5"),
+        "rsi14": _safe_float(signal_row, "rsi_14"),
+    }
+    if chart_context:
+        base_chart_context.update(chart_context)
+
     summary = {
         "time_step": int(signal_row["time_step"]),
         "close": float(signal_row["close"]),
@@ -883,15 +898,7 @@ def _row_to_signal_summary(
         "reasonItems": reason_items,
         "reasonSummary": reason_items[0],
         "signalChat": _build_signal_chat(signal_row, reason_items, signal_name=signal_name),
-        "chartContext": {
-            "breakoutUp20": _safe_float(signal_row, "breakout_up_20"),
-            "breakoutDown20": _safe_float(signal_row, "breakout_down_20"),
-            "rangePosition20": _safe_float(signal_row, "range_position_20"),
-            "closeVsEma5": _safe_float(signal_row, "close_vs_ema_5"),
-            "relativeStrength1": _safe_float(signal_row, "relative_strength_1"),
-            "relativeStrength5": _safe_float(signal_row, "relative_strength_5"),
-            "rsi14": _safe_float(signal_row, "rsi_14"),
-        },
+        "chartContext": base_chart_context,
         "marketContext": {
             "cmcPercentChange24h": _safe_float(signal_row, "cmc_percent_change_24h"),
             "cmcPercentChange7d": _safe_float(signal_row, "cmc_percent_change_7d"),
@@ -1002,14 +1009,27 @@ def build_latest_signal_summaries(
                 freshness_cutoff = freshest_timestamp - pd.Timedelta(hours=max_staleness_hours)
                 latest_rows = latest_rows.loc[latest_rows["timestamp"] >= freshness_cutoff].copy()
 
-    signal_summaries = [
-        _row_to_signal_summary(
-            signal_row=signal_row,
-            minimum_action_confidence=minimum_action_confidence,
-            config=config,
+    window_map: dict[str, pd.DataFrame] = {}
+    chart_context_by_product: dict[str, dict[str, Any]] = {}
+    if "product_id" in prediction_df.columns:
+        window_size = int(getattr(config, "chart_feature_window", 60) or 60) if config is not None else 60
+        for product_id, group in prediction_df.groupby("product_id"):
+            window_df = group.sort_values("timestamp").tail(window_size).copy()
+            window_map[str(product_id).upper()] = window_df
+            chart_context_by_product[str(product_id).upper()] = build_chart_context(window_df, config=config)
+
+    signal_summaries = []
+    for _, signal_row in latest_rows.iterrows():
+        product_id = str(signal_row.get("product_id", "")).strip().upper()
+        chart_context = chart_context_by_product.get(product_id)
+        signal_summaries.append(
+            _row_to_signal_summary(
+                signal_row=signal_row,
+                minimum_action_confidence=minimum_action_confidence,
+                config=config,
+                chart_context=chart_context,
+            )
         )
-        for _, signal_row in latest_rows.iterrows()
-    ]
     signal_summaries = [
         signal_summary
         for signal_summary in signal_summaries
@@ -1021,7 +1041,7 @@ def build_latest_signal_summaries(
     ]
     signal_summaries = filter_public_signal_summaries(signal_summaries)
 
-    return sorted(
+    sorted_summaries = sorted(
         signal_summaries,
         key=lambda signal_summary: (
             ACTION_PRIORITY.get(signal_summary.get("signal_name", "HOLD"), 99),
@@ -1032,6 +1052,46 @@ def build_latest_signal_summaries(
             str(signal_summary.get("productId", "")),
         ),
     )
+    if config is not None and bool(getattr(config, "chart_snapshot_enabled", False)):
+        _render_chart_snapshots(
+            sorted_summaries,
+            window_map=window_map,
+            config=config,
+        )
+
+    return sorted_summaries
+
+
+def _render_chart_snapshots(
+    signal_summaries: List[Dict[str, Any]],
+    *,
+    window_map: Dict[str, pd.DataFrame],
+    config: TrainingConfig,
+) -> None:
+    if not window_map:
+        return
+    max_signals = int(getattr(config, "chart_snapshot_max_signals", 6) or 6)
+    snapshot_dir = getattr(config, "chart_snapshot_dir", None)
+    if snapshot_dir is None:
+        return
+    snapshot_dir = snapshot_dir
+    for signal_summary in signal_summaries[:max_signals]:
+        product_id = str(signal_summary.get("productId", "")).strip().upper()
+        if not product_id or product_id not in window_map:
+            continue
+        window_df = window_map[product_id]
+        output_path = snapshot_dir / f"{product_id}.png"
+        try:
+            render_chart_snapshot(
+                window_df,
+                output_path=output_path,
+                title=f"{product_id} signal snapshot",
+            )
+            chart_context = signal_summary.get("chartContext") or {}
+            chart_context["chartSnapshotPath"] = str(output_path)
+            signal_summary["chartContext"] = chart_context
+        except Exception:
+            continue
 
 
 def build_actionable_signal_summaries(signal_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

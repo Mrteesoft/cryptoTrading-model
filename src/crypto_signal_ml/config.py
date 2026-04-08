@@ -315,6 +315,16 @@ class TrainingConfig:
     news_positive_decision_boost: float = _env_float("NEWS_POSITIVE_DECISION_BOOST", 0.04)
     news_negative_decision_penalty: float = _env_float("NEWS_NEGATIVE_DECISION_PENALTY", 0.08)
     trend_support_threshold: float = _env_float("TREND_SUPPORT_THRESHOLD", 0.35)
+    chart_feature_window: int = _env_optional_int("CHART_FEATURE_WINDOW", 60) or 60
+    chart_breakout_buffer_pct: float = _env_float("CHART_BREAKOUT_BUFFER_PCT", 0.005)
+    chart_retest_tolerance_pct: float = _env_float("CHART_RETEST_TOLERANCE_PCT", 0.003)
+    chart_near_resistance_pct: float = _env_float("CHART_NEAR_RESISTANCE_PCT", 0.01)
+    chart_positive_decision_boost: float = _env_float("CHART_POSITIVE_DECISION_BOOST", 0.05)
+    chart_negative_decision_penalty: float = _env_float("CHART_NEGATIVE_DECISION_PENALTY", 0.08)
+    chart_snapshot_enabled: bool = _env_bool("CHART_SNAPSHOT_ENABLED", False)
+    chart_snapshot_max_signals: int = _env_optional_int("CHART_SNAPSHOT_MAX_SIGNALS", 6) or 6
+    chart_snapshot_dir: Path = OUTPUTS_DIR / "chartSnapshots"
+    chart_eval_max_rows_total: int = _env_optional_int("CHART_EVAL_MAX_ROWS_TOTAL", 50000) or 50000
     signal_excluded_base_currencies: Tuple[str, ...] = field(
         default_factory=lambda: _env_csv_tuple(
             "SIGNAL_EXCLUDED_BASE_CURRENCIES",
