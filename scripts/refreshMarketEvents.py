@@ -6,7 +6,7 @@ from scriptSupport import bootstrap_src_path
 
 bootstrap_src_path()
 
-from crypto_signal_ml.app import MarketEventsRefreshApp  # noqa: E402
+from crypto_signal_ml.application import MarketEventsRefreshApp  # noqa: E402
 
 
 def main() -> None:

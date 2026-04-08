@@ -3,6 +3,7 @@
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -37,6 +38,7 @@ from .labels import create_labeler_from_config, create_regime_labeler_from_confi
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .trading.portfolio import TradingPortfolioStore
+from .trading.signal_store import TradingSignalStore
 from .regime_modeling import MarketRegimeModel
 from .trading.signals import (
     apply_signal_trade_context,
@@ -46,6 +48,9 @@ from .trading.signals import (
     select_primary_signal,
 )
 from .trading.trader_brain import TraderBrain
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BaseSignalApp:
@@ -1771,6 +1776,58 @@ class SignalGenerationApp(BaseSignalApp):
             Path(self.config.signal_watchlist_pool_path),
         )
 
+    def _build_signal_store(self) -> TradingSignalStore:
+        """Create the persistent live-signal store for current and historical rows."""
+
+        return TradingSignalStore(
+            db_path=self.config.signal_store_path,
+            database_url=self.config.signal_store_url,
+        )
+
+    def _log_live_signal_rows(self, signal_summaries: List[Dict[str, Any]]) -> None:
+        """Write one structured log line for every published live signal."""
+
+        for signal_summary in signal_summaries:
+            product_id = str(signal_summary.get("productId", "")).strip().upper() or str(
+                signal_summary.get("pairSymbol", "")
+            ).strip().upper()
+            LOGGER.info(
+                (
+                    "Live signal created: symbol=%s signal=%s action=%s confidence=%.4f "
+                    "timestamp=%s price=%.8f watchlistFallback=%s"
+                ),
+                product_id or str(signal_summary.get("symbol", "")).strip().upper() or "UNKNOWN",
+                str(signal_summary.get("signal_name", "UNKNOWN")).strip().upper(),
+                str(signal_summary.get("spotAction", "wait")).strip().lower(),
+                float(signal_summary.get("confidence", 0.0) or 0.0),
+                str(signal_summary.get("timestamp", "")).strip() or "unknown",
+                float(signal_summary.get("close", 0.0) or 0.0),
+                bool(signal_summary.get("watchlistFallback", False)),
+            )
+
+    def _persist_live_signal_store(
+        self,
+        latest_signals: List[Dict[str, Any]],
+        top_signal: Dict[str, Any] | None,
+        generated_at: str,
+    ) -> Dict[str, Any]:
+        """Persist the current live signal set to the database and log each row."""
+
+        signal_store = self._build_signal_store()
+        persistence_summary = signal_store.replace_current_signals(
+            signal_summaries=latest_signals,
+            primary_signal=top_signal,
+            generated_at=generated_at,
+        )
+        self._log_live_signal_rows(latest_signals)
+        LOGGER.info(
+            "Persisted %s live signal(s) to %s via %s.",
+            int(persistence_summary["signalCount"]),
+            persistence_summary["databaseTarget"],
+            persistence_summary["storageBackend"],
+        )
+        return persistence_summary
+
     def _build_fresh_signal_prediction_frame(self) -> tuple[pd.DataFrame, dict[str, Any]]:
         """Score a fresh top-market universe for the published signal snapshot."""
 
@@ -2109,6 +2166,19 @@ class SignalGenerationApp(BaseSignalApp):
         if not self._should_publish_watchlist_fallback():
             return None
 
+        ranked_candidates = self._rank_watchlist_fallback_candidates(signal_summaries)
+        if not ranked_candidates:
+            return None
+
+        return self._decorate_watchlist_fallback_signal(ranked_candidates[0])
+
+    def _rank_watchlist_fallback_candidates(
+        self,
+        signal_summaries: list[Dict[str, Any]],
+        excluded_product_ids: set[str] | None = None,
+    ) -> list[Dict[str, Any]]:
+        """Return the strongest watchlist candidates that are safe to surface publicly."""
+
         readiness_priority = {
             "high": 0,
             "medium": 1,
@@ -2121,9 +2191,18 @@ class SignalGenerationApp(BaseSignalApp):
         minimum_confidence = float(
             getattr(self.config, "signal_watchlist_min_confidence", 0.55) or 0.55
         )
+        excluded_product_ids = {
+            str(product_id).strip().upper()
+            for product_id in list(excluded_product_ids or set())
+            if str(product_id).strip()
+        }
         ranked_candidates: list[tuple[tuple[Any, ...], Dict[str, Any]]] = []
 
         for signal_summary in signal_summaries:
+            product_id = str(signal_summary.get("productId", "")).strip().upper()
+            if not product_id or product_id in excluded_product_ids:
+                continue
+
             brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
             if str(brain.get("decision", "")).strip().lower() != "watchlist":
                 continue
@@ -2155,16 +2234,21 @@ class SignalGenerationApp(BaseSignalApp):
                         -decision_score,
                         -float(signal_summary.get("policyScore", 0.0) or 0.0),
                         -confidence,
-                        str(signal_summary.get("productId", "")),
+                        product_id,
                     ),
                     dict(signal_summary),
                 )
             )
 
         if not ranked_candidates:
-            return None
+            return []
 
-        selected_signal = sorted(ranked_candidates, key=lambda item: item[0])[0][1]
+        return [candidate for _, candidate in sorted(ranked_candidates, key=lambda item: item[0])]
+
+    @staticmethod
+    def _decorate_watchlist_fallback_signal(selected_signal: Dict[str, Any]) -> Dict[str, Any]:
+        """Label one internal watchlist candidate as a public fallback row."""
+
         fallback_note = (
             "No actionable trade cleared the live gate recently, so this strongest watchlist candidate is surfaced instead."
         )
@@ -2193,6 +2277,41 @@ class SignalGenerationApp(BaseSignalApp):
         )
 
         return fallback_signal
+
+    def _supplement_published_signals_with_watchlist_candidates(
+        self,
+        published_signals: list[Dict[str, Any]],
+        signal_summaries: list[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        """Keep one primary public signal while backfilling a thin feed with watchlist ideas."""
+
+        minimum_published_signals = max(
+            int(getattr(self.config, "signal_watchlist_min_published_signals", 2) or 2),
+            1,
+        )
+        if len(published_signals) >= minimum_published_signals:
+            return list(published_signals)
+        if not published_signals:
+            return []
+
+        existing_product_ids = {
+            str(signal_summary.get("productId", "")).strip().upper()
+            for signal_summary in published_signals
+            if str(signal_summary.get("productId", "")).strip()
+        }
+        ranked_candidates = self._rank_watchlist_fallback_candidates(
+            signal_summaries,
+            excluded_product_ids=existing_product_ids,
+        )
+        if not ranked_candidates:
+            return list(published_signals)
+
+        supplemented_signals = list(published_signals)
+        remaining_slots = minimum_published_signals - len(supplemented_signals)
+        for candidate in ranked_candidates[:remaining_slots]:
+            supplemented_signals.append(self._decorate_watchlist_fallback_signal(candidate))
+
+        return supplemented_signals
 
     def run(self) -> Dict[str, Any]:
         """
@@ -2362,6 +2481,11 @@ class SignalGenerationApp(BaseSignalApp):
             )
             if watchlist_fallback_signal is not None:
                 latest_signals = [watchlist_fallback_signal]
+        else:
+            latest_signals = self._supplement_published_signals_with_watchlist_candidates(
+                published_signals=latest_signals,
+                signal_summaries=trader_brain_plan["signals"],
+            )
         actionable_signals = build_actionable_signal_summaries(latest_signals)
         prediction_timestamps = signal_prediction_df["timestamp"] if "timestamp" in signal_prediction_df.columns else None
         data_first_timestamp = (
@@ -2435,6 +2559,21 @@ class SignalGenerationApp(BaseSignalApp):
                 "signalInference": signal_inference_summary,
             }
         )
+        signal_store_summary = self._persist_live_signal_store(
+            latest_signals=latest_signals,
+            top_signal=top_signal,
+            generated_at=str(frontend_signal_snapshot.get("generatedAt") or datetime.now(timezone.utc).isoformat()),
+        )
+        frontend_signal_snapshot["currentSignalStore"] = {
+            "status": "ready" if int(signal_store_summary.get("signalCount", 0)) > 0 else "empty",
+            "signalCount": int(signal_store_summary.get("signalCount", 0)),
+            "actionableCount": int(signal_store_summary.get("actionableCount", 0)),
+            "primaryProductId": signal_store_summary.get("primaryProductId"),
+            "generatedAt": signal_store_summary.get("generatedAt"),
+            "persistedAt": signal_store_summary.get("persistedAt"),
+            "storageBackend": signal_store_summary.get("storageBackend"),
+            "databaseTarget": signal_store_summary.get("databaseTarget"),
+        }
 
         self.save_dataframe(prediction_df, OUTPUTS_DIR / "historicalSignals.csv")
         self.save_json(top_signal or {}, OUTPUTS_DIR / "latestSignal.json")
@@ -2465,6 +2604,8 @@ class SignalGenerationApp(BaseSignalApp):
             "marketDataRefresh": market_data_refresh,
             "marketDataRefreshedAt": market_data_refreshed_at,
             "signalInference": signal_inference_summary,
+            "signalStore": signal_store_summary,
+            "signalStorePath": str(self.config.signal_store_path),
             "trackedTradeSync": tracked_trade_sync,
         }
 

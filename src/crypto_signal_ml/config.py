@@ -240,6 +240,9 @@ class TrainingConfig:
     signal_watchlist_fallback_hours: float = _env_float("SIGNAL_WATCHLIST_FALLBACK_HOURS", 12.0)
     signal_watchlist_min_decision_score: float = _env_float("SIGNAL_WATCHLIST_MIN_DECISION_SCORE", 0.30)
     signal_watchlist_min_confidence: float = _env_float("SIGNAL_WATCHLIST_MIN_CONFIDENCE", 0.55)
+    signal_watchlist_min_published_signals: int = (
+        _env_optional_int("SIGNAL_WATCHLIST_MIN_PUBLISHED_SIGNALS", 2) or 2
+    )
     signal_watchlist_pool_enabled: bool = _env_bool("SIGNAL_WATCHLIST_POOL_ENABLED", True)
     signal_watchlist_pool_max_products: int = _env_optional_int("SIGNAL_WATCHLIST_POOL_MAX_PRODUCTS", 12) or 12
     signal_watchlist_pool_path: Path = OUTPUTS_DIR / "watchlistPool.json"
@@ -254,6 +257,8 @@ class TrainingConfig:
     assistant_store_url: Optional[str] = os.getenv("ASSISTANT_DATABASE_URL") or os.getenv("DATABASE_URL")
     portfolio_store_path: Path = OUTPUTS_DIR / "traderPortfolio.sqlite3"
     portfolio_store_url: Optional[str] = os.getenv("PORTFOLIO_DATABASE_URL") or os.getenv("DATABASE_URL")
+    signal_store_path: Path = OUTPUTS_DIR / "liveSignals.sqlite3"
+    signal_store_url: Optional[str] = os.getenv("SIGNAL_DATABASE_URL") or os.getenv("DATABASE_URL")
     portfolio_default_capital: float = 10000.0
     rag_enabled: bool = True
     rag_store_path: Path = OUTPUTS_DIR / "assistantKnowledge.sqlite3"
@@ -360,6 +365,7 @@ def config_to_dict(config: TrainingConfig) -> Dict[str, object]:
     config_dict["market_product_batch_state_file"] = str(config.market_product_batch_state_file)
     config_dict["assistant_store_path"] = str(config.assistant_store_path)
     config_dict["portfolio_store_path"] = str(config.portfolio_store_path)
+    config_dict["signal_store_path"] = str(config.signal_store_path)
     config_dict["rag_store_path"] = str(config.rag_store_path)
     return config_dict
 
@@ -390,6 +396,8 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
         restored_config["assistant_store_path"] = Path(str(restored_config["assistant_store_path"]))
     if "portfolio_store_path" in restored_config:
         restored_config["portfolio_store_path"] = Path(str(restored_config["portfolio_store_path"]))
+    if "signal_store_path" in restored_config:
+        restored_config["signal_store_path"] = Path(str(restored_config["signal_store_path"]))
     if "rag_store_path" in restored_config:
         restored_config["rag_store_path"] = Path(str(restored_config["rag_store_path"]))
     if "comparison_model_types" in restored_config:

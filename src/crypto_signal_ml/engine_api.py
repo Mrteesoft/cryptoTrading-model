@@ -28,6 +28,7 @@ from .live import LiveSignalEngine
 from .modeling import BaseSignalModel, get_model_class
 from .rag import RagKnowledgeStore
 from .trading.portfolio import TradingPortfolioStore
+from .trading.signal_store import TradingSignalStore
 from .trading.trader_brain import TraderBrain
 
 INTERNAL_API_KEY_HEADER = "x-ai-engine-key"
@@ -468,6 +469,7 @@ def create_app(
     assistant_service: TradingAssistantService | None = None,
     session_store: ConversationSessionStore | None = None,
     portfolio_store: TradingPortfolioStore | None = None,
+    signal_store: TradingSignalStore | None = None,
     knowledge_store: RagKnowledgeStore | None = None,
     require_internal_api_key: bool = False,
     internal_api_key: str | None = None,
@@ -493,6 +495,10 @@ def create_app(
         db_path=runtime_config.portfolio_store_path,
         default_capital=runtime_config.portfolio_default_capital,
         database_url=runtime_config.portfolio_store_url,
+    )
+    signal_store = signal_store or TradingSignalStore(
+        db_path=runtime_config.signal_store_path,
+        database_url=runtime_config.signal_store_url,
     )
     knowledge_store = knowledge_store or (
         RagKnowledgeStore(
@@ -544,7 +550,14 @@ def create_app(
     async def require_backend_internal_key(request: Request, call_next):
         """Reject direct callers when the engine is configured for backend-only access."""
 
-        protected_path = request.url.path.startswith("/api") or request.url.path in {"/docs", "/redoc", "/openapi.json"}
+        protected_path = request.url.path.startswith("/api") or request.url.path in {
+            "/current-signal",
+            "/current-signals",
+            "/signal-history",
+            "/docs",
+            "/redoc",
+            "/openapi.json",
+        }
         if not require_internal_api_key or not protected_path:
             return await call_next(request)
 
@@ -606,6 +619,43 @@ def create_app(
             return snapshot_store.get_snapshot()
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    def get_current_signal_or_404() -> dict[str, Any]:
+        """Return the primary current signal from the database or raise a 404."""
+
+        signal_summary = signal_store.get_current_signal()
+        if signal_summary is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No current live signal has been persisted yet. "
+                    "Run `python model-service/scripts/generateSignals.py` first."
+                ),
+            )
+
+        return signal_summary
+
+    def filter_current_signal_rows(
+        signal_rows: list[dict[str, Any]],
+        action: str,
+    ) -> list[dict[str, Any]]:
+        """Apply the same public action filter semantics used by the cached snapshot routes."""
+
+        normalized_action = str(action).strip().lower() or "all"
+        if normalized_action == "all":
+            return list(signal_rows)
+        if normalized_action == "actionable":
+            return [
+                signal_summary
+                for signal_summary in signal_rows
+                if bool(signal_summary.get("actionable", False))
+            ]
+
+        return [
+            signal_summary
+            for signal_summary in signal_rows
+            if str(signal_summary.get("spotAction", "")).strip().lower() == normalized_action
+        ]
 
     def resolve_signal_for_tracking(
         product_id: str,
@@ -708,6 +758,7 @@ def create_app(
         snapshot_status = get_snapshot_status()
         model_status = model_store.get_summary()
         live_status = live_signal_engine.get_status()
+        current_signal_status = signal_store.get_status()
         rag_status = knowledge_store.get_status() if knowledge_store is not None else {"enabled": False}
 
         return {
@@ -715,6 +766,8 @@ def create_app(
             "snapshotStatus": snapshot_status["status"],
             "modelStatus": model_status["status"],
             "liveStatus": live_status["status"],
+            "currentSignalStatus": current_signal_status["status"],
+            "currentSignalStore": current_signal_status,
             "ragStatus": rag_status,
             "snapshotFreshness": snapshot_status.get("freshness"),
             "modelFreshness": model_status.get("lifecycle", {}).get("freshness"),
@@ -763,6 +816,7 @@ def create_app(
                 "portfolio": portfolio_store.get_portfolio(),
                 "supportsLivePlan": True,
             },
+            "currentSignals": signal_store.get_status(),
             "rag": knowledge_store.get_status() if knowledge_store is not None else {"enabled": False},
             "model": model_store.get_summary(),
             "modelResearch": MODEL_RESEARCH_ROADMAP,
@@ -852,8 +906,20 @@ def create_app(
                     "path": "/api/market-state",
                 },
                 {
-                    "label": "Signal list",
+                    "label": "Cached signal list",
                     "path": "/api/signals?action=all&limit=12",
+                },
+                {
+                    "label": "Current signal",
+                    "path": "/current-signal",
+                },
+                {
+                    "label": "Current signals",
+                    "path": "/current-signals?limit=12",
+                },
+                {
+                    "label": "Signal history",
+                    "path": "/signal-history?limit=25",
                 },
                 {
                     "label": "Live overview",
@@ -952,6 +1018,56 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"No signal found for {product_id}.")
 
         return signal_summary
+
+    @app.get("/current-signal")
+    @app.get("/api/current-signal")
+    def current_signal() -> dict[str, Any]:
+        """Return the latest persisted current signal from the database."""
+
+        return get_current_signal_or_404()
+
+    @app.get("/current-signals")
+    @app.get("/api/current-signals")
+    def current_signals(
+        action: str = Query(default="all"),
+        limit: Optional[int] = Query(default=50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Return the currently published live signal set from the database."""
+
+        signal_rows = signal_store.list_current_signals(limit=500)
+        filtered_signal_rows = filter_current_signal_rows(signal_rows, action=action)
+        if limit is not None:
+            filtered_signal_rows = filtered_signal_rows[: max(0, int(limit))]
+        store_status = signal_store.get_status()
+        return {
+            "action": action,
+            "count": len(filtered_signal_rows),
+            "signals": filtered_signal_rows,
+            "generatedAt": store_status.get("generatedAt"),
+            "primaryProductId": store_status.get("primaryProductId"),
+            "storageBackend": store_status.get("storageBackend"),
+            "databaseTarget": store_status.get("databaseTarget"),
+        }
+
+    @app.get("/signal-history")
+    @app.get("/api/signal-history")
+    def signal_history(
+        limit: Optional[int] = Query(default=100, ge=1, le=500),
+        product_id: str | None = Query(default=None, alias="productId"),
+    ) -> dict[str, Any]:
+        """Return the newest persisted signal events from the database."""
+
+        signal_rows = signal_store.list_signal_history(
+            limit=limit or 100,
+            product_id=product_id,
+        )
+        return {
+            "count": len(signal_rows),
+            "productId": str(product_id).strip().upper() or None if product_id is not None else None,
+            "signals": signal_rows,
+            "storageBackend": signal_store.database.storage_backend,
+            "databaseTarget": signal_store.database.database_target,
+        }
 
     @app.get("/api/live/overview")
     def live_overview(

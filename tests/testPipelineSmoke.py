@@ -16,7 +16,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig, apply_runtime_market_data_settings  # noqa: E402
-from crypto_signal_ml.app import (  # noqa: E402
+from crypto_signal_ml.application import (  # noqa: E402
     MarketEventsRefreshApp,
     MarketDataRefreshApp,
     MarketUniverseRefreshApp,
@@ -25,9 +25,18 @@ from crypto_signal_ml.app import (  # noqa: E402
     TrainingApp,
     WalkForwardValidationApp,
 )
-from crypto_signal_ml.assistant import ConversationSessionStore  # noqa: E402
+from crypto_signal_ml.chat import ConversationSessionStore  # noqa: E402
 from crypto_signal_ml.backtesting import EqualWeightSignalBacktester  # noqa: E402
-from crypto_signal_ml.data import (  # noqa: E402
+from crypto_signal_ml.environment import load_env_file  # noqa: E402
+from crypto_signal_ml.frontend import (  # noqa: E402
+    SignalSnapshotStore,
+    WatchlistPoolStore,
+    build_frontend_signal_snapshot,
+    build_watchlist_pool_snapshot,
+)
+from crypto_signal_ml.live import LiveSignalEngine  # noqa: E402
+from crypto_signal_ml.ml import (  # noqa: E402
+    BaseSignalModel,
     CoinbaseExchangePriceDataLoader,
     CoinMarketCalEventEnricher,
     CoinMarketCapRateLimitError,
@@ -35,39 +44,30 @@ from crypto_signal_ml.data import (  # noqa: E402
     CoinMarketCapLatestQuotesPriceDataLoader,
     CoinMarketCapMarketIntelligenceEnricher,
     CoinMarketCapOhlcvPriceDataLoader,
+    CryptoDatasetBuilder,
     CsvPriceDataLoader,
-    create_market_data_loader,
-)
-from crypto_signal_ml.environment import load_env_file  # noqa: E402
-from crypto_signal_ml.features import TechnicalFeatureEngineer  # noqa: E402
-from crypto_signal_ml.frontend import (  # noqa: E402
-    SignalSnapshotStore,
-    WatchlistPoolStore,
-    build_frontend_signal_snapshot,
-    build_watchlist_pool_snapshot,
-)
-from crypto_signal_ml.labels import FutureReturnSignalLabeler, TripleBarrierSignalLabeler  # noqa: E402
-from crypto_signal_ml.live import LiveSignalEngine  # noqa: E402
-from crypto_signal_ml.monitor import SignalMonitorService  # noqa: E402
-from crypto_signal_ml.modeling import (  # noqa: E402
-    BaseSignalModel,
+    FutureReturnSignalLabeler,
     HistGradientBoostingSignalModel,
     LogisticRegressionSignalModel,
     RandomForestSignalModel,
+    TechnicalFeatureEngineer,
+    TripleBarrierSignalLabeler,
+    create_market_data_loader,
     create_model_from_config,
 )
-from crypto_signal_ml.pipeline import CryptoDatasetBuilder  # noqa: E402
-from crypto_signal_ml.portfolio import TradingPortfolioStore  # noqa: E402
-from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
-from crypto_signal_ml.signals import (  # noqa: E402
+from crypto_signal_ml.retrieval import RagKnowledgeStore  # noqa: E402
+from crypto_signal_ml.service import SignalMonitorService  # noqa: E402
+from crypto_signal_ml.trading import (  # noqa: E402
+    TraderBrain,
+    TradingPortfolioStore,
+    TradingSignalStore,
     apply_signal_trade_context,
     build_actionable_signal_summaries,
     build_latest_signal_summaries,
     filter_published_signal_summaries,
+    is_signal_eligible_base_currency,
     select_primary_signal,
 )
-from crypto_signal_ml.symbols import is_signal_eligible_base_currency  # noqa: E402
-from crypto_signal_ml.trader_brain import TraderBrain  # noqa: E402
 
 
 def _build_sample_market_frame(total_hours: int = 96) -> DataFrame:
@@ -2023,6 +2023,102 @@ def test_signal_generation_app_can_publish_from_fresh_top_market_universe(
     assert saved_json_payloads["frontendSignalSnapshot.json"]["signalInference"]["mode"] == "fresh-top-market-universe"
 
 
+def test_signal_generation_app_persists_current_signals_to_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Publishing signals should persist the current set in the live-signal database."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-04-05T12:00:00Z",
+                "product_id": "ALGO-USD",
+                "base_currency": "ALGO",
+                "quote_currency": "USD",
+                "close": 0.25,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.86,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.10,
+                "prob_buy": 0.86,
+                "breakout_up_20": 0.04,
+                "breakout_down_20": 0.01,
+                "close_vs_ema_5": 0.03,
+                "relative_strength_1": 0.02,
+                "relative_strength_5": 0.05,
+                "momentum_10": 0.07,
+                "range_position_20": 0.93,
+                "rsi_14": 63.0,
+                "trend_score": 0.03,
+                "volatility_ratio": 0.95,
+                "regime_label": "trend_up",
+                "regime_code": 2,
+                "regime_is_trending": 1,
+                "regime_is_high_volatility": 0,
+                "cmc_context_available": 0,
+            }
+        ]
+    )
+
+    class FakeDatasetBuilder:
+        def build_feature_table(self) -> pd.DataFrame:
+            return pd.DataFrame([{"feature_1": 1.0}])
+
+    class FakeModel:
+        model_type = "histGradientBoostingSignalModel"
+
+        def __init__(self, config: TrainingConfig) -> None:
+            self.config = config
+            self.feature_columns = ["feature_1"]
+
+        def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
+            assert list(feature_df.columns) == ["feature_1"]
+            return prediction_df.copy()
+
+    data_path = tmp_path / "marketPrices.csv"
+    data_path.write_text("timestamp,product_id,close\n", encoding="utf-8")
+    config = TrainingConfig(
+        data_file=data_path,
+        coinmarketcap_use_context=False,
+        market_data_source="coinmarketcapLatestQuotes",
+        signal_excluded_base_currencies=(),
+        signal_refresh_market_data_before_generation=False,
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+        signal_store_path=tmp_path / "liveSignals.sqlite3",
+    )
+    app = SignalGenerationApp(
+        config=config,
+        dataset_builder=FakeDatasetBuilder(),
+        model=FakeModel(config=config),
+    )
+
+    monkeypatch.setattr(app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(app, "save_json", lambda payload, file_path: None)
+
+    with caplog.at_level("INFO"):
+        result = app.run()
+
+    signal_store = TradingSignalStore(db_path=config.signal_store_path)
+    current_signal = signal_store.get_current_signal()
+    current_signals = signal_store.list_current_signals(limit=10)
+    signal_history = signal_store.list_signal_history(limit=10)
+
+    assert result["signalStore"]["signalCount"] == 1
+    assert result["signalStore"]["storageBackend"] == "sqlite"
+    assert current_signal is not None
+    assert current_signal["productId"] == "ALGO-USD"
+    assert current_signal["signal_name"] == "BUY"
+    assert current_signal["isPrimary"] is True
+    assert len(current_signals) == 1
+    assert len(signal_history) == 1
+    assert signal_history[0]["productId"] == "ALGO-USD"
+    assert "Live signal created: symbol=ALGO-USD signal=BUY" in caplog.text
+
+
 def test_signal_generation_app_can_emit_watchlist_fallback_after_quiet_period(
     tmp_path: Path,
 ) -> None:
@@ -2084,6 +2180,70 @@ def test_signal_generation_app_can_emit_watchlist_fallback_after_quiet_period(
     assert selected_signal["publicSignalType"] == "watchlist"
     assert selected_signal["spotAction"] == "wait"
     assert selected_signal["reasonSummary"].startswith("No actionable trade cleared the live gate recently")
+
+
+def test_signal_generation_app_can_supplement_one_public_signal_with_watchlist_candidate() -> None:
+    """A thin public feed should be padded with the strongest watchlist idea."""
+
+    app = SignalGenerationApp(
+        config=TrainingConfig(
+            signal_watchlist_min_decision_score=0.30,
+            signal_watchlist_min_confidence=0.55,
+            signal_watchlist_min_published_signals=2,
+        ),
+    )
+
+    supplemented_signals = app._supplement_published_signals_with_watchlist_candidates(
+        published_signals=[
+            {
+                "productId": "ALGO-USD",
+                "signal_name": "LOSS",
+                "spotAction": "cut_loss",
+                "actionable": True,
+            }
+        ],
+        signal_summaries=[
+            {
+                "productId": "ALGO-USD",
+                "signal_name": "LOSS",
+                "modelSignalName": "HOLD",
+                "tradeReadiness": "high",
+                "confidence": 0.71,
+                "policyScore": 1.25,
+                "reasonItems": ["ALGO-USD is protecting capital."],
+                "signalChat": "ALGO-USD is protecting capital.",
+                "brain": {
+                    "decision": "avoid_long",
+                    "decisionScore": 0.36,
+                },
+                "tradeContext": {
+                    "hasActiveTrade": True,
+                },
+            },
+            {
+                "productId": "ABT-USD",
+                "signal_name": "HOLD",
+                "modelSignalName": "HOLD",
+                "tradeReadiness": "standby",
+                "confidence": 0.91,
+                "policyScore": 1.76,
+                "reasonItems": ["ABT-USD stays on the watchlist."],
+                "signalChat": "ABT-USD stays on the watchlist.",
+                "brain": {
+                    "decision": "watchlist",
+                    "decisionScore": 0.62,
+                },
+                "tradeContext": {
+                    "hasActiveTrade": False,
+                },
+            },
+        ],
+    )
+
+    assert [signal["productId"] for signal in supplemented_signals] == ["ALGO-USD", "ABT-USD"]
+    assert supplemented_signals[1]["watchlistFallback"] is True
+    assert supplemented_signals[1]["publicSignalType"] == "watchlist"
+    assert supplemented_signals[1]["spotAction"] == "wait"
 
 
 def test_signal_generation_app_persists_watchlist_pool_snapshot(tmp_path: Path) -> None:

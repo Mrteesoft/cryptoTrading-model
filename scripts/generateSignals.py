@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import logging
+import os
+
 from scriptSupport import bootstrap_src_path
 
 bootstrap_src_path()
 
-from crypto_signal_ml.app import SignalGenerationApp  # noqa: E402
+from crypto_signal_ml.application import SignalGenerationApp  # noqa: E402
 
 
 def main() -> None:
     """Generate signals through the reusable app class."""
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
     results = SignalGenerationApp().run()
 
@@ -24,6 +34,17 @@ def main() -> None:
     print(f"Signals generated: {results['signalsGenerated']}")
     print(f"Actionable signals generated: {results['actionableSignalsGenerated']}")
     print(f"Signal source: {results['signalSource']}")
+    if results.get("signalStore"):
+        print(
+            "Current signal store: "
+            f"{results['signalStore']['storageBackend']} -> "
+            f"{results['signalStore']['databaseTarget']}"
+        )
+        print(
+            "Current signals persisted: "
+            f"{results['signalStore']['signalCount']} "
+            f"(primary={results['signalStore'].get('primaryProductId') or 'none'})"
+        )
     if results.get("marketDataRefresh"):
         print(
             "Market data refreshed: "

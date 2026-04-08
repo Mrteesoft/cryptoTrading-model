@@ -19,12 +19,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
-from crypto_signal_ml.api import create_signal_api  # noqa: E402
-from crypto_signal_ml.engine_api import create_app  # noqa: E402
 from crypto_signal_ml.frontend import build_frontend_signal_snapshot  # noqa: E402
 from crypto_signal_ml.modeling import RandomForestSignalModel  # noqa: E402
-from crypto_signal_ml.portfolio import TradingPortfolioStore  # noqa: E402
-from crypto_signal_ml.rag import RagKnowledgeStore  # noqa: E402
+from crypto_signal_ml.retrieval import RagKnowledgeStore  # noqa: E402
+from crypto_signal_ml.service import create_app, create_signal_api  # noqa: E402
+from crypto_signal_ml.trading import TradingPortfolioStore, TradingSignalStore  # noqa: E402
 
 
 def _build_trained_model(
@@ -302,6 +301,114 @@ def test_engine_api_can_require_backend_internal_api_key(tmp_path: Path) -> None
 
     assert unauthorized_response.status_code == 403
     assert authorized_response.status_code == 200
+
+
+def test_engine_api_reads_current_signals_from_database_across_app_restarts(tmp_path: Path) -> None:
+    """Current-signal endpoints should read the persisted live-signal database, not cached files."""
+
+    signal_db_path = tmp_path / "liveSignals.sqlite3"
+    initial_store = TradingSignalStore(db_path=signal_db_path)
+    current_signal_rows = [
+        {
+            "productId": "BTC-USD",
+            "signal_name": "BUY",
+            "spotAction": "buy",
+            "actionable": True,
+            "confidence": 0.84,
+            "close": 65250.0,
+            "timestamp": "2026-04-07T16:28:00+00:00",
+            "signalSource": "live-market-refresh",
+        },
+        {
+            "productId": "ETH-USD",
+            "signal_name": "HOLD",
+            "spotAction": "wait",
+            "actionable": False,
+            "confidence": 0.63,
+            "close": 3320.0,
+            "timestamp": "2026-04-07T16:28:00+00:00",
+            "signalSource": "live-market-refresh",
+        },
+    ]
+    initial_store.replace_current_signals(
+        signal_summaries=current_signal_rows,
+        primary_signal=current_signal_rows[0],
+        generated_at="2026-04-07T16:30:00+00:00",
+    )
+
+    restarted_store = TradingSignalStore(db_path=signal_db_path)
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            signal_store=restarted_store,
+        )
+    )
+
+    current_signal_response = client.get("/current-signal")
+    current_signals_response = client.get("/current-signals?limit=10")
+    current_buy_signals_response = client.get("/current-signals?action=buy&limit=10")
+    current_actionable_signals_response = client.get("/current-signals?action=actionable&limit=10")
+    signal_history_response = client.get("/signal-history?limit=10")
+
+    assert current_signal_response.status_code == 200
+    assert current_signal_response.json()["productId"] == "BTC-USD"
+    assert current_signal_response.json()["isPrimary"] is True
+    assert current_signal_response.json()["generatedAt"] == "2026-04-07T16:30:00+00:00"
+    assert current_signals_response.status_code == 200
+    assert current_signals_response.json()["count"] == 2
+    assert current_signals_response.json()["primaryProductId"] == "BTC-USD"
+    assert current_signals_response.json()["storageBackend"] == "sqlite"
+    assert current_buy_signals_response.status_code == 200
+    assert current_buy_signals_response.json()["action"] == "buy"
+    assert current_buy_signals_response.json()["count"] == 1
+    assert current_buy_signals_response.json()["signals"][0]["productId"] == "BTC-USD"
+    assert current_actionable_signals_response.status_code == 200
+    assert current_actionable_signals_response.json()["count"] == 1
+    assert current_actionable_signals_response.json()["signals"][0]["productId"] == "BTC-USD"
+    assert signal_history_response.status_code == 200
+    assert signal_history_response.json()["count"] == 2
+    assert signal_history_response.json()["signals"][0]["generationId"]
+
+
+def test_engine_api_protects_current_signal_endpoint_with_internal_key(tmp_path: Path) -> None:
+    """Root-level current-signal endpoints should honor the same backend-only auth gate."""
+
+    signal_store = TradingSignalStore(db_path=tmp_path / "liveSignals.sqlite3")
+    signal_row = {
+        "productId": "BTC-USD",
+        "signal_name": "BUY",
+        "spotAction": "buy",
+        "actionable": True,
+        "confidence": 0.80,
+        "close": 65000.0,
+        "timestamp": "2026-04-07T16:28:00+00:00",
+    }
+    signal_store.replace_current_signals(
+        signal_summaries=[signal_row],
+        primary_signal=signal_row,
+        generated_at="2026-04-07T16:30:00+00:00",
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            signal_store=signal_store,
+            require_internal_api_key=True,
+            internal_api_key="test-backend-key",
+        )
+    )
+
+    unauthorized_response = client.get("/current-signal")
+    authorized_response = client.get(
+        "/current-signal",
+        headers={"x-ai-engine-key": "test-backend-key"},
+    )
+
+    assert unauthorized_response.status_code == 403
+    assert authorized_response.status_code == 200
+    assert authorized_response.json()["productId"] == "BTC-USD"
 
 
 def test_model_summary_exposes_lifecycle_metadata_when_sidecar_exists(tmp_path: Path) -> None:
