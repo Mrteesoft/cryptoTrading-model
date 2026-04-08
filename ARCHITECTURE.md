@@ -10,6 +10,8 @@ This service is still a trading engine first. The refactor in this repository do
   Facade package for API creation and runtime entrypoints.
 - `src/crypto_signal_ml/application/`
   Facade package for orchestration workflows such as training, refresh, validation, backtesting, and signal publishing.
+- `src/crypto_signal_ml/tools/`
+  Stable structured tool wrappers that expose authoritative signal, trader, model, and retrieval operations for LLM callers.
 - `src/crypto_signal_ml/app.py`
   Concrete application workflow implementations used by scripts and the monitor.
 - `src/crypto_signal_ml/api.py`, `src/crypto_signal_ml/engine_api.py`, `src/crypto_signal_ml/monitor.py`
@@ -22,6 +24,10 @@ This service is still a trading engine first. The refactor in this repository do
   Shared database adapter layer for SQLite/PostgreSQL-backed stores.
 - `src/crypto_signal_ml/chat/`, `src/crypto_signal_ml/retrieval/`
   Facade packages around the current assistant and RAG modules.
+- `src/crypto_signal_ml/memory/`
+  Session-memory facade that can later grow beyond the current conversation store.
+- `src/crypto_signal_ml/llm/`
+  Provider-specific adapters that stay outside the trading domain.
 - `src/crypto_signal_ml/assistant.py`, `src/crypto_signal_ml/rag.py`
   Current assistant/session orchestration and local retrieval store implementations.
 - `scripts/`
@@ -56,6 +62,9 @@ These root modules are compatibility bridges and should not grow new logic:
 
 - Keep runtime implementations in place to avoid a risky file move.
 - Add explicit facade packages for `service`, `application`, `ml`, `chat`, and `retrieval`.
+- Add `tools/` as the stable contract for LLM-callable access to the authoritative engine.
+- Add `llm/` as an isolated adapter layer that can consume tool schemas later without owning business logic.
+- Add `memory/` as a clearer home for future assistant/session memory evolution.
 - Prefer those facades in new scripts, tests, and documentation.
 - Keep root compatibility modules importable for external callers.
 
@@ -65,12 +74,12 @@ If this service evolves into a more agentic system, the current layout leaves cl
 
 - `chat/`
   Session APIs, conversation orchestration, response policies.
+- `tools/`
+  Structured signal, trader, model, and retrieval actions that both internal chat and external LLMs can call.
 - `retrieval/`
   Knowledge indexing, search, and source management.
 - `memory/`
   Future long-term user/session memory distinct from retrieval chunks.
-- `tools/`
-  Structured actions the assistant can call, such as live signal fetches, chart lookups, and trade-plan generation.
 - `llm/` or `agents/`
   Provider adapters, prompting, planner/executor flows, or agent policies.
 

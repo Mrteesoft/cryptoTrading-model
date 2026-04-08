@@ -253,8 +253,12 @@ class TrainingConfig:
     assistant_enable_retrieval: bool = True
     assistant_memory_message_limit: int = 12
     assistant_retrieval_item_limit: int = 4
+    assistant_use_llm: bool = _env_bool("ASSISTANT_USE_LLM", False)
     assistant_store_path: Path = OUTPUTS_DIR / "assistantSessions.sqlite3"
     assistant_store_url: Optional[str] = os.getenv("ASSISTANT_DATABASE_URL") or os.getenv("DATABASE_URL")
+    llm_provider: str = _env_str("LLM_PROVIDER", "deterministic")
+    openai_model: str = _env_str("OPENAI_MODEL", "")
+    openai_api_key_env_var: str = _env_str("OPENAI_API_KEY_ENV_VAR", "OPENAI_API_KEY")
     portfolio_store_path: Path = OUTPUTS_DIR / "traderPortfolio.sqlite3"
     portfolio_store_url: Optional[str] = os.getenv("PORTFOLIO_DATABASE_URL") or os.getenv("DATABASE_URL")
     signal_store_path: Path = OUTPUTS_DIR / "liveSignals.sqlite3"

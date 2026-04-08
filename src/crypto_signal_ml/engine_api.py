@@ -14,7 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from .assistant import ConversationSessionStore, TradingAssistantService
+from .application import PublishedSignalViewService
+from .chat import TradingAssistantService
 from .charting import MarketChartService
 from .config import (
     MODELS_DIR,
@@ -25,11 +26,12 @@ from .config import (
 )
 from .frontend import SignalSnapshotStore
 from .live import LiveSignalEngine
+from .memory import ConversationSessionStore
 from .modeling import BaseSignalModel, get_model_class
 from .rag import RagKnowledgeStore
+from .tools import ModelToolService, RetrievalToolService, SignalToolService, ToolRegistry, TraderToolService
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signal_store import TradingSignalStore
-from .trading.trader_brain import TraderBrain
 
 INTERNAL_API_KEY_HEADER = "x-ai-engine-key"
 
@@ -521,12 +523,49 @@ def create_app(
         except FileNotFoundError:
             return None
 
+    fallback_snapshot_provider = (
+        live_signal_engine.get_live_snapshot
+        if hasattr(live_signal_engine, "get_live_snapshot")
+        else None
+    )
+    published_signal_view = PublishedSignalViewService(
+        signal_store=signal_store,
+        snapshot_store=snapshot_store,
+        cached_snapshot_provider=get_cached_snapshot_or_none,
+        fallback_snapshot_provider=fallback_snapshot_provider,
+    )
+    signal_tools = SignalToolService(
+        live_signal_engine=live_signal_engine,
+        cached_snapshot_provider=get_cached_snapshot_or_none,
+        published_signal_service=published_signal_view,
+    )
+    trader_tools = TraderToolService(
+        signal_tools=signal_tools,
+        portfolio_store=portfolio_store,
+        config=runtime_config,
+        published_signal_service=published_signal_view,
+    )
+    model_tools = ModelToolService(model_status_provider=model_store.get_summary)
+    retrieval_tools = RetrievalToolService(
+        knowledge_store=knowledge_store,
+        default_limit=runtime_config.rag_search_limit,
+    )
+    tool_registry = ToolRegistry(
+        signal_tools=signal_tools,
+        trader_tools=trader_tools,
+        model_tools=model_tools,
+        retrieval_tools=retrieval_tools,
+    )
+
     assistant_service = assistant_service or TradingAssistantService(
         live_signal_engine=live_signal_engine,
         session_store=session_store,
         model_summary_provider=model_store.get_summary,
         cached_snapshot_provider=get_cached_snapshot_or_none,
         knowledge_store=knowledge_store,
+        portfolio_store=portfolio_store,
+        tool_registry=tool_registry,
+        published_signal_service=published_signal_view,
         config=runtime_config,
     )
 
@@ -697,47 +736,20 @@ def create_app(
     ) -> dict[str, Any]:
         """Build a portfolio-aware trader plan from live data or cached signals."""
 
-        source = "live"
-        warning = ""
-        try:
-            signal_snapshot = live_signal_engine.get_live_snapshot(force_refresh=force_refresh)
-        except FileNotFoundError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except Exception as error:
-            cached_snapshot = get_cached_snapshot_or_none()
-            if cached_snapshot is None:
-                raise HTTPException(status_code=503, detail=f"Trader plan refresh failed: {error}") from error
-            signal_snapshot = cached_snapshot
-            source = "cached"
-            warning = str(error)
-
-        portfolio = portfolio_store.get_portfolio()
-        resolved_capital = float(capital_override) if capital_override is not None else float(portfolio["capital"])
-        trader_plan = TraderBrain(config=runtime_config).build_plan(
-            signal_summaries=list(signal_snapshot.get("signals", [])),
-            positions=list(portfolio.get("positions", [])),
-            capital=resolved_capital,
-            trade_memory_by_product=portfolio_store.build_trade_learning_map(
-                list(signal_snapshot.get("signals", []))
-            ),
+        tool_payload = trader_tools.get_trader_plan(
+            capital=capital_override,
+            force_refresh=force_refresh,
         )
+        if tool_payload.get("status") == "error":
+            error_message = str(tool_payload.get("error") or "Trader plan is unavailable.")
+            raise HTTPException(status_code=503, detail=error_message)
 
         return {
-            "source": source,
-            "warning": warning,
-            "portfolio": {
-                **portfolio,
-                "capital": resolved_capital,
-            },
-            "liveSnapshot": {
-                "generatedAt": signal_snapshot.get("generatedAt"),
-                "marketDataSource": signal_snapshot.get("marketDataSource"),
-                "requestMode": signal_snapshot.get("requestMode"),
-                "productsCovered": signal_snapshot.get("productsCovered"),
-                "primarySignal": signal_snapshot.get("primarySignal"),
-                "marketSummary": signal_snapshot.get("marketSummary", {}),
-            },
-            "traderPlan": trader_plan,
+            "source": tool_payload.get("source"),
+            "warning": tool_payload.get("warning"),
+            "portfolio": tool_payload.get("portfolio"),
+            "liveSnapshot": tool_payload.get("liveSnapshot"),
+            "traderPlan": tool_payload.get("traderPlan"),
         }
 
     @app.get("/")
@@ -783,7 +795,63 @@ def create_app(
     def model_summary() -> dict[str, Any]:
         """Return the latest model artifact details for the landing page."""
 
-        return model_store.get_summary()
+        return model_tools.get_model_status()["model"]
+
+    @app.get("/api/tools")
+    def tool_catalog() -> dict[str, Any]:
+        """Return the stable internal tool catalog for LLM callers and adapters."""
+
+        return {
+            "count": len(tool_registry.list_tools()),
+            "tools": tool_registry.list_tools(),
+        }
+
+    @app.get("/api/tools/market-overview")
+    def tool_market_overview(
+        force_refresh: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        """Return the stable market-overview tool payload."""
+
+        return signal_tools.get_market_overview(force_refresh=force_refresh)
+
+    @app.get("/api/tools/signals/{product_id}")
+    def tool_signal_detail(
+        product_id: str,
+        force_refresh: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        """Return the stable single-signal tool payload."""
+
+        return signal_tools.get_signal(
+            product_id=product_id,
+            force_refresh=force_refresh,
+        )
+
+    @app.get("/api/tools/trader-plan")
+    def tool_trader_plan(
+        force_refresh: bool = Query(default=False),
+        capital: float | None = Query(default=None, gt=0),
+    ) -> dict[str, Any]:
+        """Return the stable trader-plan tool payload."""
+
+        return trader_tools.get_trader_plan(
+            capital=capital,
+            force_refresh=force_refresh,
+        )
+
+    @app.get("/api/tools/model-status")
+    def tool_model_status() -> dict[str, Any]:
+        """Return the stable model-status tool payload."""
+
+        return model_tools.get_model_status()
+
+    @app.post("/api/tools/retrieval/search")
+    def tool_retrieval_search(request: RagSearchRequest) -> dict[str, Any]:
+        """Return the stable retrieval-search tool payload."""
+
+        return retrieval_tools.search_knowledge(
+            request.query,
+            limit=request.limit or runtime_config.rag_search_limit,
+        )
 
     @app.get("/api/landing")
     def landing_payload() -> dict[str, Any]:
@@ -810,6 +878,7 @@ def create_app(
                 "supportsLiveData": True,
                 "supportsSessionMemory": True,
                 "supportsRetrieval": bool(runtime_config.assistant_enable_retrieval),
+                "supportsToolCalls": True,
             },
             "trader": {
                 "brainEnabled": bool(runtime_config.brain_enabled),
@@ -898,6 +967,10 @@ def create_app(
                     "path": "/api/model",
                 },
                 {
+                    "label": "Tool catalog",
+                    "path": "/api/tools",
+                },
+                {
                     "label": "Signal overview",
                     "path": "/api/overview",
                 },
@@ -928,6 +1001,22 @@ def create_app(
                 {
                     "label": "Live signals",
                     "path": "/api/live/signals?action=all&limit=12",
+                },
+                {
+                    "label": "Tool market overview",
+                    "path": "/api/tools/market-overview?force_refresh=true",
+                },
+                {
+                    "label": "Tool signal detail",
+                    "path": "/api/tools/signals/BTC-USD?force_refresh=true",
+                },
+                {
+                    "label": "Tool trader plan",
+                    "path": "/api/tools/trader-plan?force_refresh=true",
+                },
+                {
+                    "label": "Tool model status",
+                    "path": "/api/tools/model-status",
                 },
                 {
                     "label": "Trader portfolio",
@@ -1034,20 +1123,10 @@ def create_app(
     ) -> dict[str, Any]:
         """Return the currently published live signal set from the database."""
 
-        signal_rows = signal_store.list_current_signals(limit=500)
-        filtered_signal_rows = filter_current_signal_rows(signal_rows, action=action)
-        if limit is not None:
-            filtered_signal_rows = filtered_signal_rows[: max(0, int(limit))]
-        store_status = signal_store.get_status()
-        return {
-            "action": action,
-            "count": len(filtered_signal_rows),
-            "signals": filtered_signal_rows,
-            "generatedAt": store_status.get("generatedAt"),
-            "primaryProductId": store_status.get("primaryProductId"),
-            "storageBackend": store_status.get("storageBackend"),
-            "databaseTarget": store_status.get("databaseTarget"),
-        }
+        return published_signal_view.build_current_signals_response(
+            action=action,
+            limit=limit or 50,
+        )
 
     @app.get("/signal-history")
     @app.get("/api/signal-history")
@@ -1057,17 +1136,10 @@ def create_app(
     ) -> dict[str, Any]:
         """Return the newest persisted signal events from the database."""
 
-        signal_rows = signal_store.list_signal_history(
+        return published_signal_view.build_signal_history_response(
             limit=limit or 100,
             product_id=product_id,
         )
-        return {
-            "count": len(signal_rows),
-            "productId": str(product_id).strip().upper() or None if product_id is not None else None,
-            "signals": signal_rows,
-            "storageBackend": signal_store.database.storage_backend,
-            "databaseTarget": signal_store.database.database_target,
-        }
 
     @app.get("/api/live/overview")
     def live_overview(

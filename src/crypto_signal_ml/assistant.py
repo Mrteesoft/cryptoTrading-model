@@ -9,10 +9,14 @@ import re
 from typing import Any, Callable, Dict, Mapping, Optional
 from uuid import uuid4
 
+from .application import PublishedSignalViewService
+from .chat.flow import ToolDrivenChatFlow
 from .config import TrainingConfig
 from .live import LiveSignalEngine
 from .rag import RagKnowledgeStore
 from .storage.database import DatabaseConnection, DatabaseHandle
+from .tools import ModelToolService, RetrievalToolService, SignalToolService, ToolRegistry, TraderToolService
+from .trading.portfolio import TradingPortfolioStore
 
 
 COMMON_STOP_WORDS = {
@@ -261,6 +265,10 @@ class TradingAssistantService:
         model_summary_provider: Callable[[], Dict[str, Any]],
         cached_snapshot_provider: Callable[[], Dict[str, Any] | None] | None = None,
         knowledge_store: RagKnowledgeStore | None = None,
+        portfolio_store: TradingPortfolioStore | None = None,
+        tool_registry: ToolRegistry | None = None,
+        chat_flow: ToolDrivenChatFlow | None = None,
+        published_signal_service: PublishedSignalViewService | None = None,
         config: TrainingConfig | None = None,
     ) -> None:
         self.live_signal_engine = live_signal_engine
@@ -269,6 +277,38 @@ class TradingAssistantService:
         self.cached_snapshot_provider = cached_snapshot_provider
         self.knowledge_store = knowledge_store
         self.config = config or TrainingConfig()
+        self.portfolio_store = portfolio_store or TradingPortfolioStore(
+            db_path=self.config.portfolio_store_path,
+            default_capital=self.config.portfolio_default_capital,
+            database_url=self.config.portfolio_store_url,
+        )
+        self.signal_tools = SignalToolService(
+            live_signal_engine=self.live_signal_engine,
+            cached_snapshot_provider=self.cached_snapshot_provider,
+            published_signal_service=published_signal_service,
+        )
+        self.trader_tools = TraderToolService(
+            signal_tools=self.signal_tools,
+            portfolio_store=self.portfolio_store,
+            config=self.config,
+            published_signal_service=published_signal_service,
+        )
+        self.model_tools = ModelToolService(model_status_provider=self.model_summary_provider)
+        self.retrieval_tools = RetrievalToolService(
+            knowledge_store=self.knowledge_store,
+            default_limit=self.config.rag_search_limit,
+        )
+        self.tool_registry = tool_registry or ToolRegistry(
+            signal_tools=self.signal_tools,
+            trader_tools=self.trader_tools,
+            model_tools=self.model_tools,
+            retrieval_tools=self.retrieval_tools,
+        )
+        self.chat_flow = chat_flow or ToolDrivenChatFlow(
+            tool_registry=self.tool_registry,
+            session_store=self.session_store,
+            config=self.config,
+        )
 
     def create_session(self, title: str | None = None) -> Dict[str, Any]:
         """Create a session and seed it with a welcome message."""
@@ -317,53 +357,38 @@ class TradingAssistantService:
         if not normalized_question:
             raise ValueError("Question is empty.")
 
-        resolved_product_id = product_id or self._extract_requested_product_id(normalized_question)
         user_message = self.session_store.add_message(
             session_id=session_id,
             role="user",
             content=normalized_question,
-            metadata={"productId": resolved_product_id},
+            metadata={"productId": product_id},
         )
-
-        live_snapshot = None
-        live_source = "live"
-        live_error = ""
-
-        try:
-            live_snapshot = self.live_signal_engine.get_live_snapshot(
-                force_refresh=force_refresh,
-                product_id=resolved_product_id,
-            )
-        except Exception as error:
-            live_error = str(error)
-            live_snapshot = self._load_cached_snapshot()
-            live_source = "cached" if live_snapshot is not None else "unavailable"
-
-        model_summary = self.model_summary_provider()
-        retrieval = self._build_retrieval_context(
+        flow_result = self.chat_flow.run(
             session_id=session_id,
             question=normalized_question,
-            live_snapshot=live_snapshot,
-            resolved_product_id=resolved_product_id,
+            explicit_product_id=product_id,
+            force_refresh=force_refresh,
         )
-        answer_text = self._compose_answer(
-            question=normalized_question,
-            resolved_product_id=resolved_product_id,
-            live_snapshot=live_snapshot,
-            live_source=live_source,
-            live_error=live_error,
-            model_summary=model_summary,
-            retrieval=retrieval,
-        )
+        resolved_product_id = flow_result["resolvedProductId"]
+        answer_text = str(flow_result["replyText"])
+        retrieval = dict(flow_result["retrieval"])
+        live_context = dict(flow_result["liveContext"])
+        tool_calls = list(flow_result["toolCalls"])
+        tool_results = list(flow_result["toolResults"])
         assistant_message = self.session_store.add_message(
             session_id=session_id,
             role="assistant",
             content=answer_text,
             metadata={
                 "productId": resolved_product_id,
-                "liveSource": live_source,
-                "liveError": live_error,
-                "retrieval": retrieval,
+                "liveSource": live_context.get("source"),
+                "liveError": live_context.get("error"),
+                "toolCalls": tool_calls,
+                "toolNames": [tool_call["name"] for tool_call in tool_calls],
+                "retrieval": {
+                    "messageCount": len(retrieval.get("messages", [])),
+                    "knowledgeCount": len(retrieval.get("knowledge", [])),
+                },
             },
         )
 
@@ -375,12 +400,10 @@ class TradingAssistantService:
                 session_id=session_id,
                 limit=self.config.assistant_memory_message_limit,
             ),
-            "liveContext": {
-                "source": live_source,
-                "error": live_error,
-                "snapshot": live_snapshot,
-            },
+            "liveContext": live_context,
             "retrieval": retrieval,
+            "toolCalls": tool_calls,
+            "toolResults": tool_results,
         }
 
     def _load_cached_snapshot(self) -> Dict[str, Any] | None:

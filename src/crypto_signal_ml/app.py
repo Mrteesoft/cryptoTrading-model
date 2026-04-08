@@ -29,25 +29,22 @@ from .data import (
     CsvPriceDataLoader,
     create_market_data_loader,
 )
-from .frontend import (
-    WatchlistPoolStore,
-    build_frontend_signal_snapshot,
-    build_watchlist_pool_snapshot,
-)
+from .frontend import WatchlistPoolStore
 from .labels import create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signal_store import TradingSignalStore
 from .regime_modeling import MarketRegimeModel
-from .trading.signals import (
-    apply_signal_trade_context,
-    build_actionable_signal_summaries,
-    build_latest_signal_summaries,
-    filter_published_signal_summaries,
-    select_primary_signal,
+from .application import (
+    PrimarySignalHistoryStore,
+    SignalDecisionStage,
+    SignalEnrichmentStage,
+    SignalGenerationCoordinator,
+    SignalInferenceStage,
+    SignalPublicationStage,
 )
-from .trading.trader_brain import TraderBrain
+from .trading.signals import build_latest_signal_summaries
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1760,22 +1757,6 @@ class SignalGenerationApp(BaseSignalApp):
             ),
         }
 
-    def _save_watchlist_pool_snapshot(self, signal_summaries: List[Dict[str, Any]]) -> None:
-        """Persist the strongest watchlist names for more aggressive live monitoring."""
-
-        if not bool(getattr(self.config, "signal_watchlist_pool_enabled", True)):
-            return
-
-        max_products = int(getattr(self.config, "signal_watchlist_pool_max_products", 12) or 12)
-        watchlist_pool_snapshot = build_watchlist_pool_snapshot(
-            signal_summaries=signal_summaries,
-            max_products=max_products,
-        )
-        self.save_json(
-            watchlist_pool_snapshot,
-            Path(self.config.signal_watchlist_pool_path),
-        )
-
     def _build_signal_store(self) -> TradingSignalStore:
         """Create the persistent live-signal store for current and historical rows."""
 
@@ -1783,50 +1764,6 @@ class SignalGenerationApp(BaseSignalApp):
             db_path=self.config.signal_store_path,
             database_url=self.config.signal_store_url,
         )
-
-    def _log_live_signal_rows(self, signal_summaries: List[Dict[str, Any]]) -> None:
-        """Write one structured log line for every published live signal."""
-
-        for signal_summary in signal_summaries:
-            product_id = str(signal_summary.get("productId", "")).strip().upper() or str(
-                signal_summary.get("pairSymbol", "")
-            ).strip().upper()
-            LOGGER.info(
-                (
-                    "Live signal created: symbol=%s signal=%s action=%s confidence=%.4f "
-                    "timestamp=%s price=%.8f watchlistFallback=%s"
-                ),
-                product_id or str(signal_summary.get("symbol", "")).strip().upper() or "UNKNOWN",
-                str(signal_summary.get("signal_name", "UNKNOWN")).strip().upper(),
-                str(signal_summary.get("spotAction", "wait")).strip().lower(),
-                float(signal_summary.get("confidence", 0.0) or 0.0),
-                str(signal_summary.get("timestamp", "")).strip() or "unknown",
-                float(signal_summary.get("close", 0.0) or 0.0),
-                bool(signal_summary.get("watchlistFallback", False)),
-            )
-
-    def _persist_live_signal_store(
-        self,
-        latest_signals: List[Dict[str, Any]],
-        top_signal: Dict[str, Any] | None,
-        generated_at: str,
-    ) -> Dict[str, Any]:
-        """Persist the current live signal set to the database and log each row."""
-
-        signal_store = self._build_signal_store()
-        persistence_summary = signal_store.replace_current_signals(
-            signal_summaries=latest_signals,
-            primary_signal=top_signal,
-            generated_at=generated_at,
-        )
-        self._log_live_signal_rows(latest_signals)
-        LOGGER.info(
-            "Persisted %s live signal(s) to %s via %s.",
-            int(persistence_summary["signalCount"]),
-            persistence_summary["databaseTarget"],
-            persistence_summary["storageBackend"],
-        )
-        return persistence_summary
 
     def _build_fresh_signal_prediction_frame(self) -> tuple[pd.DataFrame, dict[str, Any]]:
         """Score a fresh top-market universe for the published signal snapshot."""
@@ -1902,417 +1839,6 @@ class SignalGenerationApp(BaseSignalApp):
 
         return combined_prediction_df, signal_inference_summary
 
-    def _build_signal_tracking_metadata(
-        self,
-        signal_summary: Dict[str, Any],
-        signal_source: str,
-    ) -> dict[str, Any]:
-        """Build one compact metadata payload for an auto-tracked signal trade."""
-
-        brain = signal_summary.get("brain", {}) if isinstance(signal_summary.get("brain"), dict) else {}
-        return {
-            "autoTrackedFromSignalGeneration": True,
-            "signalSource": signal_source,
-            "signalTimestamp": signal_summary.get("timestamp"),
-            "signalName": signal_summary.get("signal_name"),
-            "confidence": signal_summary.get("confidence"),
-            "productId": signal_summary.get("productId"),
-            "marketDataSource": signal_summary.get("marketDataSource"),
-            "brainDecision": brain.get("decision"),
-            "brainSummary": brain.get("summaryLine"),
-        }
-
-    def _sync_generated_signal_trades(
-        self,
-        latest_signals: list[Dict[str, Any]],
-        signal_source: str,
-        portfolio_store: TradingPortfolioStore | None = None,
-    ) -> dict[str, Any]:
-        """Create tracked trade records for fresh BUY signals and refresh active records."""
-
-        if not bool(getattr(self.config, "signal_track_generated_trades", False)):
-            return {
-                "enabled": False,
-                "createdCount": 0,
-                "refreshedCount": 0,
-                "skippedCount": 0,
-                "trackedTradeIds": [],
-            }
-
-        portfolio_store = portfolio_store or TradingPortfolioStore(
-            db_path=self.config.portfolio_store_path,
-            default_capital=self.config.portfolio_default_capital,
-            database_url=self.config.portfolio_store_url,
-        )
-        created_count = 0
-        refreshed_count = 0
-        skipped_count = 0
-        tracked_trade_ids: list[int] = []
-
-        for signal_summary in latest_signals:
-            product_id = str(signal_summary.get("productId", "")).strip().upper()
-            if not product_id:
-                skipped_count += 1
-                continue
-
-            signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
-            brain = signal_summary.get("brain", {}) if isinstance(signal_summary.get("brain"), dict) else {}
-            signal_metadata = self._build_signal_tracking_metadata(signal_summary, signal_source)
-            active_trade = portfolio_store.get_active_trade_for_product(product_id)
-
-            if active_trade is not None:
-                refreshed_trade = portfolio_store.refresh_trade(
-                    trade_id=int(active_trade["tradeId"]),
-                    current_price=float(signal_summary.get("close") or 0.0) or None,
-                    stop_loss_price=brain.get("stopLossPrice"),
-                    take_profit_price=brain.get("takeProfitPrice"),
-                    signal_name=signal_name or None,
-                    metadata=signal_metadata,
-                )
-                refreshed_count += 1
-                tracked_trade_ids.append(int(refreshed_trade["tradeId"]))
-                continue
-
-            if signal_name != "BUY":
-                skipped_count += 1
-                continue
-            if not bool(signal_summary.get("actionable", False)):
-                skipped_count += 1
-                continue
-
-            entry_price = float(signal_summary.get("close") or 0.0)
-            if entry_price <= 0:
-                skipped_count += 1
-                continue
-
-            tracked_trade = portfolio_store.create_trade(
-                product_id=product_id,
-                entry_price=entry_price,
-                take_profit_price=brain.get("takeProfitPrice"),
-                stop_loss_price=brain.get("stopLossPrice"),
-                quantity=0.0,
-                current_price=entry_price,
-                signal_name=signal_name,
-                status=str(getattr(self.config, "signal_generated_trade_status", "planned") or "planned"),
-                opened_at=str(signal_summary.get("timestamp") or "") or None,
-                metadata=signal_metadata,
-            )
-            created_count += 1
-            tracked_trade_ids.append(int(tracked_trade["tradeId"]))
-
-        return {
-            "enabled": True,
-            "createdCount": created_count,
-            "refreshedCount": refreshed_count,
-            "skippedCount": skipped_count,
-            "trackedTradeIds": tracked_trade_ids,
-            "storageBackend": portfolio_store.database.storage_backend,
-            "databaseTarget": portfolio_store.database.database_target,
-        }
-
-    def _load_recent_primary_product_ids(self) -> list[str]:
-        """Load the recently featured primary-signal products from disk when available."""
-
-        if not self.primary_signal_history_path.exists():
-            latest_signal_path = OUTPUTS_DIR / "latestSignal.json"
-            if not latest_signal_path.exists():
-                return []
-
-            try:
-                with latest_signal_path.open("r", encoding="utf-8") as latest_signal_file:
-                    latest_signal_payload = json.load(latest_signal_file)
-            except (OSError, json.JSONDecodeError):
-                return []
-
-            latest_product_id = str(latest_signal_payload.get("productId", "")).strip().upper()
-            return [latest_product_id] if latest_product_id else []
-
-        try:
-            with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
-                history_payload = json.load(history_file)
-        except (OSError, json.JSONDecodeError):
-            return []
-
-        history_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
-        if not isinstance(history_entries, list):
-            return []
-
-        return [
-            str(history_entry.get("productId", "")).strip().upper()
-            for history_entry in history_entries
-            if isinstance(history_entry, dict) and str(history_entry.get("productId", "")).strip()
-        ]
-
-    def _save_primary_signal_history(
-        self,
-        top_signal: Dict[str, Any],
-        signal_source: str,
-    ) -> None:
-        """Persist a small recent history of featured primary signals for rotation."""
-
-        recent_entries: list[dict[str, Any]] = []
-        if self.primary_signal_history_path.exists():
-            try:
-                with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
-                    history_payload = json.load(history_file)
-                previous_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
-                if isinstance(previous_entries, list):
-                    recent_entries = [
-                        entry
-                        for entry in previous_entries
-                        if isinstance(entry, dict)
-                    ]
-            except (OSError, json.JSONDecodeError):
-                recent_entries = []
-
-        new_entry = {
-            "productId": str(top_signal.get("productId", "")),
-            "signalName": str(top_signal.get("signal_name", "")),
-            "generatedAt": str(top_signal.get("marketDataRefreshedAt") or datetime.now(timezone.utc).isoformat()),
-            "signalSource": str(signal_source),
-            "confidence": float(top_signal.get("confidence", 0.0) or 0.0),
-            "policyScore": float(top_signal.get("policyScore", 0.0) or 0.0),
-            "setupScore": float(top_signal.get("setupScore", 0.0) or 0.0),
-        }
-        recent_entries = [new_entry] + recent_entries
-
-        deduped_entries: list[dict[str, Any]] = []
-        seen_products: set[str] = set()
-        max_history_entries = max(
-            int(getattr(self.config, "signal_primary_rotation_candidate_window", 4)) * 2,
-            int(getattr(self.config, "signal_primary_rotation_lookback", 3)),
-            6,
-        )
-        for history_entry in recent_entries:
-            product_id = str(history_entry.get("productId", "")).strip().upper()
-            if not product_id or product_id in seen_products:
-                continue
-            seen_products.add(product_id)
-            deduped_entries.append(history_entry)
-            if len(deduped_entries) >= max_history_entries:
-                break
-
-        self.save_json(
-            {
-                "updatedAt": datetime.now(timezone.utc).isoformat(),
-                "entries": deduped_entries,
-            },
-            self.primary_signal_history_path,
-        )
-
-    def _load_last_primary_signal_generated_at(self) -> datetime | None:
-        """Return when the most recent non-empty primary signal was published."""
-
-        timestamp_candidates: list[str] = []
-
-        if self.primary_signal_history_path.exists():
-            try:
-                with self.primary_signal_history_path.open("r", encoding="utf-8") as history_file:
-                    history_payload = json.load(history_file)
-                history_entries = history_payload.get("entries", []) if isinstance(history_payload, dict) else []
-                if isinstance(history_entries, list):
-                    timestamp_candidates.extend(
-                        str(history_entry.get("generatedAt", "")).strip()
-                        for history_entry in history_entries
-                        if isinstance(history_entry, dict) and str(history_entry.get("generatedAt", "")).strip()
-                    )
-            except (OSError, json.JSONDecodeError):
-                timestamp_candidates = []
-
-        latest_signal_path = OUTPUTS_DIR / "latestSignal.json"
-        if latest_signal_path.exists():
-            try:
-                with latest_signal_path.open("r", encoding="utf-8") as latest_signal_file:
-                    latest_signal_payload = json.load(latest_signal_file)
-                if isinstance(latest_signal_payload, dict) and latest_signal_payload:
-                    for field_name in ("marketDataRefreshedAt", "generatedAt", "timestamp"):
-                        raw_value = str(latest_signal_payload.get(field_name, "")).strip()
-                        if raw_value:
-                            timestamp_candidates.append(raw_value)
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        for raw_timestamp in timestamp_candidates:
-            parsed_timestamp = pd.to_datetime(raw_timestamp, utc=True, errors="coerce")
-            if pd.notna(parsed_timestamp):
-                return parsed_timestamp.to_pydatetime()
-
-        return None
-
-    def _should_publish_watchlist_fallback(self) -> bool:
-        """Return whether the public feed should emit a watchlist fallback signal."""
-
-        if not bool(getattr(self.config, "signal_watchlist_fallback_enabled", True)):
-            return False
-
-        quiet_period_hours = max(
-            float(getattr(self.config, "signal_watchlist_fallback_hours", 12.0) or 0.0),
-            0.0,
-        )
-        last_primary_signal_at = self._load_last_primary_signal_generated_at()
-        if last_primary_signal_at is None:
-            return True
-        if quiet_period_hours <= 0:
-            return True
-
-        return (datetime.now(timezone.utc) - last_primary_signal_at) >= timedelta(hours=quiet_period_hours)
-
-    def _select_watchlist_fallback_signal(
-        self,
-        signal_summaries: list[Dict[str, Any]],
-    ) -> Dict[str, Any] | None:
-        """Choose one strong watchlist candidate when the public feed would otherwise be empty."""
-
-        if not self._should_publish_watchlist_fallback():
-            return None
-
-        ranked_candidates = self._rank_watchlist_fallback_candidates(signal_summaries)
-        if not ranked_candidates:
-            return None
-
-        return self._decorate_watchlist_fallback_signal(ranked_candidates[0])
-
-    def _rank_watchlist_fallback_candidates(
-        self,
-        signal_summaries: list[Dict[str, Any]],
-        excluded_product_ids: set[str] | None = None,
-    ) -> list[Dict[str, Any]]:
-        """Return the strongest watchlist candidates that are safe to surface publicly."""
-
-        readiness_priority = {
-            "high": 0,
-            "medium": 1,
-            "standby": 2,
-            "blocked": 3,
-        }
-        minimum_decision_score = float(
-            getattr(self.config, "signal_watchlist_min_decision_score", 0.30) or 0.30
-        )
-        minimum_confidence = float(
-            getattr(self.config, "signal_watchlist_min_confidence", 0.55) or 0.55
-        )
-        excluded_product_ids = {
-            str(product_id).strip().upper()
-            for product_id in list(excluded_product_ids or set())
-            if str(product_id).strip()
-        }
-        ranked_candidates: list[tuple[tuple[Any, ...], Dict[str, Any]]] = []
-
-        for signal_summary in signal_summaries:
-            product_id = str(signal_summary.get("productId", "")).strip().upper()
-            if not product_id or product_id in excluded_product_ids:
-                continue
-
-            brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
-            if str(brain.get("decision", "")).strip().lower() != "watchlist":
-                continue
-
-            trade_context = (
-                signal_summary.get("tradeContext")
-                if isinstance(signal_summary.get("tradeContext"), dict)
-                else {}
-            )
-            if bool(trade_context.get("hasActiveTrade", False)):
-                continue
-
-            raw_signal_name = str(signal_summary.get("modelSignalName", "")).strip().upper()
-            final_signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
-            if raw_signal_name == "TAKE_PROFIT" or final_signal_name == "LOSS":
-                continue
-
-            confidence = float(signal_summary.get("confidence", 0.0) or 0.0)
-            decision_score = float(brain.get("decisionScore", 0.0) or 0.0)
-            if confidence < minimum_confidence or decision_score < minimum_decision_score:
-                continue
-
-            trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
-            ranked_candidates.append(
-                (
-                    (
-                        0 if raw_signal_name == "BUY" else 1,
-                        readiness_priority.get(trade_readiness, 99),
-                        -decision_score,
-                        -float(signal_summary.get("policyScore", 0.0) or 0.0),
-                        -confidence,
-                        product_id,
-                    ),
-                    dict(signal_summary),
-                )
-            )
-
-        if not ranked_candidates:
-            return []
-
-        return [candidate for _, candidate in sorted(ranked_candidates, key=lambda item: item[0])]
-
-    @staticmethod
-    def _decorate_watchlist_fallback_signal(selected_signal: Dict[str, Any]) -> Dict[str, Any]:
-        """Label one internal watchlist candidate as a public fallback row."""
-
-        fallback_note = (
-            "No actionable trade cleared the live gate recently, so this strongest watchlist candidate is surfaced instead."
-        )
-        existing_reason_items = [
-            str(reason_item).strip()
-            for reason_item in list(selected_signal.get("reasonItems", []))
-            if str(reason_item).strip()
-        ]
-        merged_reason_items = [fallback_note]
-        for reason_item in existing_reason_items:
-            if reason_item not in merged_reason_items:
-                merged_reason_items.append(reason_item)
-
-        fallback_signal = dict(selected_signal)
-        fallback_signal["watchlistFallback"] = True
-        fallback_signal["publicSignalType"] = "watchlist"
-        fallback_signal["actionable"] = False
-        fallback_signal["spotAction"] = "wait"
-        fallback_signal["reasonItems"] = merged_reason_items[:4]
-        fallback_signal["reasonSummary"] = merged_reason_items[0]
-        existing_chat = str(fallback_signal.get("signalChat", "")).strip()
-        fallback_signal["signalChat"] = (
-            f"{fallback_note} {existing_chat}".strip()
-            if existing_chat
-            else fallback_note
-        )
-
-        return fallback_signal
-
-    def _supplement_published_signals_with_watchlist_candidates(
-        self,
-        published_signals: list[Dict[str, Any]],
-        signal_summaries: list[Dict[str, Any]],
-    ) -> list[Dict[str, Any]]:
-        """Keep one primary public signal while backfilling a thin feed with watchlist ideas."""
-
-        minimum_published_signals = max(
-            int(getattr(self.config, "signal_watchlist_min_published_signals", 2) or 2),
-            1,
-        )
-        if len(published_signals) >= minimum_published_signals:
-            return list(published_signals)
-        if not published_signals:
-            return []
-
-        existing_product_ids = {
-            str(signal_summary.get("productId", "")).strip().upper()
-            for signal_summary in published_signals
-            if str(signal_summary.get("productId", "")).strip()
-        }
-        ranked_candidates = self._rank_watchlist_fallback_candidates(
-            signal_summaries,
-            excluded_product_ids=existing_product_ids,
-        )
-        if not ranked_candidates:
-            return list(published_signals)
-
-        supplemented_signals = list(published_signals)
-        remaining_slots = minimum_published_signals - len(supplemented_signals)
-        for candidate in ranked_candidates[:remaining_slots]:
-            supplemented_signals.append(self._decorate_watchlist_fallback_signal(candidate))
-
-        return supplemented_signals
-
     def run(self) -> Dict[str, Any]:
         """
         Execute the signal generation workflow.
@@ -2367,126 +1893,68 @@ class SignalGenerationApp(BaseSignalApp):
 
         feature_df = self.dataset_builder.build_feature_table()
         prediction_df = self.model.predict(feature_df)
-        latest_signals = build_latest_signal_summaries(
+        inference_stage = SignalInferenceStage(self.config)
+        inference_artifacts = inference_stage.build_from_prediction_frame(
             prediction_df,
-            minimum_action_confidence=self.config.backtest_min_confidence,
-            config=self.config,
+            mode="historical-market-data",
         )
         signal_prediction_df = prediction_df
-        signal_inference_summary = {
-            "mode": "historical-market-data",
-            "warning": "",
-            "maxProducts": None,
-            "productsRequested": (
-                int(prediction_df["product_id"].nunique())
-                if "product_id" in prediction_df.columns
-                else int(len(prediction_df))
-            ),
-            "totalAvailableProducts": None,
-            "rowsScored": int(len(prediction_df)),
-            "productsScored": (
-                int(prediction_df["product_id"].nunique())
-                if "product_id" in prediction_df.columns
-                else int(len(prediction_df))
-            ),
-        }
         if prefetched_signal_prediction_df is not None and prefetched_signal_inference_summary is not None:
-            fresh_latest_signals = build_latest_signal_summaries(
+            fresh_inference_artifacts = inference_stage.build_from_prediction_frame(
                 prefetched_signal_prediction_df,
-                minimum_action_confidence=self.config.backtest_min_confidence,
-                config=self.config,
+                summary=prefetched_signal_inference_summary,
+                raise_on_empty=False,
             )
-            if fresh_latest_signals:
+            if fresh_inference_artifacts.signal_candidates:
                 signal_prediction_df = prefetched_signal_prediction_df
-                latest_signals = fresh_latest_signals
-                signal_inference_summary = prefetched_signal_inference_summary
+                inference_artifacts = fresh_inference_artifacts
             else:
-                signal_inference_summary["mode"] = "historical-market-data-fallback"
-                signal_inference_summary["warning"] = (
+                inference_artifacts.summary["mode"] = "historical-market-data-fallback"
+                inference_artifacts.summary["warning"] = (
                     "Fresh top-market signal scoring produced no eligible signal rows, "
                     "so publication fell back to the persisted market dataset."
                 )
         elif prefetched_signal_inference_warning:
-            signal_inference_summary["mode"] = "historical-market-data-fallback"
-            signal_inference_summary["warning"] = prefetched_signal_inference_warning
-        if not latest_signals:
-            raise ValueError(
-                "No signal summaries remained after applying the configured signal-universe exclusions."
-            )
+            inference_artifacts.summary["mode"] = "historical-market-data-fallback"
+            inference_artifacts.summary["warning"] = prefetched_signal_inference_warning
+
         portfolio_store = TradingPortfolioStore(
             db_path=self.config.portfolio_store_path,
             default_capital=self.config.portfolio_default_capital,
             database_url=self.config.portfolio_store_url,
         )
-        portfolio = portfolio_store.get_portfolio()
-        positions_by_product = {
-            str(position.get("productId", "")).strip().upper(): position
-            for position in list(portfolio.get("positions", []))
-            if str(position.get("productId", "")).strip()
-        }
-        active_signal_context_by_product: dict[str, dict[str, Any]] = {}
-        for signal_summary in latest_signals:
-            product_id = str(signal_summary.get("productId", "")).strip().upper()
-            if not product_id:
-                continue
-            active_trade = portfolio_store.get_active_trade_for_product(product_id)
-            position = positions_by_product.get(product_id)
-            if active_trade is None and position is None:
-                continue
-            active_signal_context_by_product[product_id] = {
-                "entryPrice": (
-                    position.get("entryPrice")
-                    if position is not None and position.get("entryPrice") is not None
-                    else (active_trade.get("entryPrice") if active_trade is not None else None)
-                ),
-                "currentPrice": (
-                    position.get("currentPrice")
-                    if position is not None and position.get("currentPrice") is not None
-                    else (active_trade.get("currentPrice") if active_trade is not None else None)
-                ),
-                "stopLossPrice": active_trade.get("stopLossPrice") if active_trade is not None else None,
-                "takeProfitPrice": active_trade.get("takeProfitPrice") if active_trade is not None else None,
-                "positionFraction": position.get("positionFraction") if position is not None else None,
-                "quantity": position.get("quantity") if position is not None else None,
-                "openedAt": (
-                    position.get("openedAt")
-                    if position is not None and position.get("openedAt") is not None
-                    else (active_trade.get("openedAt") if active_trade is not None else None)
-                ),
-                "status": active_trade.get("status") if active_trade is not None else None,
-            }
-        latest_signals = apply_signal_trade_context(
-            latest_signals,
-            active_trade_product_ids=portfolio_store.get_active_signal_product_ids(),
-            active_signal_context_by_product=active_signal_context_by_product,
+        primary_history_store = PrimarySignalHistoryStore(
             config=self.config,
+            history_path=self.primary_signal_history_path,
+            save_json=self.save_json,
         )
-        trader_brain_plan = TraderBrain(config=self.config).build_plan(
-            signal_summaries=latest_signals,
-            positions=list(portfolio.get("positions", [])),
-            capital=float(portfolio["capital"]),
-            trade_memory_by_product=portfolio_store.build_trade_learning_map(latest_signals),
+        decision_stage = SignalDecisionStage(
+            self.config,
+            primary_history_store=primary_history_store,
+            allow_watchlist_fallback=True,
+            allow_watchlist_supplement=True,
         )
-        latest_signals = trader_brain_plan["signals"]
-        self._save_watchlist_pool_snapshot(latest_signals)
-        trader_brain_snapshot = {
-            key: value
-            for key, value in trader_brain_plan.items()
-            if key != "signals"
-        }
-        latest_signals = filter_published_signal_summaries(latest_signals)
-        if not latest_signals:
-            watchlist_fallback_signal = self._select_watchlist_fallback_signal(
-                trader_brain_plan["signals"],
-            )
-            if watchlist_fallback_signal is not None:
-                latest_signals = [watchlist_fallback_signal]
-        else:
-            latest_signals = self._supplement_published_signals_with_watchlist_candidates(
-                published_signals=latest_signals,
-                signal_summaries=trader_brain_plan["signals"],
-            )
-        actionable_signals = build_actionable_signal_summaries(latest_signals)
+        publication_stage = SignalPublicationStage(
+            config=self.config,
+            save_json=self.save_json,
+            save_dataframe=self.save_dataframe,
+            signal_store_factory=self._build_signal_store,
+            primary_history_store=primary_history_store,
+        )
+        coordinator = SignalGenerationCoordinator(
+            inference_stage=inference_stage,
+            enrichment_stage=SignalEnrichmentStage(self.config),
+            decision_stage=decision_stage,
+            publication_stage=publication_stage,
+        )
+        pipeline_artifacts = coordinator.run_pipeline(
+            inference_artifacts=inference_artifacts,
+            portfolio_store=portfolio_store,
+            save_watchlist_pool_snapshot=True,
+        )
+        latest_signals = pipeline_artifacts.decision.published_signals
+        actionable_signals = pipeline_artifacts.decision.actionable_signals
+        top_signal = pipeline_artifacts.decision.primary_signal
         prediction_timestamps = signal_prediction_df["timestamp"] if "timestamp" in signal_prediction_df.columns else None
         data_first_timestamp = (
             str(prediction_timestamps.min())
@@ -2515,76 +1983,14 @@ class SignalGenerationApp(BaseSignalApp):
             ),
             "marketDataRefreshedAt": market_data_refreshed_at,
         }
-        latest_signals = [
-            {
-                **signal_summary,
-                **signal_metadata,
-            }
-            for signal_summary in latest_signals
-        ]
-        actionable_signals = [
-            {
-                **signal_summary,
-                **signal_metadata,
-            }
-            for signal_summary in actionable_signals
-        ]
-        recent_primary_product_ids = self._load_recent_primary_product_ids()
-        top_signal = None
-        if latest_signals:
-            top_signal = {
-                **select_primary_signal(
-                    latest_signals,
-                    config=self.config,
-                    recent_primary_product_ids=recent_primary_product_ids,
-                ),
-                **signal_metadata,
-            }
-        frontend_signal_snapshot = build_frontend_signal_snapshot(
+        publication_artifacts = coordinator.publish_signal_generation(
             model_type=self.model.model_type,
-            primary_signal=top_signal,
-            latest_signals=latest_signals,
-            actionable_signals=actionable_signals,
-            trader_brain=trader_brain_snapshot,
-        )
-        frontend_signal_snapshot.update(
-            {
-                "mode": signal_source,
-                "marketDataSource": str(self.config.market_data_source),
-                "marketDataPath": str(self.config.data_file),
-                "marketDataRefresh": market_data_refresh or {},
-                "marketDataRefreshedAt": market_data_refreshed_at,
-                "marketDataLastTimestamp": signal_metadata["marketDataLastTimestamp"],
-                "marketDataFirstTimestamp": signal_metadata["marketDataFirstTimestamp"],
-                "signalInference": signal_inference_summary,
-            }
-        )
-        signal_store_summary = self._persist_live_signal_store(
-            latest_signals=latest_signals,
-            top_signal=top_signal,
-            generated_at=str(frontend_signal_snapshot.get("generatedAt") or datetime.now(timezone.utc).isoformat()),
-        )
-        frontend_signal_snapshot["currentSignalStore"] = {
-            "status": "ready" if int(signal_store_summary.get("signalCount", 0)) > 0 else "empty",
-            "signalCount": int(signal_store_summary.get("signalCount", 0)),
-            "actionableCount": int(signal_store_summary.get("actionableCount", 0)),
-            "primaryProductId": signal_store_summary.get("primaryProductId"),
-            "generatedAt": signal_store_summary.get("generatedAt"),
-            "persistedAt": signal_store_summary.get("persistedAt"),
-            "storageBackend": signal_store_summary.get("storageBackend"),
-            "databaseTarget": signal_store_summary.get("databaseTarget"),
-        }
-
-        self.save_dataframe(prediction_df, OUTPUTS_DIR / "historicalSignals.csv")
-        self.save_json(top_signal or {}, OUTPUTS_DIR / "latestSignal.json")
-        self.save_json({"signals": latest_signals}, OUTPUTS_DIR / "latestSignals.json")
-        self.save_json({"signals": actionable_signals}, OUTPUTS_DIR / "actionableSignals.json")
-        self.save_json(frontend_signal_snapshot, OUTPUTS_DIR / "frontendSignalSnapshot.json")
-        if top_signal is not None:
-            self._save_primary_signal_history(top_signal=top_signal, signal_source=signal_source)
-        tracked_trade_sync = self._sync_generated_signal_trades(
-            latest_signals=latest_signals,
+            historical_prediction_df=prediction_df,
+            pipeline_artifacts=pipeline_artifacts,
             signal_source=signal_source,
+            signal_metadata=signal_metadata,
+            market_data_refresh=market_data_refresh,
+            market_data_refreshed_at=market_data_refreshed_at,
             portfolio_store=portfolio_store,
         )
 
@@ -2595,18 +2001,30 @@ class SignalGenerationApp(BaseSignalApp):
             "latestSignalsPath": str(OUTPUTS_DIR / "latestSignals.json"),
             "actionableSignalsPath": str(OUTPUTS_DIR / "actionableSignals.json"),
             "frontendSignalSnapshotPath": str(OUTPUTS_DIR / "frontendSignalSnapshot.json"),
-            "signalsGenerated": len(latest_signals),
-            "actionableSignalsGenerated": len(actionable_signals),
-            "signalName": top_signal.get("signal_name") if top_signal is not None else None,
-            "confidence": top_signal.get("confidence") if top_signal is not None else None,
-            "signalChat": top_signal.get("signalChat") if top_signal is not None else None,
+            "signalsGenerated": len(publication_artifacts.latest_signals),
+            "actionableSignalsGenerated": len(publication_artifacts.actionable_signals),
+            "signalName": (
+                publication_artifacts.primary_signal.get("signal_name")
+                if publication_artifacts.primary_signal is not None
+                else None
+            ),
+            "confidence": (
+                publication_artifacts.primary_signal.get("confidence")
+                if publication_artifacts.primary_signal is not None
+                else None
+            ),
+            "signalChat": (
+                publication_artifacts.primary_signal.get("signalChat")
+                if publication_artifacts.primary_signal is not None
+                else None
+            ),
             "signalSource": signal_source,
             "marketDataRefresh": market_data_refresh,
             "marketDataRefreshedAt": market_data_refreshed_at,
-            "signalInference": signal_inference_summary,
-            "signalStore": signal_store_summary,
+            "signalInference": pipeline_artifacts.inference.summary,
+            "signalStore": publication_artifacts.signal_store_summary,
             "signalStorePath": str(self.config.signal_store_path),
-            "trackedTradeSync": tracked_trade_sync,
+            "trackedTradeSync": publication_artifacts.tracked_trade_sync,
         }
 
 

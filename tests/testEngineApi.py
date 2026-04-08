@@ -1180,6 +1180,223 @@ def test_engine_api_supports_assistant_chat_endpoints(tmp_path: Path) -> None:
     assert message_response.json()["liveContext"]["source"] == "live"
 
 
+def test_engine_api_exposes_structured_tool_endpoints(tmp_path: Path) -> None:
+    """The engine should expose stable tool contracts for LLM callers."""
+
+    live_snapshot = _build_live_snapshot_payload()
+
+    class FakeLiveSignalEngine:
+        def get_status(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "modelPath": "models/randomForestSignalModel.pkl",
+                "cacheAgeSeconds": 0,
+                "cacheTtlSeconds": 60,
+                "lastGeneratedAt": str(live_snapshot["generatedAt"]),
+            }
+
+        def get_live_snapshot(
+            self,
+            force_refresh: bool = False,
+            product_id: str | None = None,
+            product_ids: list[str] | None = None,
+        ) -> dict[str, object]:
+            del force_refresh
+            if product_id is not None:
+                signal_row = live_snapshot["signalsByProduct"].get(str(product_id).upper())
+                if signal_row is None:
+                    return {**live_snapshot, "signals": [], "signalsByProduct": {}, "primarySignal": None}
+                return {
+                    **live_snapshot,
+                    "signals": [signal_row],
+                    "actionableSignals": [signal_row] if signal_row["spotAction"] != "wait" else [],
+                    "signalsByProduct": {str(product_id).upper(): signal_row},
+                    "primarySignal": signal_row,
+                    "productsCovered": 1,
+                    "requestedProducts": [str(product_id).upper()],
+                }
+
+            if product_ids:
+                filtered_rows = [
+                    live_snapshot["signalsByProduct"][str(requested_product_id).upper()]
+                    for requested_product_id in product_ids
+                    if str(requested_product_id).upper() in live_snapshot["signalsByProduct"]
+                ]
+                filtered_by_product = {
+                    str(signal_row["productId"]).upper(): signal_row
+                    for signal_row in filtered_rows
+                }
+                primary_signal = filtered_rows[0] if filtered_rows else None
+                return {
+                    **live_snapshot,
+                    "signals": filtered_rows,
+                    "actionableSignals": [
+                        signal_row for signal_row in filtered_rows if signal_row["spotAction"] != "wait"
+                    ],
+                    "signalsByProduct": filtered_by_product,
+                    "primarySignal": primary_signal,
+                    "productsCovered": len(filtered_rows),
+                    "requestedProducts": [str(value).upper() for value in product_ids],
+                }
+
+            return live_snapshot
+
+    knowledge_store = RagKnowledgeStore(db_path=tmp_path / "assistantKnowledge.sqlite3")
+    knowledge_store.ingest_text(
+        title="Bitcoin liquidity note",
+        content="Bitcoin liquidity and ETF inflows can reinforce bullish market structure.",
+        source_uri="internal://bitcoin-liquidity-note",
+    )
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=10000.0,
+    )
+    runtime_config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        assistant_store_path=tmp_path / "assistantSessions.sqlite3",
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+        rag_store_path=tmp_path / "assistantKnowledge.sqlite3",
+        live_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            config=runtime_config,
+            live_signal_engine=FakeLiveSignalEngine(),
+            knowledge_store=knowledge_store,
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    catalog_response = client.get("/api/tools")
+    overview_response = client.get("/api/tools/market-overview?force_refresh=true")
+    signal_response = client.get("/api/tools/signals/BTC-USD?force_refresh=true")
+    trader_response = client.get("/api/tools/trader-plan?force_refresh=true")
+    model_response = client.get("/api/tools/model-status")
+    retrieval_response = client.post(
+        "/api/tools/retrieval/search",
+        json={"query": "bitcoin liquidity", "limit": 3},
+    )
+
+    assert catalog_response.status_code == 200
+    assert catalog_response.json()["count"] >= 5
+    assert {tool["name"] for tool in catalog_response.json()["tools"]} >= {
+        "get_market_overview",
+        "get_signal",
+        "get_trader_plan",
+        "get_model_status",
+        "search_knowledge",
+    }
+    assert overview_response.status_code == 200
+    assert overview_response.json()["toolName"] == "get_market_overview"
+    assert overview_response.json()["source"] == "live"
+    assert overview_response.json()["overview"]["primarySignal"]["productId"] == "BTC-USD"
+    assert signal_response.status_code == 200
+    assert signal_response.json()["toolName"] == "get_signal"
+    assert signal_response.json()["signal"]["productId"] == "BTC-USD"
+    assert trader_response.status_code == 200
+    assert trader_response.json()["toolName"] == "get_trader_plan"
+    assert "reduceCount" in trader_response.json()["traderPlan"]["plan"]
+    assert model_response.status_code == 200
+    assert model_response.json()["toolName"] == "get_model_status"
+    assert model_response.json()["model"]["status"] in {"missing", "ready", "error"}
+    assert retrieval_response.status_code == 200
+    assert retrieval_response.json()["toolName"] == "search_knowledge"
+    assert retrieval_response.json()["count"] >= 1
+    assert retrieval_response.json()["results"][0]["title"] == "Bitcoin liquidity note"
+
+
+def test_engine_api_chat_flow_returns_grounded_tool_calls(tmp_path: Path) -> None:
+    """The real assistant service should answer through tool calls, not direct fabrication."""
+
+    live_snapshot = _build_live_snapshot_payload()
+
+    class FakeLiveSignalEngine:
+        def get_status(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "modelPath": "models/randomForestSignalModel.pkl",
+                "cacheAgeSeconds": 0,
+                "cacheTtlSeconds": 60,
+                "lastGeneratedAt": str(live_snapshot["generatedAt"]),
+            }
+
+        def get_live_snapshot(
+            self,
+            force_refresh: bool = False,
+            product_id: str | None = None,
+            product_ids: list[str] | None = None,
+        ) -> dict[str, object]:
+            del force_refresh, product_ids
+            if product_id is None:
+                return live_snapshot
+
+            signal_row = live_snapshot["signalsByProduct"].get(str(product_id).upper())
+            if signal_row is None:
+                return {**live_snapshot, "signals": [], "signalsByProduct": {}, "primarySignal": None}
+
+            return {
+                **live_snapshot,
+                "signals": [signal_row],
+                "actionableSignals": [signal_row] if signal_row["spotAction"] != "wait" else [],
+                "signalsByProduct": {str(product_id).upper(): signal_row},
+                "primarySignal": signal_row,
+                "productsCovered": 1,
+                "requestedProducts": [str(product_id).upper()],
+            }
+
+    knowledge_store = RagKnowledgeStore(db_path=tmp_path / "assistantKnowledge.sqlite3")
+    knowledge_store.ingest_text(
+        title="BTC research memo",
+        content="Bitcoin momentum can remain constructive when liquidity and ETF demand stay firm.",
+        source_uri="internal://btc-research-memo",
+    )
+    portfolio_store = TradingPortfolioStore(
+        db_path=tmp_path / "traderPortfolio.sqlite3",
+        default_capital=10000.0,
+    )
+    runtime_config = TrainingConfig(
+        coinmarketcap_use_context=False,
+        assistant_store_path=tmp_path / "assistantSessions.sqlite3",
+        portfolio_store_path=tmp_path / "traderPortfolio.sqlite3",
+        rag_store_path=tmp_path / "assistantKnowledge.sqlite3",
+        live_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            config=runtime_config,
+            live_signal_engine=FakeLiveSignalEngine(),
+            knowledge_store=knowledge_store,
+            portfolio_store=portfolio_store,
+        )
+    )
+
+    session_response = client.post("/api/chat/sessions", json={})
+    session_id = session_response.json()["session"]["sessionId"]
+
+    message_response = client.post(
+        f"/api/chat/sessions/{session_id}/messages",
+        json={
+            "message": "Why is BTC-USD a buy right now?",
+            "forceRefresh": True,
+        },
+    )
+
+    assert message_response.status_code == 200
+    assert message_response.json()["assistantMessage"]["role"] == "assistant"
+    assert message_response.json()["liveContext"]["source"] == "live"
+    assert message_response.json()["toolCalls"][0]["name"] == "get_signal"
+    assert any(tool_call["name"] == "search_knowledge" for tool_call in message_response.json()["toolCalls"])
+    assert message_response.json()["toolResults"][0]["result"]["toolName"] == "get_signal"
+    assert "BTC-USD is currently a BUY setup" in message_response.json()["assistantMessage"]["content"]
+    assert message_response.json()["assistantMessage"]["metadata"]["toolNames"][0] == "get_signal"
+
+
 def test_engine_api_exposes_rag_ingest_and_search_endpoints(tmp_path: Path) -> None:
     """The engine should let users ingest and search external knowledge sources."""
 

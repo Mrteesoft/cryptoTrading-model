@@ -11,19 +11,17 @@ import pandas as pd
 
 from .config import MODELS_DIR, TrainingConfig, apply_runtime_market_data_settings
 from .data import create_market_data_loader
-from .frontend import WatchlistPoolStore, build_frontend_signal_snapshot
+from .frontend import WatchlistPoolStore
 from .modeling import BaseSignalModel, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .trading.portfolio import TradingPortfolioStore
-from .trading.signals import (
-    apply_signal_trade_context,
-    build_actionable_signal_summaries,
-    build_latest_signal_summaries,
-    filter_published_signal_summaries,
-    is_signal_product_excluded,
-    select_primary_signal,
+from .trading.signals import is_signal_product_excluded
+from .application import (
+    SignalDecisionStage,
+    SignalEnrichmentStage,
+    SignalGenerationCoordinator,
+    SignalInferenceStage,
 )
-from .trading.trader_brain import TraderBrain
 
 
 class LiveSignalEngine:
@@ -249,85 +247,37 @@ class LiveSignalEngine:
                     subset=duplicate_subset,
                     keep="last",
                 )
-        latest_signals = build_latest_signal_summaries(
+        inference_stage = SignalInferenceStage(runtime_config)
+        inference_artifacts = inference_stage.build_from_prediction_frame(
             prediction_df,
-            minimum_action_confidence=runtime_config.backtest_min_confidence,
-            config=runtime_config,
-        )
-        if not latest_signals:
-            raise ValueError(
+            summary={
+                "rowsScored": int(prediction_summary["rowsScored"]),
+                "productsScored": int(prediction_summary["productsScored"]),
+                "watchlistPoolRowsScored": int(watchlist_pool_summary["rowsScored"]),
+                "watchlistPoolProductsScored": int(watchlist_pool_summary["productsScored"]),
+            },
+            empty_message=(
                 "No live signals remained after applying the configured signal-universe exclusions."
-            )
+            ),
+        )
         portfolio_store = TradingPortfolioStore(
             db_path=runtime_config.portfolio_store_path,
             default_capital=runtime_config.portfolio_default_capital,
             database_url=runtime_config.portfolio_store_url,
         )
-        portfolio = portfolio_store.get_portfolio()
-        positions_by_product = {
-            str(position.get("productId", "")).strip().upper(): position
-            for position in list(portfolio.get("positions", []))
-            if str(position.get("productId", "")).strip()
-        }
-        active_signal_context_by_product: dict[str, dict[str, Any]] = {}
-        for signal_summary in latest_signals:
-            signal_product_id = str(signal_summary.get("productId", "")).strip().upper()
-            if not signal_product_id:
-                continue
-            active_trade = portfolio_store.get_active_trade_for_product(signal_product_id)
-            position = positions_by_product.get(signal_product_id)
-            if active_trade is None and position is None:
-                continue
-            active_signal_context_by_product[signal_product_id] = {
-                "entryPrice": (
-                    position.get("entryPrice")
-                    if position is not None and position.get("entryPrice") is not None
-                    else (active_trade.get("entryPrice") if active_trade is not None else None)
-                ),
-                "currentPrice": (
-                    position.get("currentPrice")
-                    if position is not None and position.get("currentPrice") is not None
-                    else (active_trade.get("currentPrice") if active_trade is not None else None)
-                ),
-                "stopLossPrice": active_trade.get("stopLossPrice") if active_trade is not None else None,
-                "takeProfitPrice": active_trade.get("takeProfitPrice") if active_trade is not None else None,
-                "positionFraction": position.get("positionFraction") if position is not None else None,
-                "quantity": position.get("quantity") if position is not None else None,
-                "openedAt": (
-                    position.get("openedAt")
-                    if position is not None and position.get("openedAt") is not None
-                    else (active_trade.get("openedAt") if active_trade is not None else None)
-                ),
-                "status": active_trade.get("status") if active_trade is not None else None,
-            }
-        latest_signals = apply_signal_trade_context(
-            latest_signals,
-            active_trade_product_ids=portfolio_store.get_active_signal_product_ids(),
-            active_signal_context_by_product=active_signal_context_by_product,
-            config=runtime_config,
+        coordinator = SignalGenerationCoordinator(
+            inference_stage=inference_stage,
+            enrichment_stage=SignalEnrichmentStage(runtime_config),
+            decision_stage=SignalDecisionStage(runtime_config),
         )
-        trader_brain_plan = TraderBrain(config=runtime_config).build_plan(
-            signal_summaries=latest_signals,
-            positions=list(portfolio.get("positions", [])),
-            capital=float(portfolio["capital"]),
-            trade_memory_by_product=portfolio_store.build_trade_learning_map(latest_signals),
+        pipeline_artifacts = coordinator.run_pipeline(
+            inference_artifacts=inference_artifacts,
+            portfolio_store=portfolio_store,
         )
-        latest_signals = trader_brain_plan["signals"]
-        trader_brain_snapshot = {
-            key: value
-            for key, value in trader_brain_plan.items()
-            if key != "signals"
-        }
-        latest_signals = filter_published_signal_summaries(latest_signals)
-        actionable_signals = build_actionable_signal_summaries(latest_signals)
-        primary_signal = select_primary_signal(latest_signals) if latest_signals else None
 
-        live_snapshot = build_frontend_signal_snapshot(
+        live_snapshot = coordinator.build_live_snapshot(
             model_type=model.model_type,
-            primary_signal=primary_signal,
-            latest_signals=latest_signals,
-            actionable_signals=actionable_signals,
-            trader_brain=trader_brain_snapshot,
+            pipeline_artifacts=pipeline_artifacts,
         )
         live_snapshot.update(
             {
@@ -345,19 +295,14 @@ class LiveSignalEngine:
                     else "configured-watchlist"
                 ),
                 "requestedProducts": resolved_product_ids,
-                "productsCovered": len(latest_signals),
+                "productsCovered": len(pipeline_artifacts.decision.published_signals),
                 "featureRowsScored": int(len(prediction_df)),
                 "granularitySeconds": int(runtime_config.live_granularity_seconds),
                 "liveSignalCacheSeconds": int(effective_cache_ttl_seconds),
                 "minimumActionConfidence": float(runtime_config.backtest_min_confidence),
                 "modelPath": str(self._resolve_model_path()),
                 "watchlistPool": watchlist_pool_summary,
-                "signalInference": {
-                    "rowsScored": int(prediction_summary["rowsScored"]),
-                    "productsScored": int(prediction_summary["productsScored"]),
-                    "watchlistPoolRowsScored": int(watchlist_pool_summary["rowsScored"]),
-                    "watchlistPoolProductsScored": int(watchlist_pool_summary["productsScored"]),
-                },
+                "signalInference": dict(inference_artifacts.summary),
             }
         )
 
