@@ -899,6 +899,14 @@ def _row_to_signal_summary(
         "reasonSummary": reason_items[0],
         "signalChat": _build_signal_chat(signal_row, reason_items, signal_name=signal_name),
         "chartContext": base_chart_context,
+        "executionContext": {
+            "atrPct14": _safe_float(signal_row, "atr_pct_14"),
+            "volumeVsSma20": _safe_float(signal_row, "volume_vs_sma_20"),
+            "volumeZscore20": _safe_float(signal_row, "volume_zscore_20"),
+            "cmcVolume24hLog": _safe_float(signal_row, "cmc_volume_24h_log"),
+            "cmcNumMarketPairsLog": _safe_float(signal_row, "cmc_num_market_pairs_log"),
+            "cmcRankScore": _safe_float(signal_row, "cmc_rank_score"),
+        },
         "marketContext": {
             "cmcPercentChange24h": _safe_float(signal_row, "cmc_percent_change_24h"),
             "cmcPercentChange7d": _safe_float(signal_row, "cmc_percent_change_7d"),

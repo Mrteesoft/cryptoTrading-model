@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import OUTPUTS_DIR, TrainingConfig
+from .signal_quality import build_signal_quality_context
 
 
 def _utc_now_iso() -> str:
@@ -139,6 +140,7 @@ class WatchlistStateStore:
         signal_summary: dict[str, Any],
         decision_score: float,
         market_context: dict[str, Any],
+        trade_memory: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], WatchlistPromotionSignal]:
         product_id = str(signal_summary.get("productId", "")).strip().upper()
         now_iso = _utc_now_iso()
@@ -168,6 +170,29 @@ class WatchlistStateStore:
         news_context = signal_summary.get("newsContext") or {}
         trend_context = signal_summary.get("trendContext") or {}
         chart_context = signal_summary.get("chartContext") or {}
+        quality_context = build_signal_quality_context(
+            signal_summary=signal_summary,
+            market_context=market_context,
+            trade_memory=trade_memory,
+            config=self.config,
+        )
+        confidence_calibration = quality_context["confidenceCalibration"]
+        execution_context = quality_context["executionContext"]
+        adaptive_context = quality_context["adaptiveContext"]
+        calibrated_confidence = _safe_float(confidence_calibration.get("calibratedConfidence"))
+        if calibrated_confidence is None:
+            calibrated_confidence = confidence
+        chart_alignment_score = _safe_float(confidence_calibration.get("chartAlignmentScore")) or 0.0
+        news_alignment_score = _safe_float(confidence_calibration.get("newsAlignmentScore")) or 0.0
+        trend_alignment_score = _safe_float(confidence_calibration.get("trendAlignmentScore")) or 0.0
+        context_alignment_score = _safe_float(confidence_calibration.get("contextAlignmentScore")) or 0.0
+        execution_quality_score = _safe_float(execution_context.get("executionQualityScore")) or 0.0
+        execution_penalty = _safe_float(execution_context.get("decisionPenalty")) or 0.0
+        thin_liquidity = bool(execution_context.get("isThinLiquidity", False))
+        elevated_execution_cost = bool(execution_context.get("hasElevatedCost", False))
+        execution_blocked = bool(execution_context.get("isExecutionBlocked", False))
+        adaptive_confirmation_adjustment = _safe_float(adaptive_context.get("confirmationAdjustment")) or 0.0
+        adaptive_bias = str(adaptive_context.get("bias", "neutral") or "neutral")
         event_window_active = bool(event_context.get("eventWindowActive", False))
         post_event_cooldown_active = bool(event_context.get("postEventCooldownActive", False))
         event_risk_flag = bool(event_context.get("macroEventRiskFlag", False))
@@ -189,7 +214,8 @@ class WatchlistStateStore:
         structure_label = str(chart_context.get("structureLabel", "")).lower()
         weak_structure = structure_label in {"lower_highs", "lower_lows", "downtrend"}
         confirmed_chart = breakout_confirmed or retest_hold_confirmed
-        supportive_context = positive_trend or positive_news
+        chart_supportive = confirmed_chart or chart_alignment_score >= 0.18
+        supportive_context = positive_trend or positive_news or context_alignment_score >= 0.18
         min_resistance_distance_pct = float(
             getattr(self.config, "signal_watchlist_entry_ready_min_resistance_distance_pct", 0.015) or 0.015
         )
@@ -222,10 +248,13 @@ class WatchlistStateStore:
                 "triggerPrice": trigger_price,
                 "invalidationPrice": invalidation_price,
                 "confidenceHistory": [],
+                "calibratedConfidenceHistory": [],
                 "decisionScoreHistory": [],
                 "tradeReadinessHistory": [],
                 "trendScoreHistory": [],
                 "volatilityRatioHistory": [],
+                "executionQualityHistory": [],
+                "adaptiveBiasHistory": [],
                 "lastSignalName": signal_name,
                 "lastSpotAction": signal_summary.get("spotAction"),
             }
@@ -237,39 +266,62 @@ class WatchlistStateStore:
 
         history_max = int(getattr(self.config, "signal_watchlist_history_max", 6) or 6)
         confidence_history = list(state.get("confidenceHistory") or [])
+        calibrated_confidence_history = list(state.get("calibratedConfidenceHistory") or [])
         decision_history = list(state.get("decisionScoreHistory") or [])
         readiness_history = list(state.get("tradeReadinessHistory") or [])
         trend_history = list(state.get("trendScoreHistory") or [])
         volatility_history = list(state.get("volatilityRatioHistory") or [])
+        execution_quality_history = list(state.get("executionQualityHistory") or [])
+        adaptive_bias_history = list(state.get("adaptiveBiasHistory") or [])
 
         confidence_history.append({"at": now_iso, "value": confidence})
+        calibrated_confidence_history.append({"at": now_iso, "value": float(calibrated_confidence)})
         decision_history.append({"at": now_iso, "value": float(decision_score)})
         readiness_history.append({"at": now_iso, "value": trade_readiness})
         if trend_score is not None:
             trend_history.append({"at": now_iso, "value": float(trend_score)})
         if volatility_ratio is not None:
             volatility_history.append({"at": now_iso, "value": float(volatility_ratio)})
+        execution_quality_history.append({"at": now_iso, "value": float(execution_quality_score)})
+        adaptive_bias_history.append({"at": now_iso, "value": adaptive_bias})
 
         state["confidenceHistory"] = _bounded_history(confidence_history, history_max)
+        state["calibratedConfidenceHistory"] = _bounded_history(calibrated_confidence_history, history_max)
         state["decisionScoreHistory"] = _bounded_history(decision_history, history_max)
         state["tradeReadinessHistory"] = _bounded_history(readiness_history, history_max)
         state["trendScoreHistory"] = _bounded_history(trend_history, history_max)
         state["volatilityRatioHistory"] = _bounded_history(volatility_history, history_max)
+        state["executionQualityHistory"] = _bounded_history(execution_quality_history, history_max)
+        state["adaptiveBiasHistory"] = _bounded_history(adaptive_bias_history, history_max)
+        state["calibratedConfidence"] = float(calibrated_confidence)
+        state["confidenceQuality"] = str(confidence_calibration.get("confidenceQuality", "balanced"))
+        state["contextAlignmentScore"] = float(context_alignment_score)
+        state["executionQualityScore"] = float(execution_quality_score)
+        state["executionBlocked"] = bool(execution_blocked)
+        state["adaptiveBias"] = adaptive_bias
 
         state["checks"] = int(state.get("checks") or 0) + 1
 
         min_confidence = float(self.config.signal_watchlist_promotion_min_confidence)
         min_decision_score = float(self.config.signal_watchlist_promotion_min_decision_score)
-        positive_check = confidence >= min_confidence and decision_score >= min_decision_score
+        positive_check = (
+            calibrated_confidence >= min_confidence
+            and decision_score >= min_decision_score
+            and not execution_blocked
+        )
         if positive_check:
             state["positiveChecks"] = int(state.get("positiveChecks") or 0) + 1
             state["consecutivePositiveChecks"] = int(state.get("consecutivePositiveChecks") or 0) + 1
         else:
             state["consecutivePositiveChecks"] = 0
 
-        first_confidence = confidence_history[0]["value"] if confidence_history else confidence
+        first_confidence = (
+            calibrated_confidence_history[0]["value"]
+            if calibrated_confidence_history
+            else calibrated_confidence
+        )
         first_decision_score = decision_history[0]["value"] if decision_history else float(decision_score)
-        confidence_delta = float(confidence - (first_confidence or 0.0))
+        confidence_delta = float(calibrated_confidence - (first_confidence or 0.0))
         decision_delta = float(decision_score - (first_decision_score or 0.0))
         state["confidenceDelta"] = confidence_delta
         state["decisionScoreDelta"] = decision_delta
@@ -291,7 +343,7 @@ class WatchlistStateStore:
             invalidated = True
         if close_price is not None and invalidation_price is not None and close_price <= invalidation_price:
             invalidated = True
-        if confidence <= invalidation_confidence:
+        if calibrated_confidence <= invalidation_confidence:
             invalidated = True
 
         if invalidated:
@@ -324,17 +376,19 @@ class WatchlistStateStore:
                 and confidence_delta >= min_conf_gain
                 and decision_delta >= min_decision_gain
                 and has_resistance_room
-                and (confirmed_chart or supportive_context)
+                and execution_quality_score >= 0.20
+                and (chart_supportive or supportive_context)
             ):
                 stage = "setup_confirmed"
             if (
                 stage == "setup_confirmed"
                 and positive_check
                 and state.get("consecutivePositiveChecks", 0) >= entry_ready_min_positive_checks
-                and confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
+                and calibrated_confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
                 and decision_score >= float(self.config.signal_watchlist_entry_ready_min_decision_score)
                 and has_resistance_room
-                and confirmed_chart
+                and execution_quality_score >= 0.28
+                and (confirmed_chart or chart_alignment_score >= 0.28)
             ):
                 stage = "entry_ready"
 
@@ -359,6 +413,8 @@ class WatchlistStateStore:
             hard_blocks.append("severe_downtrend_regime")
         if not has_resistance_room:
             hard_blocks.append("near_resistance")
+        if execution_blocked:
+            hard_blocks.append("execution_risk_too_high")
 
         soft_penalties: list[str] = []
         if market_stance == "defensive":
@@ -369,6 +425,12 @@ class WatchlistStateStore:
             soft_penalties.append("high_volatility")
         if negative_news:
             soft_penalties.append("negative_news_conflict")
+        if thin_liquidity:
+            soft_penalties.append("thin_liquidity")
+        if elevated_execution_cost:
+            soft_penalties.append("elevated_execution_cost")
+        if adaptive_bias == "cautious":
+            soft_penalties.append("weak_recent_trade_memory")
 
         setup_building_min_checks = int(
             getattr(self.config, "signal_watchlist_setup_building_min_checks", 2) or 2
@@ -395,6 +457,15 @@ class WatchlistStateStore:
             confirmation_strength += 0.03
         if positive_news and positive_trend:
             confirmation_strength += 0.02
+        confirmation_strength += max(chart_alignment_score, 0.0) * 0.12
+        confirmation_strength += max(news_alignment_score, 0.0) * 0.05
+        confirmation_strength += max(trend_alignment_score, 0.0) * 0.04
+        confirmation_strength += max(adaptive_confirmation_adjustment, 0.0)
+        confirmation_strength -= max(-chart_alignment_score, 0.0) * 0.08
+        confirmation_strength -= max(-news_alignment_score, 0.0) * 0.05
+        confirmation_strength -= max(-trend_alignment_score, 0.0) * 0.03
+        confirmation_strength -= execution_penalty * 0.35
+        confirmation_strength -= max(-adaptive_confirmation_adjustment, 0.0)
         confirmation_strength = min(max(confirmation_strength, 0.0), 1.0)
 
         soft_risk_override_min_confirmation = float(
@@ -405,8 +476,8 @@ class WatchlistStateStore:
             and not hard_blocks
             and bool(soft_penalties)
             and confirmation_strength >= soft_risk_override_min_confirmation
-            and confirmed_chart
-            and confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
+            and (confirmed_chart or chart_alignment_score >= 0.28)
+            and calibrated_confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
             and decision_score >= float(self.config.signal_watchlist_entry_ready_min_decision_score)
         )
 

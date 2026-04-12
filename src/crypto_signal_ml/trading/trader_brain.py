@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Sequence
 
 from ..config import TrainingConfig
 from .decision_intelligence import TradingDecisionDeliberator
+from .signal_quality import build_signal_quality_context
 from .watchlist_state import WatchlistStateStore
 
 
@@ -498,7 +499,7 @@ class TraderBrain:
         product_id = str(signal_summary.get("productId", signal_summary.get("pairSymbol", ""))).upper()
         signal_name = str(signal_summary.get("signal_name", "HOLD")).upper()
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).lower()
-        confidence = _safe_float(signal_summary, "confidence")
+        raw_confidence = _safe_float(signal_summary, "confidence")
         probability_margin = _safe_float(signal_summary, "probabilityMargin")
         setup_score = _safe_float(signal_summary, "setupScore")
         policy_score = _safe_float(signal_summary, "policyScore")
@@ -518,6 +519,33 @@ class TraderBrain:
         structure_label = str(chart_context.get("structureLabel", "")).lower()
         weak_structure = structure_label in {"lower_highs", "lower_lows", "downtrend"}
         macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
+        quality_context = build_signal_quality_context(
+            signal_summary=enriched_signal,
+            market_context=market_context,
+            trade_memory=trade_memory,
+            config=self.config,
+        )
+        enriched_signal.update(quality_context)
+        confidence_calibration = enriched_signal["confidenceCalibration"]
+        execution_context = enriched_signal["executionContext"]
+        adaptive_context = enriched_signal["adaptiveContext"]
+        confidence = _safe_float(
+            confidence_calibration,
+            "calibratedConfidence",
+            default_value=raw_confidence,
+        )
+        chart_alignment_score = _safe_float(confidence_calibration, "chartAlignmentScore")
+        news_alignment_score = _safe_float(confidence_calibration, "newsAlignmentScore")
+        trend_alignment_score = _safe_float(confidence_calibration, "trendAlignmentScore")
+        context_alignment_score = _safe_float(confidence_calibration, "contextAlignmentScore")
+        confidence_quality = str(confidence_calibration.get("confidenceQuality", "balanced"))
+        execution_quality_score = _safe_float(execution_context, "executionQualityScore", default_value=0.5)
+        execution_penalty = _safe_float(execution_context, "decisionPenalty")
+        execution_blocked = _safe_bool(execution_context, "isExecutionBlocked")
+        thin_liquidity = _safe_bool(execution_context, "isThinLiquidity")
+        elevated_execution_cost = _safe_bool(execution_context, "hasElevatedCost")
+        adaptive_size_multiplier = _safe_float(adaptive_context, "sizeMultiplier", default_value=1.0)
+        adaptive_bias = str(adaptive_context.get("bias", "neutral"))
 
         decision_score = self._build_decision_score(
             confidence=confidence,
@@ -530,28 +558,36 @@ class TraderBrain:
             regime_label=regime_label,
             is_high_volatility=is_high_volatility,
             has_event_next_7d=has_event_next_7d,
+            context_alignment_score=context_alignment_score,
+            execution_penalty=execution_penalty,
+            adaptive_decision_adjustment=_safe_float(adaptive_context, "decisionAdjustment"),
         )
 
         positive_news = (
             news_relevance > 0
             and news_sentiment >= float(self.config.news_positive_sentiment_threshold)
-        )
+        ) or news_alignment_score >= 0.15
         negative_news = (
             news_relevance > 0
             and news_sentiment <= float(self.config.news_negative_sentiment_threshold)
+        ) or news_alignment_score <= -0.15
+        trend_supportive = (
+            trend_score >= float(self.config.trend_support_threshold)
+            or trend_alignment_score >= 0.12
         )
-        trend_supportive = trend_score >= float(self.config.trend_support_threshold)
+        chart_supportive = chart_alignment_score >= 0.18
 
         if event_window_active or macro_event_risk:
             decision_score -= float(self.config.event_risk_decision_penalty)
-        if positive_news or trend_supportive:
-            decision_score += float(self.config.news_positive_decision_boost)
-        if negative_news:
-            decision_score -= float(self.config.news_negative_decision_penalty)
-        if breakout_confirmed or retest_hold_confirmed or structure_label in {"higher_highs", "higher_lows"}:
-            decision_score += float(self.config.chart_positive_decision_boost)
-        if near_resistance or weak_structure:
-            decision_score -= float(self.config.chart_negative_decision_penalty)
+        decision_score += max(news_alignment_score, 0.0) * float(self.config.news_positive_decision_boost)
+        decision_score -= max(-news_alignment_score, 0.0) * float(self.config.news_negative_decision_penalty)
+        decision_score += max(trend_alignment_score, 0.0) * min(float(self.config.news_positive_decision_boost), 0.04)
+        decision_score += max(chart_alignment_score, 0.0) * float(self.config.chart_positive_decision_boost)
+        decision_score -= max(-chart_alignment_score, 0.0) * float(self.config.chart_negative_decision_penalty)
+        if elevated_execution_cost:
+            decision_score -= 0.03
+        if execution_blocked:
+            decision_score -= 0.08
         decision_score = _clamp(decision_score, 0.0, 1.25)
 
         watchlist_state = None
@@ -561,6 +597,7 @@ class TraderBrain:
                 signal_summary=enriched_signal,
                 decision_score=decision_score,
                 market_context=dict(market_context),
+                trade_memory=trade_memory,
             )
             enriched_signal["watchlistState"] = dict(watchlist_state)
             enriched_signal["watchlistPromotion"] = {
@@ -597,6 +634,8 @@ class TraderBrain:
         additional_hold_reason = None
         if event_window_active or macro_event_risk:
             additional_hold_reason = "blocked_by_event_risk"
+        elif execution_blocked:
+            additional_hold_reason = "execution_risk_too_high"
         elif post_event_cooldown_active:
             additional_hold_reason = "await_post_event_confirmation"
         elif negative_news:
@@ -605,7 +644,7 @@ class TraderBrain:
             additional_hold_reason = "near_resistance"
         elif weak_structure:
             additional_hold_reason = "weak_chart_structure"
-        elif positive_news or trend_supportive:
+        elif positive_news or trend_supportive or chart_supportive:
             additional_hold_reason = "supported_by_positive_news"
 
         if position is None:
@@ -616,6 +655,12 @@ class TraderBrain:
                 elif trade_readiness == "blocked":
                     proposed_decision = "watchlist"
                     reasons.append("The policy has already blocked this setup from opening fresh risk.")
+                elif execution_blocked:
+                    proposed_decision = "watchlist"
+                    reasons.append("Execution quality is too weak for a clean fresh entry on this coin.")
+                elif (thin_liquidity or elevated_execution_cost) and trade_readiness != "high":
+                    proposed_decision = "watchlist"
+                    reasons.append("Liquidity and trading-cost conditions are still too soft for a normal fresh entry.")
                 elif str(market_context["marketStance"]) == "defensive" and trade_readiness != "high":
                     proposed_decision = "watchlist"
                     reasons.append("The wider market posture is defensive, so only the strongest long setups can open.")
@@ -647,11 +692,13 @@ class TraderBrain:
                         regime_label=regime_label,
                         is_high_volatility=is_high_volatility,
                         has_event_next_7d=has_event_next_7d,
+                        execution_quality_score=execution_quality_score,
+                        adaptive_size_multiplier=adaptive_size_multiplier,
                     )
                     reasons.append("The setup qualifies as a fresh long candidate under the current market posture.")
                     if positive_news or trend_supportive:
                         reasons.append("News or trend context is supportive for follow-through.")
-                    if breakout_confirmed or retest_hold_confirmed:
+                    if breakout_confirmed or retest_hold_confirmed or chart_supportive:
                         reasons.append("Chart structure confirms a breakout/retest, accelerating entry readiness.")
             elif signal_name == "LOSS":
                 proposed_decision = "avoid_long"
@@ -724,6 +771,7 @@ class TraderBrain:
                 elif (
                     trade_readiness == "high"
                     and str(market_context["marketStance"]) != "defensive"
+                    and not execution_blocked
                     and position.position_fraction < float(self.config.brain_base_position_fraction)
                 ):
                     proposed_decision = "add_to_winner_candidate"
@@ -733,6 +781,13 @@ class TraderBrain:
                             float(self.config.brain_base_position_fraction) - position.position_fraction,
                             0.0,
                         ),
+                    )
+                    desired_position_fraction *= 0.82 + (_clamp(execution_quality_score, 0.0, 1.0) * 0.36)
+                    desired_position_fraction *= _clamp(adaptive_size_multiplier, 0.88, 1.10)
+                    desired_position_fraction = _clamp(
+                        desired_position_fraction,
+                        0.0,
+                        float(self.config.brain_scale_in_fraction),
                     )
                     reasons.append("The position can be added to because the trend and confidence are still aligned.")
                 else:
@@ -780,6 +835,20 @@ class TraderBrain:
             reasons.append("Chart structure is weak, which reduces confidence in follow-through.")
         if breakout_confirmed or retest_hold_confirmed:
             reasons.append("Chart structure confirms a breakout/retest hold that supports the entry thesis.")
+        if confidence_quality == "strong":
+            reasons.append("Context-calibrated confidence remains strong after factoring news, chart, and market conditions.")
+        elif confidence_quality == "fragile":
+            reasons.append("Context-calibrated confidence is fragile once chart, news, and market risks are applied.")
+        if execution_blocked:
+            reasons.append("Estimated execution quality is too weak because liquidity is thin relative to volatility.")
+        elif elevated_execution_cost:
+            reasons.append("Estimated round-trip trading cost is elevated, so the setup needs extra edge.")
+        elif thin_liquidity:
+            reasons.append("Liquidity is thinner than ideal, which argues for more patience or smaller size.")
+        if adaptive_bias == "supportive":
+            reasons.append("Recent realized trade outcomes for this coin have been supportive enough to slightly trust the setup more.")
+        elif adaptive_bias == "cautious":
+            reasons.append("Recent realized trade outcomes for this coin have been weak, so the setup is treated more cautiously.")
 
         stop_loss_pct, take_profit_pct = self._build_exit_levels(
             signal_name=signal_name,
@@ -846,6 +915,13 @@ class TraderBrain:
             "decision": final_proposed_decision.replace("_candidate", ""),
             "proposedDecision": final_proposed_decision,
             "decisionScore": float(decision_score),
+            "rawConfidence": float(raw_confidence),
+            "calibratedConfidence": float(confidence),
+            "confidenceQuality": confidence_quality,
+            "contextAlignmentScore": float(context_alignment_score),
+            "chartAlignmentScore": float(chart_alignment_score),
+            "newsAlignmentScore": float(news_alignment_score),
+            "trendAlignmentScore": float(trend_alignment_score),
             "marketStance": str(market_context["marketStance"]),
             "macroRiskMode": macro_risk_mode,
             "desiredPositionFraction": float(desired_position_fraction),
@@ -870,6 +946,11 @@ class TraderBrain:
                 if watchlist_promotion is not None and watchlist_promotion.hold_reason
                 else additional_hold_reason
             ),
+            "executionQualityScore": float(execution_quality_score),
+            "liquidityScore": float(_safe_float(execution_context, "liquidityScore")),
+            "estimatedRoundTripCostRate": float(_safe_float(execution_context, "estimatedRoundTripCostRate")),
+            "executionBlocked": bool(execution_blocked),
+            "adaptiveBias": adaptive_bias,
             "position": position.to_dict() if position is not None else None,
             "evidence": deliberation["evidence"],
             "decisionMemo": decision_memo,
@@ -890,6 +971,9 @@ class TraderBrain:
         regime_label: str,
         is_high_volatility: bool,
         has_event_next_7d: bool,
+        context_alignment_score: float,
+        execution_penalty: float,
+        adaptive_decision_adjustment: float,
     ) -> float:
         """Score one candidate for portfolio planning."""
 
@@ -925,6 +1009,9 @@ class TraderBrain:
             decision_score -= 0.04
         if has_event_next_7d:
             decision_score -= 0.03
+        decision_score += _clamp(context_alignment_score, -1.0, 1.0) * 0.10
+        decision_score -= _clamp(execution_penalty, 0.0, 0.18)
+        decision_score += _clamp(adaptive_decision_adjustment, -0.08, 0.08)
 
         return _clamp(decision_score, 0.0, 1.25)
 
@@ -939,6 +1026,8 @@ class TraderBrain:
         regime_label: str,
         is_high_volatility: bool,
         has_event_next_7d: bool,
+        execution_quality_score: float,
+        adaptive_size_multiplier: float,
     ) -> float:
         """Size one new position from signal quality and current market posture."""
 
@@ -972,6 +1061,8 @@ class TraderBrain:
             size_fraction *= 0.78
         if has_event_next_7d:
             size_fraction *= 0.85
+        size_fraction *= 0.82 + (_clamp(execution_quality_score, 0.0, 1.0) * 0.36)
+        size_fraction *= _clamp(adaptive_size_multiplier, 0.88, 1.10)
 
         return _clamp(
             size_fraction,

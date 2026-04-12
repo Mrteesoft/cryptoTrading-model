@@ -137,17 +137,33 @@ class TradingDecisionDeliberator:
         market_state = signal_summary.get("marketState") or {}
         event_context = signal_summary.get("eventContext") or {}
         watchlist_promotion = signal_summary.get("watchlistPromotion") or {}
+        confidence_calibration = signal_summary.get("confidenceCalibration") or {}
+        execution_context = signal_summary.get("executionContext") or {}
+        adaptive_context = signal_summary.get("adaptiveContext") or {}
         signal_name = str(signal_summary.get("signal_name", "HOLD")).strip().upper()
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
-        confidence = _safe_float(signal_summary, "confidence")
+        raw_confidence = _safe_float(signal_summary, "confidence")
+        confidence = _safe_float(
+            confidence_calibration,
+            "calibratedConfidence",
+            default_value=raw_confidence,
+        )
         probability_margin = _safe_float(signal_summary, "probabilityMargin")
         setup_score = _safe_float(signal_summary, "setupScore")
         policy_score = _safe_float(signal_summary, "policyScore")
+        context_alignment_score = _safe_float(confidence_calibration, "contextAlignmentScore")
+        confidence_quality = str(confidence_calibration.get("confidenceQuality", "balanced"))
         regime_label = str(market_state.get("label", "unknown")).strip().lower()
         is_high_volatility = _safe_bool(market_state, "isHighVolatility")
         has_event_next_7d = _safe_bool(event_context, "hasEventNext7d")
         market_stance = str(market_context.get("marketStance", "balanced") or "balanced")
         macro_risk_mode = str(market_context.get("macroRiskMode", "neutral") or "neutral")
+        execution_quality_score = _safe_float(execution_context, "executionQualityScore", default_value=0.5)
+        liquidity_score = _safe_float(execution_context, "liquidityScore", default_value=0.5)
+        estimated_round_trip_cost_rate = _safe_float(execution_context, "estimatedRoundTripCostRate")
+        is_execution_blocked = _safe_bool(execution_context, "isExecutionBlocked")
+        thin_liquidity = _safe_bool(execution_context, "isThinLiquidity")
+        elevated_cost = _safe_bool(execution_context, "hasElevatedCost")
         has_position = position is not None
         position_fraction = _safe_float(position or {}, "positionFraction")
         position_age_hours = _safe_float(position or {}, "ageHours")
@@ -164,10 +180,17 @@ class TradingDecisionDeliberator:
         normalized_policy_score = _clamp(policy_score / 1.5, 0.0, 1.0)
         normalized_probability_margin = _clamp(probability_margin / 0.20, 0.0, 1.0)
         edge_score = _clamp(
-            (confidence * 0.40)
+            (confidence * 0.36)
             + (normalized_probability_margin * 0.25)
             + (normalized_setup_score * 0.20)
             + (normalized_policy_score * 0.15),
+            0.0,
+            1.0,
+        )
+        edge_score = _clamp(
+            edge_score
+            + (max(context_alignment_score, 0.0) * 0.10)
+            + (execution_quality_score * 0.08),
             0.0,
             1.0,
         )
@@ -191,18 +214,28 @@ class TradingDecisionDeliberator:
             risk_score += 0.08
         if trade_readiness == "blocked":
             risk_score += 0.12
+        if is_execution_blocked:
+            risk_score += 0.14
+        elif thin_liquidity:
+            risk_score += 0.08
+        if elevated_cost:
+            risk_score += 0.05
         if stale_position:
             risk_score += 0.08
         if loss_cut_triggered:
             risk_score += 0.16
 
-        memory_bias = _memory_bias(trade_memory)
+        memory_bias = str(adaptive_context.get("bias") or _memory_bias(trade_memory))
         if memory_bias == "supportive":
             risk_score -= 0.05
         elif memory_bias == "cautious":
             risk_score += 0.10
         if int(_safe_float(trade_memory, "recentLossStreak")) >= 2:
             risk_score += 0.06
+        if confidence_quality == "fragile":
+            risk_score += 0.08
+        elif confidence_quality == "strong":
+            risk_score -= 0.03
 
         risk_score = _clamp(risk_score, 0.0, 1.0)
 
@@ -236,13 +269,17 @@ class TradingDecisionDeliberator:
             supporting_factors.append("The trade has weakened enough that capital protection now takes priority.")
 
         if confidence >= 0.70:
-            supporting_factors.append(f"Model confidence is elevated at {confidence:.2f}.")
+            supporting_factors.append(f"Calibrated confidence is elevated at {confidence:.2f}.")
         if probability_margin >= 0.10:
             supporting_factors.append(f"Probability margin is healthy at {probability_margin:.2f}.")
         if setup_score >= 3.5:
             supporting_factors.append(f"Setup score is supportive at {setup_score:.2f}.")
         if policy_score >= 0.80:
             supporting_factors.append(f"Policy score remains constructive at {policy_score:.2f}.")
+        if context_alignment_score >= 0.20:
+            supporting_factors.append("Chart, news, and trend context are aligned behind the setup.")
+        if execution_quality_score >= 0.50:
+            supporting_factors.append("Liquidity and cost conditions look good enough for execution.")
         if regime_label in UPTREND_LABELS:
             supporting_factors.append("The active regime still favors long momentum.")
         if macro_risk_mode == "risk_on":
@@ -268,6 +305,12 @@ class TradingDecisionDeliberator:
             risk_factors.append("The policy layer has already blocked fresh risk.")
         elif trade_readiness == "standby":
             risk_factors.append("Trade readiness is still only on standby.")
+        if confidence_quality == "fragile":
+            risk_factors.append("Context-adjusted confidence is fragile after applying chart, news, and risk filters.")
+        if is_execution_blocked:
+            risk_factors.append("Execution quality is too weak because liquidity is thin relative to volatility.")
+        elif elevated_cost:
+            risk_factors.append("Estimated execution cost is elevated for a fresh entry.")
         if watchlist_hard_block_count > 0:
             risk_factors.append("Hard watchlist gating is still active against promotion.")
         elif watchlist_soft_penalty_count > 0 and not watchlist_soft_risk_override:
@@ -285,6 +328,8 @@ class TradingDecisionDeliberator:
             counter_arguments.append("The setup can be right on direction but still fail on volatility noise.")
         if has_event_next_7d:
             counter_arguments.append("A catalyst can invalidate the current setup faster than the model horizon.")
+        if is_execution_blocked or elevated_cost:
+            counter_arguments.append("A decent directional call can still fail after costs if execution stays poor.")
         if stale_position and has_position:
             counter_arguments.append("The position may simply be old rather than still genuinely strong.")
         if memory_bias == "cautious":
@@ -299,10 +344,13 @@ class TradingDecisionDeliberator:
             "hasPosition": bool(has_position),
             "isHighVolatility": bool(is_high_volatility),
             "hasEventNext7d": bool(has_event_next_7d),
+            "rawConfidence": float(raw_confidence),
             "confidence": float(confidence),
+            "confidenceQuality": confidence_quality,
             "probabilityMargin": float(probability_margin),
             "setupScore": float(setup_score),
             "policyScore": float(policy_score),
+            "contextAlignmentScore": float(context_alignment_score),
             "positionFraction": float(position_fraction),
             "positionAgeHours": float(position_age_hours) if position_age_hours > 0 else None,
             "positionUnrealizedReturn": position_unrealized_return,
@@ -312,6 +360,10 @@ class TradingDecisionDeliberator:
             "edgeScore": float(edge_score),
             "riskScore": float(risk_score),
             "convictionScore": float(conviction_score),
+            "executionQualityScore": float(execution_quality_score),
+            "liquidityScore": float(liquidity_score),
+            "estimatedRoundTripCostRate": float(estimated_round_trip_cost_rate),
+            "executionBlocked": bool(is_execution_blocked),
             "supportingFactors": supporting_factors[:4],
             "riskFactors": risk_factors[:4],
             "counterArguments": counter_arguments[:3],
@@ -445,10 +497,14 @@ class TradingDecisionDeliberator:
                 objections.append("Volatility is elevated for a new entry.")
             if _safe_bool(evidence, "hasEventNext7d"):
                 objections.append("Event risk is too near for a clean entry.")
+            if _safe_bool(evidence, "executionBlocked"):
+                objections.append("Execution quality is too weak for a new entry.")
             if str(evidence.get("regimeLabel", "")) in DOWNTREND_LABELS:
                 objections.append("The regime is still downward for fresh long risk.")
             if str(evidence.get("tradeReadiness", "standby")) == "blocked":
                 objections.append("The policy layer already blocked this setup.")
+            if str(evidence.get("confidenceQuality", "balanced")) == "fragile":
+                objections.append("Context-adjusted confidence is too fragile for fresh capital.")
             if conviction_score < 0.58:
                 objections.append("Conviction is not strong enough for fresh capital.")
             trade_memory = evidence.get("tradeMemory") or {}

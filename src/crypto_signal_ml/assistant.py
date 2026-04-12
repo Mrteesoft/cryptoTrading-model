@@ -370,21 +370,27 @@ class TradingAssistantService:
             force_refresh=force_refresh,
         )
         resolved_product_id = flow_result["resolvedProductId"]
+        resolved_product_ids = list(flow_result.get("resolvedProductIds", []))
         answer_text = str(flow_result["replyText"])
         retrieval = dict(flow_result["retrieval"])
         live_context = dict(flow_result["liveContext"])
         tool_calls = list(flow_result["toolCalls"])
         tool_results = list(flow_result["toolResults"])
+        routing = dict(flow_result.get("routing") or {})
+        tool_telemetry = dict(flow_result.get("toolTelemetry") or {})
         assistant_message = self.session_store.add_message(
             session_id=session_id,
             role="assistant",
             content=answer_text,
             metadata={
                 "productId": resolved_product_id,
+                "productIds": resolved_product_ids,
                 "liveSource": live_context.get("source"),
                 "liveError": live_context.get("error"),
                 "toolCalls": tool_calls,
                 "toolNames": [tool_call["name"] for tool_call in tool_calls],
+                "routing": routing,
+                "toolTelemetry": tool_telemetry,
                 "retrieval": {
                     "messageCount": len(retrieval.get("messages", [])),
                     "knowledgeCount": len(retrieval.get("knowledge", [])),
@@ -402,7 +408,9 @@ class TradingAssistantService:
             ),
             "liveContext": live_context,
             "retrieval": retrieval,
+            "routing": routing,
             "toolCalls": tool_calls,
+            "toolTelemetry": tool_telemetry,
             "toolResults": tool_results,
         }
 
