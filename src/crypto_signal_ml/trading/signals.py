@@ -1,6 +1,6 @@
 """Helpers for turning model predictions into human-readable spot-trading signals."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import pandas as pd
 
@@ -972,6 +972,7 @@ def build_latest_signal_summaries(
     prediction_df: pd.DataFrame,
     minimum_action_confidence: float = 0.0,
     config: TrainingConfig | None = None,
+    protected_product_ids: Sequence[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Build the newest available signal for each asset in the prediction table.
@@ -1011,6 +1012,11 @@ def build_latest_signal_summaries(
 
     window_map: dict[str, pd.DataFrame] = {}
     chart_context_by_product: dict[str, dict[str, Any]] = {}
+    protected_product_id_set = {
+        str(product_id).strip().upper()
+        for product_id in (protected_product_ids or ())
+        if str(product_id).strip()
+    }
     if "product_id" in prediction_df.columns:
         window_size = int(getattr(config, "chart_feature_window", 60) or 60) if config is not None else 60
         for product_id, group in prediction_df.groupby("product_id"):
@@ -1033,7 +1039,8 @@ def build_latest_signal_summaries(
     signal_summaries = [
         signal_summary
         for signal_summary in signal_summaries
-        if not is_signal_product_excluded(
+        if str(signal_summary.get("productId", "")).strip().upper() in protected_product_id_set
+        or not is_signal_product_excluded(
             product_id=str(signal_summary.get("productId", "")),
             base_currency=str(signal_summary.get("baseCurrency", "")),
             config=config,

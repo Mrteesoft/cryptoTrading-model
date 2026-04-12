@@ -22,6 +22,22 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    normalized_value = str(value or "").strip().replace("Z", "+00:00")
+    if not normalized_value:
+        return None
+
+    try:
+        parsed_value = datetime.fromisoformat(normalized_value)
+    except ValueError:
+        return None
+
+    if parsed_value.tzinfo is None:
+        return parsed_value.replace(tzinfo=timezone.utc)
+
+    return parsed_value.astimezone(timezone.utc)
+
+
 def _bounded_history(rows: list[dict[str, Any]], max_len: int) -> list[dict[str, Any]]:
     if max_len <= 0:
         return rows
@@ -36,10 +52,22 @@ class WatchlistPromotionSignal:
     promotion_ready: bool
     blocked_reason: str | None
     hold_reason: str | None
+    hard_blocks: tuple[str, ...] = ()
+    soft_penalties: tuple[str, ...] = ()
+    confirmation_strength: float = 0.0
+    exceptional_override_applied: bool = False
 
 
 class WatchlistStateStore:
     """Store watchlist lifecycle state in a JSON file."""
+
+    stage_priority = {
+        "entry_ready": 0,
+        "setup_confirmed": 1,
+        "setup_building": 2,
+        "watchlist": 3,
+        "observe": 4,
+    }
 
     def __init__(self, config: TrainingConfig | None = None) -> None:
         self.config = config or TrainingConfig()
@@ -72,6 +100,39 @@ class WatchlistStateStore:
     def get_state(self, product_id: str) -> dict[str, Any] | None:
         return self._state.get("items", {}).get(product_id)
 
+    def list_active_product_ids(self, limit: int | None = None) -> list[str]:
+        """Return active watchlist products ordered by readiness and review recency."""
+
+        item_rows = list((self._state.get("items") or {}).values())
+        ranked_rows = sorted(
+            [
+                item_row
+                for item_row in item_rows
+                if str(item_row.get("productId", "")).strip()
+                and str(item_row.get("stage", "observe")).strip().lower() != "invalidated"
+            ],
+            key=lambda item_row: (
+                self.stage_priority.get(str(item_row.get("stage", "observe")).strip().lower(), 99),
+                -int(item_row.get("consecutivePositiveChecks", 0) or 0),
+                -int(item_row.get("positiveChecks", 0) or 0),
+                -float(item_row.get("decisionScoreDelta", 0.0) or 0.0),
+                -float(item_row.get("confidenceDelta", 0.0) or 0.0),
+                -(
+                    _parse_iso_timestamp(item_row.get("lastReviewedAt"))
+                    or datetime(1970, 1, 1, tzinfo=timezone.utc)
+                ).timestamp(),
+                str(item_row.get("productId", "")),
+            ),
+        )
+
+        product_ids = [
+            str(item_row.get("productId", "")).strip().upper()
+            for item_row in ranked_rows
+        ]
+        if limit is not None:
+            product_ids = product_ids[: max(int(limit), 0)]
+        return product_ids
+
     def update_from_signal(
         self,
         *,
@@ -98,8 +159,11 @@ class WatchlistStateStore:
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
         confidence = _safe_float(signal_summary.get("confidence")) or 0.0
         close_price = _safe_float(signal_summary.get("close"))
-        trend_score = _safe_float((signal_summary.get("marketState") or {}).get("trendScore"))
-        volatility_ratio = _safe_float((signal_summary.get("marketState") or {}).get("volatilityRatio"))
+        market_state = signal_summary.get("marketState") or {}
+        trend_score = _safe_float(market_state.get("trendScore"))
+        volatility_ratio = _safe_float(market_state.get("volatilityRatio"))
+        is_high_volatility = bool(market_state.get("isHighVolatility", False))
+        regime_label = str(market_state.get("label", "unknown")).strip().lower()
         event_context = signal_summary.get("eventContext") or {}
         news_context = signal_summary.get("newsContext") or {}
         trend_context = signal_summary.get("trendContext") or {}
@@ -107,8 +171,13 @@ class WatchlistStateStore:
         event_window_active = bool(event_context.get("eventWindowActive", False))
         post_event_cooldown_active = bool(event_context.get("postEventCooldownActive", False))
         event_risk_flag = bool(event_context.get("macroEventRiskFlag", False))
-        negative_news = float(news_context.get("newsSentiment1h", 0.0) or 0.0) <= float(
+        news_sentiment = float(news_context.get("newsSentiment1h", 0.0) or 0.0)
+        news_relevance = float(news_context.get("newsRelevanceScore", 0.0) or 0.0)
+        negative_news = news_relevance > 0 and news_sentiment <= float(
             self.config.news_negative_sentiment_threshold
+        )
+        positive_news = news_relevance > 0 and news_sentiment >= float(
+            self.config.news_positive_sentiment_threshold
         )
         positive_trend = float(trend_context.get("topicTrendScore", 0.0) or 0.0) >= float(
             self.config.trend_support_threshold
@@ -116,8 +185,25 @@ class WatchlistStateStore:
         breakout_confirmed = bool(chart_context.get("breakoutConfirmed", False))
         retest_hold_confirmed = bool(chart_context.get("retestHoldConfirmed", False))
         near_resistance = bool(chart_context.get("nearResistance", False))
+        resistance_distance_pct = _safe_float(chart_context.get("resistanceDistancePct"))
         structure_label = str(chart_context.get("structureLabel", "")).lower()
         weak_structure = structure_label in {"lower_highs", "lower_lows", "downtrend"}
+        confirmed_chart = breakout_confirmed or retest_hold_confirmed
+        supportive_context = positive_trend or positive_news
+        min_resistance_distance_pct = float(
+            getattr(self.config, "signal_watchlist_entry_ready_min_resistance_distance_pct", 0.015) or 0.015
+        )
+        has_resistance_room = bool(
+            confirmed_chart
+            or (
+                not near_resistance
+                and (
+                    resistance_distance_pct is None
+                    or resistance_distance_pct >= min_resistance_distance_pct
+                )
+            )
+        )
+        prior_stage = stage
 
         if not state:
             trigger_pct = float(self.config.signal_watchlist_breakout_pct)
@@ -143,6 +229,7 @@ class WatchlistStateStore:
                 "lastSignalName": signal_name,
                 "lastSpotAction": signal_summary.get("spotAction"),
             }
+            prior_stage = stage
 
         state["lastReviewedAt"] = now_iso
         state["lastSignalName"] = signal_name
@@ -211,73 +298,153 @@ class WatchlistStateStore:
             stage = "invalidated"
             state["invalidatedAt"] = now_iso
         else:
+            setup_building_min_checks = int(
+                getattr(self.config, "signal_watchlist_setup_building_min_checks", 2) or 2
+            )
             min_positive_checks = int(self.config.signal_watchlist_promotion_min_positive_checks)
             min_conf_gain = float(self.config.signal_watchlist_promotion_min_confidence_gain)
             min_decision_gain = float(self.config.signal_watchlist_promotion_min_decision_score_gain)
-            if stage in {"observe", "watchlist"} and positive_check:
+            entry_ready_min_positive_checks = int(
+                getattr(
+                    self.config,
+                    "signal_watchlist_entry_ready_min_positive_checks",
+                    max(min_positive_checks + 1, 3),
+                )
+                or max(min_positive_checks + 1, 3)
+            )
+            if (
+                stage in {"observe", "watchlist"}
+                and positive_check
+                and int(state.get("checks") or 0) >= setup_building_min_checks
+            ):
                 stage = "setup_building"
             if (
                 stage in {"setup_building", "watchlist"}
-                and (
-                    state.get("consecutivePositiveChecks", 0) >= min_positive_checks
-                    or breakout_confirmed
-                    or retest_hold_confirmed
-                )
+                and state.get("consecutivePositiveChecks", 0) >= min_positive_checks
                 and confidence_delta >= min_conf_gain
                 and decision_delta >= min_decision_gain
+                and has_resistance_room
+                and (confirmed_chart or supportive_context)
             ):
                 stage = "setup_confirmed"
-            if stage == "setup_confirmed":
-                breakout_pct = float(self.config.signal_watchlist_breakout_pct)
-                if close_price is not None and trigger_price is not None and close_price >= trigger_price:
-                    stage = "entry_ready"
-                elif breakout_pct <= 0 and positive_check:
-                    stage = "entry_ready"
-                elif breakout_confirmed or retest_hold_confirmed:
-                    stage = "entry_ready"
+            if (
+                stage == "setup_confirmed"
+                and positive_check
+                and state.get("consecutivePositiveChecks", 0) >= entry_ready_min_positive_checks
+                and confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
+                and decision_score >= float(self.config.signal_watchlist_entry_ready_min_decision_score)
+                and has_resistance_room
+                and confirmed_chart
+            ):
+                stage = "entry_ready"
 
         state["stage"] = stage
-        state["lastStageChangeAt"] = state.get("lastStageChangeAt") or now_iso
+        if stage != prior_stage:
+            state["lastStageChangeAt"] = now_iso
+        else:
+            state["lastStageChangeAt"] = state.get("lastStageChangeAt") or now_iso
 
         market_stance = str(market_context.get("marketStance", "balanced"))
         macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
-        blocked_reason = None
+        hard_blocks: list[str] = []
         if trade_readiness == "blocked":
-            blocked_reason = "blocked_by_risk"
-        elif event_window_active or event_risk_flag:
-            blocked_reason = "blocked_by_event_risk"
-        elif near_resistance:
-            blocked_reason = "near_resistance"
-        elif weak_structure:
-            blocked_reason = "weak_chart_structure"
-        elif market_stance == "defensive" or macro_risk_mode == "risk_off":
-            blocked_reason = "blocked_by_regime"
-        elif negative_news:
-            blocked_reason = "negative_news_conflict"
+            hard_blocks.append("blocked_by_risk")
+        if event_window_active or event_risk_flag:
+            hard_blocks.append("blocked_by_event_risk")
+        if post_event_cooldown_active:
+            hard_blocks.append("await_post_event_confirmation")
+        if weak_structure:
+            hard_blocks.append("weak_chart_structure")
+        if regime_label in {"trend_down", "trend_down_high_volatility"}:
+            hard_blocks.append("severe_downtrend_regime")
+        if not has_resistance_room:
+            hard_blocks.append("near_resistance")
+
+        soft_penalties: list[str] = []
+        if market_stance == "defensive":
+            soft_penalties.append("defensive_market")
+        if macro_risk_mode == "risk_off":
+            soft_penalties.append("macro_risk_off")
+        if is_high_volatility:
+            soft_penalties.append("high_volatility")
+        if negative_news:
+            soft_penalties.append("negative_news_conflict")
+
+        setup_building_min_checks = int(
+            getattr(self.config, "signal_watchlist_setup_building_min_checks", 2) or 2
+        )
+        min_positive_checks = int(self.config.signal_watchlist_promotion_min_positive_checks)
+        min_conf_gain = float(self.config.signal_watchlist_promotion_min_confidence_gain)
+        min_decision_gain = float(self.config.signal_watchlist_promotion_min_decision_score_gain)
+        confirmation_strength = 0.0
+        if positive_check:
+            confirmation_strength += 0.18
+        if int(state.get("checks") or 0) >= setup_building_min_checks:
+            confirmation_strength += 0.12
+        if int(state.get("consecutivePositiveChecks") or 0) >= min_positive_checks:
+            confirmation_strength += 0.18
+        if confidence_delta >= min_conf_gain:
+            confirmation_strength += 0.10
+        if decision_delta >= min_decision_gain:
+            confirmation_strength += 0.17
+        if confirmed_chart:
+            confirmation_strength += 0.17
+        if has_resistance_room:
+            confirmation_strength += 0.05
+        if supportive_context:
+            confirmation_strength += 0.03
+        if positive_news and positive_trend:
+            confirmation_strength += 0.02
+        confirmation_strength = min(max(confirmation_strength, 0.0), 1.0)
+
+        soft_risk_override_min_confirmation = float(
+            getattr(self.config, "signal_watchlist_soft_risk_override_min_confirmation", 0.72) or 0.72
+        )
+        exceptional_override_applied = bool(
+            stage == "entry_ready"
+            and not hard_blocks
+            and bool(soft_penalties)
+            and confirmation_strength >= soft_risk_override_min_confirmation
+            and confirmed_chart
+            and confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
+            and decision_score >= float(self.config.signal_watchlist_entry_ready_min_decision_score)
+        )
+
+        blocked_reason = None
+        if hard_blocks:
+            blocked_reason = hard_blocks[0]
+        elif stage == "entry_ready" and soft_penalties and not exceptional_override_applied:
+            blocked_reason = soft_penalties[0]
 
         promotion_ready = (
             stage == "entry_ready"
             and trade_readiness in {"high", "medium"}
-            and confidence >= float(self.config.signal_watchlist_entry_ready_min_confidence)
-            and decision_score >= float(self.config.signal_watchlist_entry_ready_min_decision_score)
-            and blocked_reason is None
+            and not hard_blocks
+            and (not soft_penalties or exceptional_override_applied)
         )
 
         hold_reason = None
-        if stage in {"watchlist", "setup_building"}:
+        if stage == "watchlist":
             hold_reason = "wait_for_setup_building"
+        elif stage == "setup_building":
+            hold_reason = "wait_for_setup_confirmation"
         elif stage == "setup_confirmed":
             hold_reason = "wait_for_breakout_confirmation"
             if retest_hold_confirmed:
-                hold_reason = "wait_for_retest_hold"
-        elif stage == "entry_ready" and post_event_cooldown_active:
-            hold_reason = "await_post_event_confirmation"
+                hold_reason = "wait_for_entry_window"
         elif stage == "entry_ready" and blocked_reason is not None:
             hold_reason = blocked_reason
         elif stage == "invalidated":
             hold_reason = "invalidated"
-        elif positive_trend and hold_reason is None:
+        elif supportive_context and hold_reason is None:
             hold_reason = "supported_by_positive_news"
+
+        state["hardBlocks"] = list(hard_blocks)
+        state["softPenalties"] = list(soft_penalties)
+        state["confirmationStrength"] = float(confirmation_strength)
+        state["promotionReady"] = bool(promotion_ready)
+        state["blockedReason"] = blocked_reason
+        state["holdReason"] = hold_reason
 
         self._state.setdefault("items", {})[product_id] = state
         self._dirty = True
@@ -287,4 +454,8 @@ class WatchlistStateStore:
             promotion_ready=promotion_ready,
             blocked_reason=blocked_reason,
             hold_reason=hold_reason,
+            hard_blocks=tuple(hard_blocks),
+            soft_penalties=tuple(soft_penalties),
+            confirmation_strength=float(confirmation_strength),
+            exceptional_override_applied=exceptional_override_applied,
         )

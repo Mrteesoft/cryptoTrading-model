@@ -563,6 +563,16 @@ class TraderBrain:
                 market_context=dict(market_context),
             )
             enriched_signal["watchlistState"] = dict(watchlist_state)
+            enriched_signal["watchlistPromotion"] = {
+                "stage": watchlist_promotion.stage,
+                "promotionReady": watchlist_promotion.promotion_ready,
+                "blockedReason": watchlist_promotion.blocked_reason,
+                "holdReason": watchlist_promotion.hold_reason,
+                "hardBlocks": list(watchlist_promotion.hard_blocks),
+                "softPenalties": list(watchlist_promotion.soft_penalties),
+                "confirmationStrength": float(watchlist_promotion.confirmation_strength),
+                "exceptionalOverrideApplied": bool(watchlist_promotion.exceptional_override_applied),
+            }
 
         desired_position_fraction = 0.0
         allocation_fraction = 0.0
@@ -661,12 +671,15 @@ class TraderBrain:
             ):
                 proposed_decision = "enter_long_candidate"
                 reasons.append(
-                    "Watchlist setup matured with improving confidence and decision strength, so it is promoted to an entry candidate."
+                    "Watchlist follow-up matured through repeated checks and confirmed structure, so it is promoted to an entry candidate."
                 )
-            elif watchlist_promotion is not None and watchlist_promotion.blocked_reason:
-                reasons.append(
-                    "Watchlist setup is progressing, but promotion is blocked by the current regime or risk posture."
-                )
+                if watchlist_promotion.exceptional_override_applied:
+                    reasons.append("Strong structural confirmation is overriding a mild defensive or risk-off backdrop.")
+            elif watchlist_promotion is not None:
+                if watchlist_promotion.hard_blocks:
+                    reasons.append("Hard watchlist blocks still prevent promotion on this cycle.")
+                elif watchlist_promotion.soft_penalties:
+                    reasons.append("Watchlist setup is improving, but soft market penalties still cap promotion for now.")
         else:
             if signal_name == "LOSS":
                 proposed_decision = "exit_position"
@@ -778,7 +791,7 @@ class TraderBrain:
         take_profit_price = (current_price * (1.0 + take_profit_pct)) if current_price > 0 else None
 
         deliberation = self.deliberator.deliberate(
-            signal_summary=signal_summary,
+            signal_summary=enriched_signal,
             base_decision=proposed_decision,
             base_decision_score=decision_score,
             base_reasons=reasons[:],

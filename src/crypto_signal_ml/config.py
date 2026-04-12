@@ -154,6 +154,11 @@ class TrainingConfig:
     coinmarketcap_context_file: Path = RAW_DATA_DIR / "coinMarketCapContext.csv"
     coinmarketcap_use_market_intelligence: bool = _env_bool("COINMARKETCAP_USE_MARKET_INTELLIGENCE", True)
     coinmarketcap_market_intelligence_file: Path = RAW_DATA_DIR / "coinMarketCapMarketIntelligence.csv"
+    coinmarketcap_universe_cache_file: Path = OUTPUTS_DIR / "coinmarketcapUniverse.json"
+    coinmarketcap_universe_ttl_seconds: int = _env_optional_int("COINMARKETCAP_UNIVERSE_TTL_SECONDS", 21600) or 21600
+    coinmarketcap_universe_rate_limit_cooldown_seconds: int = (
+        _env_optional_int("COINMARKETCAP_UNIVERSE_RATE_LIMIT_COOLDOWN_SECONDS", 1800) or 1800
+    )
     coinmarketcap_api_base_url: str = "https://pro-api.coinmarketcap.com"
     coinmarketcap_api_key_env_var: str = "COINMARKETCAP_API_KEY"
     coinmarketcap_quote_currency: str = "USD"
@@ -271,6 +276,14 @@ class TrainingConfig:
         "SIGNAL_WATCHLIST_PROMOTION_MIN_POSITIVE_CHECKS",
         2,
     ) or 2
+    signal_watchlist_setup_building_min_checks: int = _env_optional_int(
+        "SIGNAL_WATCHLIST_SETUP_BUILDING_MIN_CHECKS",
+        2,
+    ) or 2
+    signal_watchlist_entry_ready_min_positive_checks: int = _env_optional_int(
+        "SIGNAL_WATCHLIST_ENTRY_READY_MIN_POSITIVE_CHECKS",
+        3,
+    ) or 3
     signal_watchlist_entry_ready_min_confidence: float = _env_float(
         "SIGNAL_WATCHLIST_ENTRY_READY_MIN_CONFIDENCE",
         0.62,
@@ -278,6 +291,14 @@ class TrainingConfig:
     signal_watchlist_entry_ready_min_decision_score: float = _env_float(
         "SIGNAL_WATCHLIST_ENTRY_READY_MIN_DECISION_SCORE",
         0.62,
+    )
+    signal_watchlist_entry_ready_min_resistance_distance_pct: float = _env_float(
+        "SIGNAL_WATCHLIST_ENTRY_READY_MIN_RESISTANCE_DISTANCE_PCT",
+        0.015,
+    )
+    signal_watchlist_soft_risk_override_min_confirmation: float = _env_float(
+        "SIGNAL_WATCHLIST_SOFT_RISK_OVERRIDE_MIN_CONFIRMATION",
+        0.72,
     )
     signal_track_generated_trades: bool = _env_bool("SIGNAL_TRACK_GENERATED_TRADES", False)
     signal_generated_trade_status: str = _env_str("SIGNAL_GENERATED_TRADE_STATUS", "planned")
@@ -442,15 +463,10 @@ def config_to_dict(config: TrainingConfig) -> Dict[str, object]:
     """
 
     config_dict = asdict(config)
-    config_dict["data_file"] = str(config.data_file)
-    config_dict["coinmarketcap_context_file"] = str(config.coinmarketcap_context_file)
-    config_dict["coinmarketcap_market_intelligence_file"] = str(config.coinmarketcap_market_intelligence_file)
-    config_dict["coinmarketcal_events_file"] = str(config.coinmarketcal_events_file)
-    config_dict["market_product_batch_state_file"] = str(config.market_product_batch_state_file)
-    config_dict["assistant_store_path"] = str(config.assistant_store_path)
-    config_dict["portfolio_store_path"] = str(config.portfolio_store_path)
-    config_dict["signal_store_path"] = str(config.signal_store_path)
-    config_dict["rag_store_path"] = str(config.rag_store_path)
+    for field_name in TrainingConfig.__dataclass_fields__:
+        field_value = getattr(config, field_name)
+        if isinstance(field_value, Path):
+            config_dict[field_name] = str(field_value)
     return config_dict
 
 
@@ -463,27 +479,12 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
     """
 
     restored_config = dict(config_dict)
-    restored_config["data_file"] = Path(str(restored_config["data_file"]))
-    if "coinmarketcap_context_file" in restored_config:
-        restored_config["coinmarketcap_context_file"] = Path(str(restored_config["coinmarketcap_context_file"]))
-    if "coinmarketcap_market_intelligence_file" in restored_config:
-        restored_config["coinmarketcap_market_intelligence_file"] = Path(
-            str(restored_config["coinmarketcap_market_intelligence_file"])
-        )
-    if "coinmarketcal_events_file" in restored_config:
-        restored_config["coinmarketcal_events_file"] = Path(str(restored_config["coinmarketcal_events_file"]))
-    if "market_product_batch_state_file" in restored_config:
-        restored_config["market_product_batch_state_file"] = Path(
-            str(restored_config["market_product_batch_state_file"])
-        )
-    if "assistant_store_path" in restored_config:
-        restored_config["assistant_store_path"] = Path(str(restored_config["assistant_store_path"]))
-    if "portfolio_store_path" in restored_config:
-        restored_config["portfolio_store_path"] = Path(str(restored_config["portfolio_store_path"]))
-    if "signal_store_path" in restored_config:
-        restored_config["signal_store_path"] = Path(str(restored_config["signal_store_path"]))
-    if "rag_store_path" in restored_config:
-        restored_config["rag_store_path"] = Path(str(restored_config["rag_store_path"]))
+    default_config = TrainingConfig()
+    for field_name in TrainingConfig.__dataclass_fields__:
+        if field_name not in restored_config:
+            continue
+        if isinstance(getattr(default_config, field_name), Path):
+            restored_config[field_name] = Path(str(restored_config[field_name]))
     if "comparison_model_types" in restored_config:
         restored_config["comparison_model_types"] = tuple(restored_config["comparison_model_types"])
     if "feature_context_timeframes" in restored_config:

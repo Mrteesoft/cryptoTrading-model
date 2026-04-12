@@ -1,5 +1,6 @@
 """Very small smoke test for the dataset-building pipeline."""
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
@@ -57,10 +58,16 @@ from crypto_signal_ml.ml import (  # noqa: E402
 )
 from crypto_signal_ml.retrieval import RagKnowledgeStore  # noqa: E402
 from crypto_signal_ml.service import SignalMonitorService  # noqa: E402
+from crypto_signal_ml.source_refresh import (  # noqa: E402
+    ActiveUniversePlan,
+    CoinMarketCapUniverseRefreshService,
+    SignalUniverseCoordinator,
+)
 from crypto_signal_ml.trading import (  # noqa: E402
     TraderBrain,
     TradingPortfolioStore,
     TradingSignalStore,
+    WatchlistStateStore,
     apply_signal_trade_context,
     build_actionable_signal_summaries,
     build_latest_signal_summaries,
@@ -1330,6 +1337,8 @@ def test_market_data_refresh_app_reports_context_failure_without_aborting(
     config = TrainingConfig(
         data_file=tmp_path / "marketPrices.csv",
         coinmarketcap_context_file=tmp_path / "coinMarketCapContext.csv",
+        coinmarketcal_use_events=False,
+        coinmarketcap_refresh_context_after_market_refresh=True,
     )
     refresh_app = MarketDataRefreshApp(config=config)
 
@@ -1367,6 +1376,8 @@ def test_market_data_refresh_app_reports_market_intelligence_failure_without_abo
         data_file=tmp_path / "marketPrices.csv",
         coinmarketcap_use_context=False,
         coinmarketcap_market_intelligence_file=tmp_path / "coinMarketCapMarketIntelligence.csv",
+        coinmarketcal_use_events=False,
+        coinmarketcap_refresh_market_intelligence_after_market_refresh=True,
     )
     refresh_app = MarketDataRefreshApp(config=config)
 
@@ -1899,11 +1910,11 @@ def test_signal_generation_app_refreshes_market_data_before_publishing(
     assert saved_json_payloads["latestSignal.json"]["marketDataLastTimestamp"] == "2026-04-03T16:00:00Z"
 
 
-def test_signal_generation_app_can_publish_from_fresh_top_market_universe(
+def test_signal_generation_app_can_publish_from_prioritized_active_universe_without_broad_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Signal publication should be able to score a fresh top-market universe instead of stale batch data."""
+    """CMC publication should publish from the active universe without a separate broad refresh."""
 
     historical_prediction_df = pd.DataFrame(
         [
@@ -1996,13 +2007,22 @@ def test_signal_generation_app_can_publish_from_fresh_top_market_universe(
         lambda: (
             fresh_prediction_df.copy(),
             {
-                "mode": "fresh-top-market-universe",
+                "mode": "prioritized-active-universe",
                 "warning": "",
                 "maxProducts": 25,
-                "productsRequested": 25,
+                "productsRequested": 3,
                 "totalAvailableProducts": 25,
                 "rowsScored": 1,
                 "productsScored": 1,
+                "protectedProductIds": ["SOL-USD"],
+                "activeUniverse": {
+                    "mode": "prioritized-active-universe",
+                    "selectedProductIds": ["SOL-USD"],
+                },
+                "sourceRefresh": {
+                    "sourceStatus": "cache_valid",
+                    "productCount": 25,
+                },
             },
         ),
     )
@@ -2015,12 +2035,13 @@ def test_signal_generation_app_can_publish_from_fresh_top_market_universe(
 
     result = app.run()
 
-    assert refresh_calls == [True]
+    assert refresh_calls == []
     assert result["signalName"] == "BUY"
-    assert result["signalInference"]["mode"] == "fresh-top-market-universe"
+    assert result["signalSource"] == "live-active-universe-refresh"
+    assert result["signalInference"]["mode"] == "prioritized-active-universe"
     assert result["signalInference"]["productsScored"] == 1
     assert saved_json_payloads["latestSignal.json"]["productId"] == "SOL-USD"
-    assert saved_json_payloads["frontendSignalSnapshot.json"]["signalInference"]["mode"] == "fresh-top-market-universe"
+    assert saved_json_payloads["frontendSignalSnapshot.json"]["signalInference"]["mode"] == "prioritized-active-universe"
 
 
 def test_signal_generation_app_persists_current_signals_to_database(
@@ -2316,11 +2337,202 @@ def test_signal_generation_app_persists_watchlist_pool_snapshot(tmp_path: Path) 
     assert pool_store.get_monitored_product_ids() == ["AGLD-USD", "ABT-USD"]
 
 
-def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
+def test_coinmarketcap_universe_refresh_service_reuses_cached_universe_after_rate_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fresh snapshot scoring should merge the persisted watchlist pool with the top-market universe."""
+    """A stale tracked-universe cache should be reused when CoinMarketCap returns a rate-limit error."""
+
+    cache_path = tmp_path / "coinmarketcapUniverse.json"
+    stale_fetched_at = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    stale_expires_at = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    cache_path.write_text(
+        json.dumps(
+            {
+                "source": "coinmarketcapUniverse",
+                "marketDataSource": "coinmarketcapLatestQuotes",
+                "quoteCurrency": "USD",
+                "lastFetchedAt": stale_fetched_at,
+                "expiresAt": stale_expires_at,
+                "ttlSeconds": 21600,
+                "sourceStatus": "refreshed",
+                "lastError": "",
+                "rateLimitedUntil": None,
+                "productCount": 1,
+                "productIds": ["ADA-USD"],
+                "products": [
+                    {
+                        "productId": "ADA-USD",
+                        "baseCurrency": "ADA",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = TrainingConfig(
+        market_data_source="coinmarketcapLatestQuotes",
+        coinmarketcap_fetch_all_quote_products=True,
+        coinmarketcap_universe_cache_file=cache_path,
+    )
+    service = CoinMarketCapUniverseRefreshService(config)
+    monkeypatch.setenv(config.coinmarketcap_api_key_env_var, "test-key")
+
+    def fake_fetch_ranked_products(self) -> list[dict[str, object]]:
+        del self
+        raise CoinMarketCapRateLimitError("CoinMarketCap request failed with status 429.")
+
+    monkeypatch.setattr(CoinMarketCapUniverseRefreshService, "_fetch_ranked_products", fake_fetch_ranked_products)
+
+    payload = service.resolve()
+    persisted_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    assert payload["sourceStatus"] == "cached_rate_limited"
+    assert payload["usedCachedSnapshot"] is True
+    assert payload["refreshAttempted"] is True
+    assert payload["productIds"] == ["ADA-USD"]
+    assert payload["rateLimitedUntil"] is not None
+    assert persisted_payload["productIds"] == ["ADA-USD"]
+    assert persisted_payload["sourceStatus"] == "cached_rate_limited"
+
+
+def test_signal_universe_coordinator_prioritizes_follow_up_products_before_cached_discovery(
+    tmp_path: Path,
+) -> None:
+    """Open positions, watchlist names, and published signals should be selected before cached discovery names."""
+
+    watchlist_pool_path = tmp_path / "watchlistPool.json"
+    watchlist_pool_path.write_text(
+        json.dumps(
+            {
+                "generatedAt": "2026-04-08T10:00:00+00:00",
+                "count": 1,
+                "productIds": ["SOL-USD"],
+                "products": [
+                    {
+                        "productId": "SOL-USD",
+                        "signalName": "HOLD",
+                        "modelSignalName": "BUY",
+                        "brainDecision": "watchlist",
+                        "decisionScore": 0.52,
+                        "confidence": 0.71,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    universe_cache_path = tmp_path / "coinmarketcapUniverse.json"
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    universe_cache_path.write_text(
+        json.dumps(
+            {
+                "source": "coinmarketcapUniverse",
+                "marketDataSource": "coinmarketcapLatestQuotes",
+                "quoteCurrency": "USD",
+                "lastFetchedAt": fetched_at,
+                "expiresAt": expires_at,
+                "ttlSeconds": 21600,
+                "sourceStatus": "refreshed",
+                "lastError": "",
+                "rateLimitedUntil": None,
+                "productCount": 3,
+                "productIds": ["ADA-USD", "XRP-USD", "DOGE-USD"],
+                "products": [
+                    {
+                        "productId": "ADA-USD",
+                        "baseCurrency": "ADA",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 1,
+                    },
+                    {
+                        "productId": "XRP-USD",
+                        "baseCurrency": "XRP",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 2,
+                    },
+                    {
+                        "productId": "DOGE-USD",
+                        "baseCurrency": "DOGE",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 3,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    portfolio_store = TradingPortfolioStore(db_path=tmp_path / "portfolio.sqlite3")
+    portfolio_store.upsert_position(
+        product_id="BTC-USD",
+        quantity=1.0,
+        entry_price=65000.0,
+        current_price=65200.0,
+    )
+
+    signal_store = TradingSignalStore(db_path=tmp_path / "signals.sqlite3")
+    signal_store.replace_current_signals(
+        signal_summaries=[
+            {
+                "productId": "ETH-USD",
+                "signal_name": "HOLD",
+                "spotAction": "wait",
+                "actionable": False,
+                "confidence": 0.62,
+                "close": 3300.0,
+                "timestamp": "2026-04-08T10:00:00+00:00",
+            }
+        ],
+        primary_signal={
+            "productId": "ETH-USD",
+            "signal_name": "HOLD",
+            "spotAction": "wait",
+            "actionable": False,
+            "confidence": 0.62,
+            "close": 3300.0,
+            "timestamp": "2026-04-08T10:00:00+00:00",
+        },
+        generated_at="2026-04-08T10:00:00+00:00",
+    )
+
+    config = TrainingConfig(
+        data_file=tmp_path / "marketPrices.csv",
+        market_data_source="coinmarketcapLatestQuotes",
+        coinmarketcap_fetch_all_quote_products=True,
+        live_fetch_all_quote_products=True,
+        live_max_products=4,
+        signal_watchlist_pool_enabled=True,
+        signal_watchlist_pool_max_products=3,
+        signal_watchlist_pool_path=watchlist_pool_path,
+        signal_watchlist_state_path=tmp_path / "watchlistState.json",
+        coinmarketcap_universe_cache_file=universe_cache_path,
+        portfolio_store_path=tmp_path / "portfolio.sqlite3",
+        signal_store_path=tmp_path / "signals.sqlite3",
+        signal_excluded_base_currencies=("BTC", "ETH", "USDT", "USDC"),
+    )
+
+    plan = SignalUniverseCoordinator(config).resolve_active_universe(max_products=4)
+
+    assert plan.product_ids == ["BTC-USD", "SOL-USD", "ETH-USD", "ADA-USD"]
+    assert plan.protected_product_ids == ["BTC-USD", "SOL-USD", "ETH-USD"]
+    assert plan.source_refresh["sourceStatus"] == "cache_valid"
+    assert plan.summary["selectedCounts"]["openPositions"] == 1
+    assert plan.summary["selectedCounts"]["watchlist"] == 1
+    assert plan.summary["selectedCounts"]["publishedSignals"] == 1
+    assert plan.summary["selectedCounts"]["trackedUniverse"] == 1
+
+
+def test_signal_generation_app_uses_prioritized_active_universe_for_cmc_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CMC fresh scoring should request one explicit prioritized universe instead of a broad quote refresh."""
 
     import crypto_signal_ml.app as app_module
 
@@ -2388,25 +2600,7 @@ def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
                 raise AssertionError("This fake dataset builder should only be used with an explicit loader.")
             return self.data_loader.refresh_data()
 
-    top_universe_prediction_df = pd.DataFrame(
-        [
-            {
-                "time_step": 10,
-                "timestamp": "2026-04-07T14:39:00Z",
-                "product_id": "ABT-USD",
-                "base_currency": "ABT",
-                "quote_currency": "USD",
-                "close": 0.38,
-                "predicted_signal": 0,
-                "predicted_name": "HOLD",
-                "confidence": 0.91,
-                "prob_take_profit": 0.04,
-                "prob_hold": 0.91,
-                "prob_buy": 0.05,
-            }
-        ]
-    )
-    watchlist_prediction_df = pd.DataFrame(
+    prioritized_prediction_df = pd.DataFrame(
         [
             {
                 "time_step": 10,
@@ -2421,7 +2615,21 @@ def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
                 "prob_take_profit": 0.08,
                 "prob_hold": 0.10,
                 "prob_buy": 0.82,
-            }
+            },
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "ABT-USD",
+                "base_currency": "ABT",
+                "quote_currency": "USD",
+                "close": 0.38,
+                "predicted_signal": 0,
+                "predicted_name": "HOLD",
+                "confidence": 0.91,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.91,
+                "prob_buy": 0.05,
+            },
         ]
     )
 
@@ -2447,19 +2655,41 @@ def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
         del request_pause_seconds
         del save_progress_every_products
         del log_progress
-        if fetch_all_quote_products:
-            return FakeLoader(
-                top_universe_prediction_df,
-                {"productsDownloaded": 100, "totalAvailableProducts": 100},
-            )
-        assert tuple(product_ids or ()) == ("AGLD-USD",)
+        assert fetch_all_quote_products is False
+        assert tuple(product_ids or ()) == ("AGLD-USD", "ABT-USD")
         return FakeLoader(
-            watchlist_prediction_df,
-            {"productsDownloaded": 1, "totalAvailableProducts": 1},
+            prioritized_prediction_df,
+            {"productsDownloaded": 2, "totalAvailableProducts": 100},
+        )
+
+    def fake_resolve_active_universe(self, *, max_products: int | None = None) -> ActiveUniversePlan:
+        del self
+        del max_products
+        return ActiveUniversePlan(
+            product_ids=["AGLD-USD", "ABT-USD"],
+            protected_product_ids=["AGLD-USD"],
+            summary={
+                "mode": "prioritized-active-universe",
+                "effectiveLimit": 2,
+                "selectedProductIds": ["AGLD-USD", "ABT-USD"],
+                "watchlist": {
+                    "count": 1,
+                    "productIds": ["AGLD-USD"],
+                },
+                "trackedUniverse": {
+                    "count": 100,
+                },
+            },
+            source_refresh={
+                "sourceStatus": "cache_valid",
+                "productCount": 100,
+                "usedCachedSnapshot": True,
+            },
         )
 
     monkeypatch.setattr(app_module, "create_market_data_loader", fake_create_market_data_loader)
     monkeypatch.setattr(app_module, "CryptoDatasetBuilder", FakeDatasetBuilder)
+    monkeypatch.setattr(app_module.SignalUniverseCoordinator, "resolve_active_universe", fake_resolve_active_universe)
 
     app = SignalGenerationApp(
         config=config,
@@ -2469,10 +2699,10 @@ def test_signal_generation_app_merges_watchlist_pool_into_fresh_signal_scoring(
     prediction_df, summary = app._build_fresh_signal_prediction_frame()
 
     assert set(prediction_df["product_id"]) == {"ABT-USD", "AGLD-USD"}
-    assert summary["mode"] == "fresh-top-market-plus-watchlist-pool"
-    assert summary["productsRequested"] == 100
-    assert summary["watchlistPoolProductsRequested"] == 1
-    assert summary["watchlistPoolProductsScored"] == 1
+    assert summary["mode"] == "prioritized-active-universe"
+    assert summary["productsRequested"] == 2
+    assert summary["sourceRefresh"]["sourceStatus"] == "cache_valid"
+    assert summary["activeUniverse"]["watchlist"]["productIds"] == ["AGLD-USD"]
 
 
 def test_signal_generation_app_auto_tracks_new_entry_signals(
@@ -3054,6 +3284,38 @@ def test_signal_summaries_exclude_configured_base_currencies() -> None:
     assert [signal_summary["productId"] for signal_summary in latest_signals] == ["SOL-USD"]
 
 
+def test_build_latest_signal_summaries_keeps_protected_follow_up_products() -> None:
+    """Protected follow-up products should survive the normal excluded-base filter."""
+
+    prediction_df = pd.DataFrame(
+        [
+            {
+                "time_step": 1,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "close": 98000.0,
+                "predicted_signal": 1,
+                "predicted_name": "BUY",
+                "confidence": 0.79,
+                "prob_take_profit": 0.06,
+                "prob_hold": 0.15,
+                "prob_buy": 0.79,
+            }
+        ]
+    )
+
+    latest_signals = build_latest_signal_summaries(
+        prediction_df,
+        minimum_action_confidence=0.65,
+        config=TrainingConfig(coinmarketcap_use_context=False),
+        protected_product_ids=["BTC-USD"],
+    )
+
+    assert [signal_summary["productId"] for signal_summary in latest_signals] == ["BTC-USD"]
+
+
 def test_live_signal_engine_filters_excluded_default_watchlist_products() -> None:
     """Live watchlists should drop excluded bases before a refresh request is built."""
 
@@ -3083,11 +3345,11 @@ def test_live_signal_engine_prefers_quote_universe_when_enabled() -> None:
     assert live_engine._resolve_requested_products(product_id=None, product_ids=None) == []
 
 
-def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
+def test_live_signal_engine_uses_prioritized_active_universe_for_cmc_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Live monitoring should merge the persisted watchlist pool and publish a watched BUY immediately."""
+    """Default CMC live requests should score the prioritized active universe instead of the broad quote set."""
 
     import crypto_signal_ml.live as live_module
 
@@ -3163,29 +3425,7 @@ def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
                 raise AssertionError("This fake dataset builder should only be used with an explicit loader.")
             return self.data_loader.refresh_data()
 
-    top_universe_prediction_df = pd.DataFrame(
-        [
-            {
-                "time_step": 10,
-                "timestamp": "2026-04-07T14:39:00Z",
-                "product_id": "ABT-USD",
-                "base_currency": "ABT",
-                "quote_currency": "USD",
-                "close": 0.38,
-                "predicted_signal": 0,
-                "predicted_name": "HOLD",
-                "confidence": 0.91,
-                "prob_take_profit": 0.04,
-                "prob_hold": 0.91,
-                "prob_buy": 0.05,
-                "market_regime_label": "range",
-                "market_regime_code": 0,
-                "regime_is_high_volatility": 0,
-                "cmcal_has_event_next_7d": 0,
-            }
-        ]
-    )
-    watchlist_prediction_df = pd.DataFrame(
+    prioritized_prediction_df = pd.DataFrame(
         [
             {
                 "time_step": 10,
@@ -3205,7 +3445,25 @@ def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
                 "regime_is_trending": 1,
                 "regime_is_high_volatility": 0,
                 "cmcal_has_event_next_7d": 0,
-            }
+            },
+            {
+                "time_step": 10,
+                "timestamp": "2026-04-07T14:39:00Z",
+                "product_id": "ABT-USD",
+                "base_currency": "ABT",
+                "quote_currency": "USD",
+                "close": 0.38,
+                "predicted_signal": 0,
+                "predicted_name": "HOLD",
+                "confidence": 0.91,
+                "prob_take_profit": 0.04,
+                "prob_hold": 0.91,
+                "prob_buy": 0.05,
+                "market_regime_label": "range",
+                "market_regime_code": 0,
+                "regime_is_high_volatility": 0,
+                "cmcal_has_event_next_7d": 0,
+            },
         ]
     )
 
@@ -3231,20 +3489,42 @@ def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
         del request_pause_seconds
         del save_progress_every_products
         del log_progress
-        if fetch_all_quote_products:
-            return FakeLoader(top_universe_prediction_df)
-        assert tuple(product_ids or ()) == ("AGLD-USD",)
-        return FakeLoader(watchlist_prediction_df)
+        assert fetch_all_quote_products is False
+        assert tuple(product_ids or ()) == ("AGLD-USD", "ABT-USD")
+        return FakeLoader(prioritized_prediction_df)
+
+    def fake_resolve_active_universe(self, *, max_products: int | None = None) -> ActiveUniversePlan:
+        del self
+        del max_products
+        return ActiveUniversePlan(
+            product_ids=["AGLD-USD", "ABT-USD"],
+            protected_product_ids=["AGLD-USD"],
+            summary={
+                "mode": "prioritized-active-universe",
+                "effectiveLimit": 2,
+                "selectedProductIds": ["AGLD-USD", "ABT-USD"],
+                "watchlist": {
+                    "count": 1,
+                    "productIds": ["AGLD-USD"],
+                },
+            },
+            source_refresh={
+                "sourceStatus": "cache_valid",
+                "productCount": 100,
+                "usedCachedSnapshot": True,
+            },
+        )
 
     live_engine = LiveSignalEngine(config=config)
 
     monkeypatch.setattr(live_module, "create_market_data_loader", fake_create_market_data_loader)
     monkeypatch.setattr(live_module, "CryptoDatasetBuilder", FakeDatasetBuilder)
+    monkeypatch.setattr(live_module.SignalUniverseCoordinator, "resolve_active_universe", fake_resolve_active_universe)
     monkeypatch.setattr(live_engine, "_load_model", lambda: FakeModel(config=config))
 
     snapshot = live_engine.get_live_snapshot(force_refresh=True)
 
-    assert snapshot["requestMode"] == "quote-universe-plus-watchlist-pool"
+    assert snapshot["requestMode"] == "prioritized-active-universe"
     assert snapshot["liveSignalCacheSeconds"] == 15
     assert snapshot["watchlistPool"]["active"] is True
     assert snapshot["watchlistPool"]["productIds"] == ["AGLD-USD"]
@@ -3252,6 +3532,8 @@ def test_live_signal_engine_promotes_watchlist_pool_buy_candidates(
     assert snapshot["primarySignal"]["productId"] == "AGLD-USD"
     assert snapshot["primarySignal"]["signal_name"] == "BUY"
     assert snapshot["signals"][0]["productId"] == "AGLD-USD"
+    assert snapshot["signalInference"]["mode"] == "prioritized-active-universe"
+    assert snapshot["signalInference"]["sourceRefresh"]["sourceStatus"] == "cache_valid"
 
 
 def test_signal_monitor_service_runs_initial_generation_before_serving() -> None:
@@ -3948,6 +4230,301 @@ def test_primary_signal_rotation_keeps_the_top_coin_when_others_are_much_weaker(
     )
 
     assert primary_signal["productId"] == "ALGO-USD"
+
+
+def _build_watchlist_test_config(tmp_path: Path, **overrides: object) -> TrainingConfig:
+    """Build one small config tuned for watchlist lifecycle tests."""
+
+    config_kwargs: dict[str, object] = {
+        "coinmarketcap_use_context": False,
+        "coinmarketcap_use_market_intelligence": True,
+        "signal_excluded_base_currencies": (),
+        "signal_watchlist_state_path": tmp_path / "watchlistState.json",
+    }
+    config_kwargs.update(overrides)
+    return TrainingConfig(**config_kwargs)
+
+
+def _build_watchlist_follow_up_signal(
+    *,
+    product_id: str = "ALCX-USD",
+    signal_name: str = "HOLD",
+    confidence: float = 0.74,
+    probability_margin: float = 0.18,
+    setup_score: float = 4.8,
+    policy_score: float = 1.10,
+    trade_readiness: str = "high",
+    regime_label: str = "range",
+    is_high_volatility: bool = False,
+    trend_score: float = 0.02,
+    topic_trend_score: float = 0.40,
+    news_sentiment: float = 0.0,
+    news_relevance: float = 0.0,
+    breakout_confirmed: bool = False,
+    retest_hold_confirmed: bool = False,
+    near_resistance: bool = False,
+    resistance_distance_pct: float = 0.03,
+    event_window_active: bool = False,
+    post_event_cooldown_active: bool = False,
+    macro_event_risk: bool = False,
+    has_event_next_7d: bool = False,
+    macro_risk_mode: str = "neutral",
+    close: float = 5.10,
+) -> dict[str, object]:
+    """Create one reusable signal summary for watchlist lifecycle tests."""
+
+    return {
+        "productId": product_id,
+        "signal_name": signal_name,
+        "spotAction": "buy" if signal_name == "BUY" else "wait",
+        "confidence": confidence,
+        "probabilityMargin": probability_margin,
+        "setupScore": setup_score,
+        "policyScore": policy_score,
+        "tradeReadiness": trade_readiness,
+        "marketState": {
+            "label": regime_label,
+            "isTrending": regime_label.startswith("trend_up"),
+            "isHighVolatility": is_high_volatility,
+            "volatilityRatio": 1.30 if is_high_volatility else 1.02,
+            "trendScore": trend_score,
+        },
+        "marketContext": {
+            "marketIntelligence": {
+                "available": True,
+                "fearGreedValue": 34 if macro_risk_mode == "risk_off" else 61,
+                "fearGreedClassification": "Fear" if macro_risk_mode == "risk_off" else "Greed",
+                "btcDominance": 0.58 if macro_risk_mode == "risk_off" else 0.52,
+                "btcDominanceChange24h": 0.01 if macro_risk_mode == "risk_off" else -0.01,
+                "riskMode": macro_risk_mode,
+            }
+        },
+        "eventContext": {
+            "hasEventNext7d": has_event_next_7d,
+            "eventWindowActive": event_window_active,
+            "postEventCooldownActive": post_event_cooldown_active,
+            "macroEventRiskFlag": macro_event_risk,
+        },
+        "newsContext": {
+            "newsSentiment1h": news_sentiment,
+            "newsRelevanceScore": news_relevance,
+        },
+        "trendContext": {
+            "topicTrendScore": topic_trend_score,
+            "trendPersistenceScore": 0.45 if topic_trend_score > 0 else 0.20,
+        },
+        "chartContext": {
+            "breakoutConfirmed": breakout_confirmed,
+            "retestHoldConfirmed": retest_hold_confirmed,
+            "nearResistance": near_resistance,
+            "resistanceDistancePct": resistance_distance_pct,
+            "structureLabel": "range",
+        },
+        "close": close,
+    }
+
+
+def test_watchlist_first_check_stays_in_watchlist_for_alcx_calibration_case(tmp_path: Path) -> None:
+    """The latest ALCX-like output should stay on the watchlist on its first review."""
+
+    config = _build_watchlist_test_config(tmp_path)
+    store = WatchlistStateStore(config)
+
+    state, promotion = store.update_from_signal(
+        signal_summary=_build_watchlist_follow_up_signal(
+            confidence=0.8413942553341991,
+            probability_margin=0.7433841429810573,
+            setup_score=0.0,
+            policy_score=1.5847783983152564,
+            trade_readiness="standby",
+            regime_label="range_high_volatility",
+            is_high_volatility=True,
+            trend_score=0.0006934317752682162,
+            topic_trend_score=-0.6,
+            breakout_confirmed=False,
+            retest_hold_confirmed=False,
+            resistance_distance_pct=0.025988787692436892,
+            close=5.113558864614706,
+            macro_risk_mode="risk_off",
+        ),
+        decision_score=0.5373042434966011,
+        market_context={"marketStance": "defensive", "macroRiskMode": "risk_off"},
+    )
+
+    assert state["stage"] == "watchlist"
+    assert state["checks"] == 1
+    assert state["positiveChecks"] == 0
+    assert promotion.promotion_ready is False
+    assert promotion.hard_blocks == ()
+    assert promotion.soft_penalties == ("defensive_market", "macro_risk_off", "high_volatility")
+    assert promotion.hold_reason == "wait_for_setup_building"
+
+
+def test_watchlist_follow_up_promotes_on_second_and_third_checks(tmp_path: Path) -> None:
+    """Repeated positive follow-up checks should move from watchlist into explicit setup stages."""
+
+    config = _build_watchlist_test_config(tmp_path)
+    store = WatchlistStateStore(config)
+    market_context = {"marketStance": "balanced", "macroRiskMode": "neutral"}
+
+    store.update_from_signal(
+        signal_summary=_build_watchlist_follow_up_signal(
+            confidence=0.66,
+            trade_readiness="medium",
+            topic_trend_score=0.20,
+        ),
+        decision_score=0.56,
+        market_context=market_context,
+    )
+    second_state, second_promotion = store.update_from_signal(
+        signal_summary=_build_watchlist_follow_up_signal(
+            confidence=0.70,
+            trade_readiness="medium",
+            topic_trend_score=0.30,
+        ),
+        decision_score=0.62,
+        market_context=market_context,
+    )
+    third_state, third_promotion = store.update_from_signal(
+        signal_summary=_build_watchlist_follow_up_signal(
+            confidence=0.74,
+            trade_readiness="medium",
+            topic_trend_score=0.46,
+        ),
+        decision_score=0.66,
+        market_context=market_context,
+    )
+
+    assert second_state["stage"] == "setup_building"
+    assert second_promotion.hold_reason == "wait_for_setup_confirmation"
+    assert second_promotion.promotion_ready is False
+    assert third_state["stage"] == "setup_confirmed"
+    assert third_promotion.hold_reason == "wait_for_breakout_confirmation"
+    assert third_promotion.promotion_ready is False
+
+
+def test_watchlist_entry_ready_separates_soft_risk_from_hard_blocks(tmp_path: Path) -> None:
+    """Soft risk-off pressure should differ from hard event-style blocks at entry-ready stage."""
+
+    soft_store = WatchlistStateStore(
+        _build_watchlist_test_config(
+            tmp_path,
+            signal_watchlist_state_path=tmp_path / "softWatchlistState.json",
+            signal_watchlist_soft_risk_override_min_confirmation=1.01,
+        )
+    )
+    soft_market_context = {"marketStance": "defensive", "macroRiskMode": "risk_off"}
+    for confidence, decision_score, breakout_confirmed in (
+        (0.74, 0.58, False),
+        (0.78, 0.63, False),
+        (0.82, 0.71, True),
+    ):
+        soft_state, soft_promotion = soft_store.update_from_signal(
+            signal_summary=_build_watchlist_follow_up_signal(
+                confidence=confidence,
+                trade_readiness="high",
+                topic_trend_score=0.46,
+                breakout_confirmed=breakout_confirmed,
+                macro_risk_mode="risk_off",
+            ),
+            decision_score=decision_score,
+            market_context=soft_market_context,
+        )
+
+    assert soft_state["stage"] == "entry_ready"
+    assert soft_promotion.promotion_ready is False
+    assert soft_promotion.hard_blocks == ()
+    assert "macro_risk_off" in soft_promotion.soft_penalties
+    assert soft_promotion.blocked_reason in {"defensive_market", "macro_risk_off"}
+    assert soft_promotion.exceptional_override_applied is False
+
+    hard_store = WatchlistStateStore(
+        _build_watchlist_test_config(
+            tmp_path,
+            signal_watchlist_state_path=tmp_path / "hardWatchlistState.json",
+        )
+    )
+    hard_market_context = {"marketStance": "balanced", "macroRiskMode": "neutral"}
+    for confidence, decision_score, breakout_confirmed, event_window_active in (
+        (0.74, 0.58, False, False),
+        (0.78, 0.63, False, False),
+        (0.82, 0.71, True, True),
+    ):
+        hard_state, hard_promotion = hard_store.update_from_signal(
+            signal_summary=_build_watchlist_follow_up_signal(
+                confidence=confidence,
+                trade_readiness="high",
+                topic_trend_score=0.46,
+                breakout_confirmed=breakout_confirmed,
+                event_window_active=event_window_active,
+            ),
+            decision_score=decision_score,
+            market_context=hard_market_context,
+        )
+
+    assert hard_state["stage"] == "entry_ready"
+    assert hard_promotion.promotion_ready is False
+    assert "blocked_by_event_risk" in hard_promotion.hard_blocks
+    assert hard_promotion.blocked_reason == "blocked_by_event_risk"
+
+
+def test_trader_brain_promotes_breakout_confirmed_watchlist_on_follow_up_cycle(tmp_path: Path) -> None:
+    """Strong breakout confirmation should promote a matured watchlist despite mild risk-off conditions."""
+
+    config = _build_watchlist_test_config(tmp_path)
+    brain = TraderBrain(config)
+
+    first_plan = brain.build_plan(
+        signal_summaries=[
+            _build_watchlist_follow_up_signal(
+                confidence=0.76,
+                probability_margin=0.18,
+                setup_score=5.0,
+                policy_score=1.12,
+                trade_readiness="high",
+                topic_trend_score=0.40,
+                macro_risk_mode="risk_off",
+            )
+        ],
+        capital=10000.0,
+    )
+    second_plan = brain.build_plan(
+        signal_summaries=[
+            _build_watchlist_follow_up_signal(
+                confidence=0.79,
+                probability_margin=0.18,
+                setup_score=5.0,
+                policy_score=1.15,
+                trade_readiness="high",
+                topic_trend_score=0.43,
+                macro_risk_mode="risk_off",
+            )
+        ],
+        capital=10000.0,
+    )
+    third_plan = brain.build_plan(
+        signal_summaries=[
+            _build_watchlist_follow_up_signal(
+                confidence=0.83,
+                probability_margin=0.19,
+                setup_score=5.0,
+                policy_score=1.18,
+                trade_readiness="high",
+                topic_trend_score=0.46,
+                breakout_confirmed=True,
+                macro_risk_mode="risk_off",
+            )
+        ],
+        capital=10000.0,
+    )
+
+    assert first_plan["signals"][0]["brain"]["decision"] == "watchlist"
+    assert second_plan["signals"][0]["brain"]["decision"] == "watchlist"
+    assert third_plan["signals"][0]["watchlistState"]["stage"] == "entry_ready"
+    assert third_plan["signals"][0]["watchlistPromotion"]["exceptionalOverrideApplied"] is True
+    assert third_plan["signals"][0]["brain"]["decision"] == "enter_long"
+    assert third_plan["signals"][0]["brain"]["macroRiskMode"] == "risk_off"
+    assert third_plan["signals"][0]["brain"]["evidence"]["watchlistSoftRiskOverride"] is True
 
 
 def test_trader_brain_respects_risk_off_market_intelligence() -> None:

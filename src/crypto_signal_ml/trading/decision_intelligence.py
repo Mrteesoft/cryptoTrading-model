@@ -136,6 +136,7 @@ class TradingDecisionDeliberator:
 
         market_state = signal_summary.get("marketState") or {}
         event_context = signal_summary.get("eventContext") or {}
+        watchlist_promotion = signal_summary.get("watchlistPromotion") or {}
         signal_name = str(signal_summary.get("signal_name", "HOLD")).strip().upper()
         trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
         confidence = _safe_float(signal_summary, "confidence")
@@ -214,6 +215,15 @@ class TradingDecisionDeliberator:
             conviction_score += 0.03
         conviction_score = _clamp(conviction_score, 0.0, 1.0)
 
+        watchlist_stage = str(watchlist_promotion.get("stage", "") or "")
+        watchlist_confirmation_strength = _safe_float(
+            watchlist_promotion,
+            "confirmationStrength",
+        )
+        watchlist_soft_risk_override = _safe_bool(watchlist_promotion, "exceptionalOverrideApplied")
+        watchlist_hard_block_count = len(list(watchlist_promotion.get("hardBlocks") or []))
+        watchlist_soft_penalty_count = len(list(watchlist_promotion.get("softPenalties") or []))
+
         supporting_factors: list[str] = []
         risk_factors: list[str] = []
         counter_arguments: list[str] = []
@@ -237,6 +247,8 @@ class TradingDecisionDeliberator:
             supporting_factors.append("The active regime still favors long momentum.")
         if macro_risk_mode == "risk_on":
             supporting_factors.append("Market-wide intelligence is supportive for selective risk.")
+        if watchlist_stage == "entry_ready" and watchlist_confirmation_strength >= 0.70:
+            supporting_factors.append("Repeated watchlist checks and chart confirmation have materially improved the setup.")
         if profit_lock_triggered:
             supporting_factors.append("The open trade is already far enough in profit to justify active management.")
         if memory_bias == "supportive":
@@ -256,6 +268,10 @@ class TradingDecisionDeliberator:
             risk_factors.append("The policy layer has already blocked fresh risk.")
         elif trade_readiness == "standby":
             risk_factors.append("Trade readiness is still only on standby.")
+        if watchlist_hard_block_count > 0:
+            risk_factors.append("Hard watchlist gating is still active against promotion.")
+        elif watchlist_soft_penalty_count > 0 and not watchlist_soft_risk_override:
+            risk_factors.append("Soft watchlist penalties still argue for patience.")
         if stale_position:
             risk_factors.append("The thesis has become stale.")
         if loss_cut_triggered:
@@ -310,6 +326,11 @@ class TradingDecisionDeliberator:
                 "sampleAdequate": _safe_bool(trade_memory, "sampleAdequate"),
                 "bias": memory_bias,
             },
+            "watchlistStage": watchlist_stage or None,
+            "watchlistConfirmationStrength": float(watchlist_confirmation_strength),
+            "watchlistSoftRiskOverride": bool(watchlist_soft_risk_override),
+            "watchlistHardBlockCount": int(watchlist_hard_block_count),
+            "watchlistSoftPenaltyCount": int(watchlist_soft_penalty_count),
         }
 
     def _build_decision_memo(
@@ -414,10 +435,11 @@ class TradingDecisionDeliberator:
         risk_score = _safe_float(evidence, "riskScore")
         conviction_score = _safe_float(evidence, "convictionScore")
         signal_name = str(evidence.get("signalName", "HOLD"))
+        watchlist_soft_risk_override = _safe_bool(evidence, "watchlistSoftRiskOverride")
         objections: list[str] = []
 
         if recommended_decision in ENTRY_DECISIONS:
-            if str(evidence.get("macroRiskMode", "neutral")) == "risk_off":
+            if str(evidence.get("macroRiskMode", "neutral")) == "risk_off" and not watchlist_soft_risk_override:
                 objections.append("Macro risk mode is risk-off against a fresh long.")
             if _safe_bool(evidence, "isHighVolatility"):
                 objections.append("Volatility is elevated for a new entry.")

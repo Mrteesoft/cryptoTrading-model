@@ -33,6 +33,7 @@ from .frontend import WatchlistPoolStore
 from .labels import create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
+from .source_refresh import SignalUniverseCoordinator
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signal_store import TradingSignalStore
 from .regime_modeling import MarketRegimeModel
@@ -45,7 +46,6 @@ from .application import (
     SignalInferenceStage,
     SignalPublicationStage,
 )
-from .trading.signals import build_latest_signal_summaries
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1850,6 +1850,62 @@ class SignalGenerationApp(BaseSignalApp):
 
     primary_signal_history_path = OUTPUTS_DIR / "primarySignalHistory.json"
 
+    def _build_compat_primary_history_store(self) -> PrimarySignalHistoryStore:
+        """Create the history store used by compatibility helper methods."""
+
+        return PrimarySignalHistoryStore(
+            config=self.config,
+            history_path=self.primary_signal_history_path,
+            save_json=self.save_json,
+        )
+
+    def _build_compat_decision_stage(self) -> SignalDecisionStage:
+        """Build one decision stage for legacy helper wrappers used by tests and callers."""
+
+        decision_stage = SignalDecisionStage(
+            self.config,
+            primary_history_store=self._build_compat_primary_history_store(),
+            allow_watchlist_fallback=True,
+            allow_watchlist_supplement=True,
+        )
+        overridden_should_publish = self.__dict__.get("_should_publish_watchlist_fallback")
+        if callable(overridden_should_publish):
+            decision_stage._should_publish_watchlist_fallback = overridden_should_publish  # type: ignore[method-assign]
+        return decision_stage
+
+    def _select_watchlist_fallback_signal(
+        self,
+        signal_summaries: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Compatibility wrapper for legacy direct watchlist-fallback selection."""
+
+        return self._build_compat_decision_stage()._select_watchlist_fallback_signal(signal_summaries)
+
+    def _supplement_published_signals_with_watchlist_candidates(
+        self,
+        *,
+        published_signals: list[dict[str, Any]],
+        signal_summaries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Compatibility wrapper for legacy direct watchlist supplementation."""
+
+        return self._build_compat_decision_stage()._supplement_published_signals_with_watchlist_candidates(
+            published_signals=published_signals,
+            signal_summaries=signal_summaries,
+        )
+
+    def _save_watchlist_pool_snapshot(self, signal_summaries: list[dict[str, Any]]) -> None:
+        """Compatibility wrapper for persisting the ranked watchlist pool directly."""
+
+        publication_stage = SignalPublicationStage(
+            config=self.config,
+            save_json=self.save_json,
+            save_dataframe=self.save_dataframe,
+            signal_store_factory=self._build_signal_store,
+            primary_history_store=self._build_compat_primary_history_store(),
+        )
+        publication_stage.save_watchlist_pool_snapshot(signal_summaries)
+
     def _should_score_fresh_signal_universe(self) -> bool:
         """Return whether publication should score a fresh top-market universe."""
 
@@ -1873,6 +1929,15 @@ class SignalGenerationApp(BaseSignalApp):
             self.config,
             coinbase_product_batch_size=None,
             coinbase_product_batch_number=1,
+        )
+
+    def _should_use_prioritized_active_universe(self) -> bool:
+        """Return whether CMC live scoring should use the cached tracked universe plus follow-up priorities."""
+
+        return bool(
+            is_coinmarketcap_market_data_source(self.config.market_data_source)
+            and self._resolve_market_fetch_all_quote_products()
+            and self.config.live_fetch_all_quote_products
         )
 
     def _load_watchlist_pool_product_ids(self) -> list[str]:
@@ -1942,11 +2007,52 @@ class SignalGenerationApp(BaseSignalApp):
             database_url=self.config.signal_store_url,
         )
 
+    def _build_prioritized_signal_prediction_frame(self) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Score a reduced active universe selected from cached CMC ranking plus current follow-up state."""
+
+        if self.model is None:
+            raise ValueError("A loaded model is required before scoring the active signal universe.")
+
+        active_universe_plan = SignalUniverseCoordinator(self.config).resolve_active_universe(
+            max_products=self.config.live_max_products,
+        )
+        if not active_universe_plan.product_ids:
+            raise ValueError(
+                "No active analysis products were available after applying watchlist, portfolio, "
+                "published-signal, and tracked-universe selection."
+            )
+
+        active_prediction_df, explicit_summary = self._build_explicit_signal_prediction_frame(
+            active_universe_plan.product_ids,
+        )
+        signal_inference_summary = {
+            "mode": "prioritized-active-universe",
+            "warning": "",
+            "maxProducts": int(active_universe_plan.summary.get("effectiveLimit", len(active_universe_plan.product_ids))),
+            "productsRequested": int(explicit_summary["productsRequested"]),
+            "totalAvailableProducts": int(
+                active_universe_plan.source_refresh.get(
+                    "productCount",
+                    active_universe_plan.summary.get("trackedUniverse", {}).get("count", 0),
+                )
+                or 0
+            ),
+            "rowsScored": int(explicit_summary["rowsScored"]),
+            "productsScored": int(explicit_summary["productsScored"]),
+            "protectedProductIds": list(active_universe_plan.protected_product_ids),
+            "activeUniverse": dict(active_universe_plan.summary),
+            "sourceRefresh": dict(active_universe_plan.source_refresh),
+        }
+        return active_prediction_df, signal_inference_summary
+
     def _build_fresh_signal_prediction_frame(self) -> tuple[pd.DataFrame, dict[str, Any]]:
         """Score a fresh top-market universe for the published signal snapshot."""
 
         if self.model is None:
             raise ValueError("A loaded model is required before scoring the fresh signal universe.")
+
+        if self._should_use_prioritized_active_universe():
+            return self._build_prioritized_signal_prediction_frame()
 
         loader_config = self._build_unbatched_market_loader_config()
         fresh_market_loader = create_market_data_loader(
@@ -1988,7 +2094,6 @@ class SignalGenerationApp(BaseSignalApp):
             ),
         }
         prediction_frames = [fresh_prediction_df]
-
         watchlist_pool_product_ids = self._load_watchlist_pool_product_ids()
         if watchlist_pool_product_ids:
             explicit_prediction_df, explicit_summary = self._build_explicit_signal_prediction_frame(
@@ -2054,7 +2159,8 @@ class SignalGenerationApp(BaseSignalApp):
 
         market_data_refresh = None
         market_data_refreshed_at = None
-        if self.config.signal_refresh_market_data_before_generation:
+        should_use_prioritized_active_universe = self._should_use_prioritized_active_universe()
+        if self.config.signal_refresh_market_data_before_generation and not should_use_prioritized_active_universe:
             market_data_refreshed_at = datetime.now(timezone.utc).isoformat()
             market_data_refresh = MarketDataRefreshApp(config=self.config).run()
             self.save_json(
@@ -2065,35 +2171,48 @@ class SignalGenerationApp(BaseSignalApp):
                 },
                 OUTPUTS_DIR / "signalMarketDataRefresh.json",
             )
-        else:
+        elif not self.config.data_file.exists():
             self._ensure_market_data_available()
 
         feature_df = self.dataset_builder.build_feature_table()
         prediction_df = self.model.predict(feature_df)
         inference_stage = SignalInferenceStage(self.config)
+        allow_empty_historical_inference = (
+            prefetched_signal_prediction_df is not None
+            and prefetched_signal_inference_summary is not None
+        )
         inference_artifacts = inference_stage.build_from_prediction_frame(
             prediction_df,
             mode="historical-market-data",
+            raise_on_empty=not allow_empty_historical_inference,
         )
         signal_prediction_df = prediction_df
+        used_fresh_signal_prediction = False
         if prefetched_signal_prediction_df is not None and prefetched_signal_inference_summary is not None:
             fresh_inference_artifacts = inference_stage.build_from_prediction_frame(
                 prefetched_signal_prediction_df,
                 summary=prefetched_signal_inference_summary,
                 raise_on_empty=False,
+                protected_product_ids=prefetched_signal_inference_summary.get("protectedProductIds"),
             )
             if fresh_inference_artifacts.signal_candidates:
                 signal_prediction_df = prefetched_signal_prediction_df
                 inference_artifacts = fresh_inference_artifacts
+                used_fresh_signal_prediction = True
             else:
                 inference_artifacts.summary["mode"] = "historical-market-data-fallback"
                 inference_artifacts.summary["warning"] = (
-                    "Fresh top-market signal scoring produced no eligible signal rows, "
+                    "Fresh active-universe signal scoring produced no eligible signal rows, "
                     "so publication fell back to the persisted market dataset."
                 )
         elif prefetched_signal_inference_warning:
             inference_artifacts.summary["mode"] = "historical-market-data-fallback"
             inference_artifacts.summary["warning"] = prefetched_signal_inference_warning
+
+        if not inference_artifacts.signal_candidates:
+            raise ValueError(
+                "No signal summaries remained after applying the configured signal-universe exclusions."
+            )
 
         portfolio_store = TradingPortfolioStore(
             db_path=self.config.portfolio_store_path,
@@ -2144,7 +2263,13 @@ class SignalGenerationApp(BaseSignalApp):
             if prediction_timestamps is not None and len(prediction_timestamps) > 0
             else None
         )
-        signal_source = "live-market-refresh" if market_data_refresh is not None else "cached-market-data"
+        signal_source = (
+            "live-market-refresh"
+            if market_data_refresh is not None
+            else "live-active-universe-refresh"
+            if used_fresh_signal_prediction
+            else "cached-market-data"
+        )
         signal_metadata = {
             "signalSource": signal_source,
             "marketDataSource": str(self.config.market_data_source),

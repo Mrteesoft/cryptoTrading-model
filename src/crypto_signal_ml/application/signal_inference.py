@@ -61,6 +61,7 @@ class SignalInferenceStage:
         total_available_products: int | None = None,
         raise_on_empty: bool = True,
         empty_message: str | None = None,
+        protected_product_ids: Sequence[str] | None = None,
     ) -> SignalInferenceArtifacts:
         """Build one inference artifact bundle from a prediction frame."""
 
@@ -68,6 +69,7 @@ class SignalInferenceStage:
             prediction_df,
             minimum_action_confidence=self.config.backtest_min_confidence,
             config=self.config,
+            protected_product_ids=protected_product_ids,
         )
         if raise_on_empty and not signal_candidates:
             raise ValueError(

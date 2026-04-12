@@ -9,11 +9,17 @@ from typing import Any, Dict, Optional, Sequence
 
 import pandas as pd
 
-from .config import MODELS_DIR, TrainingConfig, apply_runtime_market_data_settings
+from .config import (
+    MODELS_DIR,
+    TrainingConfig,
+    apply_runtime_market_data_settings,
+    is_coinmarketcap_market_data_source,
+)
 from .data import create_market_data_loader
 from .frontend import WatchlistPoolStore
 from .modeling import BaseSignalModel, get_model_class
 from .pipeline import CryptoDatasetBuilder
+from .source_refresh import ActiveUniversePlan, SignalUniverseCoordinator
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signals import is_signal_product_excluded
 from .application import (
@@ -152,6 +158,28 @@ class LiveSignalEngine:
         )
         return max(1, min(base_cache_ttl_seconds, aggressive_cache_ttl_seconds))
 
+    def _should_use_prioritized_active_universe(
+        self,
+        *,
+        product_id: str | None,
+        product_ids: Sequence[str] | None,
+    ) -> bool:
+        """Use the cache-first CMC universe path only for the default no-argument live request."""
+
+        return bool(
+            not product_id
+            and not product_ids
+            and is_coinmarketcap_market_data_source(self.config.market_data_source)
+            and self.config.live_fetch_all_quote_products
+        )
+
+    def _load_prioritized_active_universe_plan(self) -> ActiveUniversePlan:
+        """Build the active live-analysis universe from cached ranking plus follow-up state."""
+
+        return SignalUniverseCoordinator(self.config).resolve_active_universe(
+            max_products=self.config.live_max_products,
+        )
+
     def get_live_snapshot(
         self,
         force_refresh: bool = False,
@@ -160,6 +188,11 @@ class LiveSignalEngine:
     ) -> Dict[str, Any]:
         """Return a fresh or cached live signal snapshot for the requested universe."""
 
+        active_universe_plan: ActiveUniversePlan | None = None
+        use_prioritized_active_universe = self._should_use_prioritized_active_universe(
+            product_id=product_id,
+            product_ids=product_ids,
+        )
         use_quote_universe = self._should_use_quote_universe(
             product_id=product_id,
             product_ids=product_ids,
@@ -169,7 +202,19 @@ class LiveSignalEngine:
             product_ids=product_ids,
         )
         watchlist_pool_product_ids: list[str] = []
-        if not product_id and not product_ids:
+        if use_prioritized_active_universe:
+            active_universe_plan = self._load_prioritized_active_universe_plan()
+            resolved_product_ids = list(active_universe_plan.product_ids)
+            watchlist_pool_product_ids = list(
+                active_universe_plan.summary.get("watchlist", {}).get("productIds", [])
+            )
+            use_quote_universe = False
+            if not resolved_product_ids:
+                raise ValueError(
+                    "No active live-analysis products were available after applying the cache-first "
+                    "CoinMarketCap universe policy."
+                )
+        elif not product_id and not product_ids:
             watchlist_pool_product_ids = self._load_watchlist_pool_product_ids()
         effective_cache_ttl_seconds = self._resolve_effective_cache_ttl_seconds(watchlist_pool_product_ids)
         request_key = self._build_request_key(
@@ -218,7 +263,27 @@ class LiveSignalEngine:
             "rowsScored": 0,
             "productsScored": 0,
         }
-        if watchlist_pool_product_ids:
+        if active_universe_plan is not None:
+            scored_watchlist_product_ids = set()
+            watchlist_pool_row_count = 0
+            if "product_id" in prediction_df.columns:
+                normalized_prediction_product_ids = prediction_df["product_id"].astype(str).str.upper()
+                watched_product_id_set = {str(product).strip().upper() for product in watchlist_pool_product_ids}
+                watchlist_pool_row_count = int(normalized_prediction_product_ids.isin(watched_product_id_set).sum())
+                scored_watchlist_product_ids = {
+                    product_value
+                    for product_value in normalized_prediction_product_ids.unique()
+                    if product_value in watched_product_id_set
+                }
+
+            watchlist_pool_summary = {
+                "active": bool(watchlist_pool_product_ids),
+                "count": len(watchlist_pool_product_ids),
+                "productIds": list(watchlist_pool_product_ids),
+                "rowsScored": int(watchlist_pool_row_count),
+                "productsScored": int(len(scored_watchlist_product_ids)),
+            }
+        elif watchlist_pool_product_ids:
             watchlist_prediction_df, explicit_summary = self._score_prediction_frame(
                 runtime_config,
                 model,
@@ -249,16 +314,36 @@ class LiveSignalEngine:
                     keep="last",
                 )
         inference_stage = SignalInferenceStage(runtime_config)
+        inference_summary = {
+            "rowsScored": int(prediction_summary["rowsScored"]),
+            "productsScored": int(prediction_summary["productsScored"]),
+            "watchlistPoolRowsScored": int(watchlist_pool_summary["rowsScored"]),
+            "watchlistPoolProductsScored": int(watchlist_pool_summary["productsScored"]),
+        }
+        if active_universe_plan is not None:
+            inference_summary.update(
+                {
+                    "mode": "prioritized-active-universe",
+                    "warning": "",
+                    "productsRequested": len(resolved_product_ids),
+                    "totalAvailableProducts": int(
+                        active_universe_plan.source_refresh.get("productCount", len(resolved_product_ids)) or 0
+                    ),
+                    "protectedProductIds": list(active_universe_plan.protected_product_ids),
+                    "activeUniverse": dict(active_universe_plan.summary),
+                    "sourceRefresh": dict(active_universe_plan.source_refresh),
+                }
+            )
         inference_artifacts = inference_stage.build_from_prediction_frame(
             prediction_df,
-            summary={
-                "rowsScored": int(prediction_summary["rowsScored"]),
-                "productsScored": int(prediction_summary["productsScored"]),
-                "watchlistPoolRowsScored": int(watchlist_pool_summary["rowsScored"]),
-                "watchlistPoolProductsScored": int(watchlist_pool_summary["productsScored"]),
-            },
+            summary=inference_summary,
             empty_message=(
                 "No live signals remained after applying the configured signal-universe exclusions."
+            ),
+            protected_product_ids=(
+                active_universe_plan.protected_product_ids
+                if active_universe_plan is not None
+                else None
             ),
         )
         portfolio_store = TradingPortfolioStore(
@@ -290,6 +375,8 @@ class LiveSignalEngine:
                     if product_id
                     else "requested-products"
                     if product_ids
+                    else "prioritized-active-universe"
+                    if active_universe_plan is not None
                     else "quote-universe-plus-watchlist-pool"
                     if use_quote_universe and watchlist_pool_product_ids
                     else "quote-universe"
