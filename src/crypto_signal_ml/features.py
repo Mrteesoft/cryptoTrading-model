@@ -1,7 +1,7 @@
 """Class-based feature engineering for the crypto signal model."""
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -135,6 +135,226 @@ FEATURE_COLUMNS = [
     "cmc_market_is_extreme_fear",
     "cmc_market_is_extreme_greed",
 ]
+
+FEATURE_GROUPS: Dict[str, list[str]] = {
+    "returns": [
+        "return_1",
+        "return_3",
+        "return_5",
+        "return_12",
+        "return_24",
+        "candle_body_pct",
+        "range_pct",
+    ],
+    "momentum": [
+        "momentum_10",
+        "rsi_14",
+        "positive_close_ratio_10",
+    ],
+    "volume": [
+        "volume_change_1",
+        "volume_change_5",
+        "volume_vs_sma_20",
+        "volume_vs_sma_50",
+        "volume_zscore_20",
+        "volume_trend_5_20",
+    ],
+    "volatility": [
+        "volatility_5",
+        "volatility_20",
+        "atr_pct_14",
+        "volatility_compression_5_20",
+    ],
+    "trend": [
+        "close_vs_sma_5",
+        "close_vs_sma_10",
+        "close_vs_sma_20",
+        "close_vs_sma_50",
+        "close_vs_ema_5",
+        "close_vs_ema_20",
+        "close_vs_ema_50",
+        "trend_acceleration_5_20",
+        "trend_acceleration_10_50",
+    ],
+    "market_context": [
+        "market_return_1",
+        "relative_strength_1",
+        "market_return_5",
+        "relative_strength_5",
+        "market_return_24",
+        "relative_strength_24",
+        "market_breadth_1",
+        "market_breadth_5",
+        "market_breadth_24",
+        "market_dispersion_1",
+        "market_dispersion_5",
+        "relative_strength_rank_1",
+        "relative_strength_rank_5",
+        "relative_strength_rank_24",
+        "market_volatility_5",
+        "market_trend_strength_20",
+        "benchmark_btc_return_1",
+        "benchmark_btc_return_5",
+        "benchmark_btc_return_24",
+        "asset_vs_btc_return_1",
+        "asset_vs_btc_return_5",
+        "asset_vs_btc_return_24",
+    ],
+    "market_structure": [
+        "breakout_up_20",
+        "breakout_down_20",
+        "range_position_20",
+        "drawdown_from_high_20",
+        "rebound_from_low_20",
+    ],
+    "time_context": [
+        "hour_of_day_sin",
+        "hour_of_day_cos",
+        "day_of_week_sin",
+        "day_of_week_cos",
+    ],
+    "higher_timeframe": list(MULTI_TIMEFRAME_FEATURE_COLUMNS),
+    "regime": list(REGIME_FEATURE_COLUMNS),
+    "fundamentals_context": [
+        "cmc_context_available",
+        "cmc_rank_score",
+        "cmc_market_cap_log",
+        "cmc_volume_24h_log",
+        "cmc_percent_change_24h",
+        "cmc_percent_change_7d",
+        "cmc_percent_change_30d",
+        "cmc_circulating_supply_ratio",
+        "cmc_num_market_pairs_log",
+        "cmc_tags_count",
+        "cmc_platform_present",
+        "cmc_is_mineable",
+        "cmc_has_defi_tag",
+        "cmc_has_ai_tag",
+        "cmc_has_layer1_tag",
+        "cmc_has_gaming_tag",
+        "cmc_has_meme_tag",
+    ],
+    "market_intelligence": [
+        "cmc_market_intelligence_available",
+        "cmc_market_total_market_cap_log",
+        "cmc_market_total_volume_24h_log",
+        "cmc_market_total_market_cap_change_24h",
+        "cmc_market_total_volume_change_24h",
+        "cmc_market_altcoin_share",
+        "cmc_market_btc_dominance",
+        "cmc_market_btc_dominance_change_24h",
+        "cmc_market_eth_dominance",
+        "cmc_market_stablecoin_share",
+        "cmc_market_defi_market_cap_log",
+        "cmc_market_defi_volume_24h_log",
+        "cmc_market_derivatives_volume_24h_log",
+        "cmc_market_fear_greed_score",
+        "cmc_market_is_fear",
+        "cmc_market_is_greed",
+        "cmc_market_is_extreme_fear",
+        "cmc_market_is_extreme_greed",
+    ],
+}
+
+FEATURE_PACKS: Dict[str, tuple[str, ...]] = {
+    "core": (
+        "returns",
+        "momentum",
+        "volume",
+        "volatility",
+        "trend",
+        "market_structure",
+        "regime",
+    ),
+    "core_plus_market": (
+        "returns",
+        "momentum",
+        "volume",
+        "volatility",
+        "trend",
+        "market_structure",
+        "regime",
+        "market_context",
+    ),
+    "core_plus_context": (
+        "returns",
+        "momentum",
+        "volume",
+        "volatility",
+        "trend",
+        "market_structure",
+        "regime",
+        "market_context",
+        "higher_timeframe",
+        "time_context",
+    ),
+    "core_plus_fundamentals": (
+        "returns",
+        "momentum",
+        "volume",
+        "volatility",
+        "trend",
+        "market_structure",
+        "regime",
+        "market_context",
+        "higher_timeframe",
+        "time_context",
+        "fundamentals_context",
+        "market_intelligence",
+    ),
+    "all": tuple(FEATURE_GROUPS.keys()),
+}
+
+
+def _build_feature_group_lookup() -> Dict[str, str]:
+    """Build a reverse lookup from feature name to its owning feature group."""
+
+    feature_group_lookup: Dict[str, str] = {}
+    for group_name, group_columns in FEATURE_GROUPS.items():
+        for feature_name in group_columns:
+            if feature_name in feature_group_lookup:
+                raise ValueError(
+                    f"Feature '{feature_name}' is assigned to multiple groups: "
+                    f"{feature_group_lookup[feature_name]} and {group_name}."
+                )
+            feature_group_lookup[feature_name] = group_name
+
+    missing_features = [feature_name for feature_name in FEATURE_COLUMNS if feature_name not in feature_group_lookup]
+    if missing_features:
+        raise ValueError(
+            "Every feature must belong to exactly one feature group. "
+            f"Missing assignments: {missing_features}"
+        )
+
+    return feature_group_lookup
+
+
+FEATURE_GROUP_LOOKUP = _build_feature_group_lookup()
+
+
+def resolve_feature_group(feature_name: str) -> str:
+    """Return the configured feature family for one feature column."""
+
+    return FEATURE_GROUP_LOOKUP.get(str(feature_name), "unknown")
+
+
+def get_feature_pack_columns(feature_pack: str = "all") -> list[str]:
+    """Return the ordered feature list for one named feature pack."""
+
+    normalized_pack = str(feature_pack or "all").strip().lower()
+    if normalized_pack not in FEATURE_PACKS:
+        available_packs = ", ".join(sorted(FEATURE_PACKS.keys()))
+        raise ValueError(
+            f"Unknown feature pack: {feature_pack}. "
+            f"Available feature packs: {available_packs}"
+        )
+
+    selected_groups = set(FEATURE_PACKS[normalized_pack])
+    return [
+        feature_name
+        for feature_name in FEATURE_COLUMNS
+        if resolve_feature_group(feature_name) in selected_groups
+    ]
 
 
 class BaseFeatureEngineer(ABC):

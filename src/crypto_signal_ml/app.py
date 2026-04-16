@@ -30,11 +30,13 @@ from .data import (
     create_market_data_loader,
 )
 from .frontend import WatchlistPoolStore
+from .features import resolve_feature_group
 from .labels import create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .source_refresh import SignalUniverseCoordinator
 from .trading.portfolio import TradingPortfolioStore
+from .trading.policy import evaluate_trading_decision
 from .trading.signal_store import TradingSignalStore
 from .regime_modeling import MarketRegimeModel
 from .application import (
@@ -432,6 +434,7 @@ class BaseSignalApp:
             "artifactCreatedAt": datetime.now(timezone.utc).isoformat(),
             "artifactPath": str(model_path),
             "modelType": model.model_type,
+            "featurePack": str(model.config.feature_pack),
             "featureCount": len(model.feature_columns),
             "featurePreview": list(model.feature_columns[:10]),
             "labeling": {
@@ -581,15 +584,21 @@ class BaseSignalApp:
 class TrainingApp(BaseSignalApp):
     """Train a model, evaluate it, and save the generated artifacts."""
 
+    def _build_dataset_bundle(self) -> Dict[str, Any]:
+        """Build the labeled dataset plus pre-clean frames for audit workflows."""
+
+        self._ensure_market_data_available()
+        dataset_bundle = self.dataset_builder.build_labeled_dataset_bundle()
+        self.save_dataframe(dataset_bundle["dataset"], self.dataset_path)
+        return dataset_bundle
+
     def _build_dataset(self) -> tuple[pd.DataFrame, List[str]]:
         """
         Build and save the labeled dataset used for training.
         """
 
-        self._ensure_market_data_available()
-        dataset, feature_columns = self.dataset_builder.build_labeled_dataset()
-        self.save_dataframe(dataset, self.dataset_path)
-        return dataset, feature_columns
+        dataset_bundle = self._build_dataset_bundle()
+        return dataset_bundle["dataset"], dataset_bundle["feature_columns"]
 
     def _train_model_for_type(
         self,
@@ -690,12 +699,153 @@ class TrainingApp(BaseSignalApp):
 
         return {
             "modelType": self.model.model_type,
+            "featurePack": str(self.model.config.feature_pack),
+            "featureCount": int(len(self.model.feature_columns)),
             "datasetPath": str(self.dataset_path),
             **output_paths,
             "trainRows": len(train_df),
             "testRows": len(test_df),
             "accuracy": metrics["accuracy"],
             "balancedAccuracy": metrics["balanced_accuracy"],
+        }
+
+    @staticmethod
+    def _find_regime_column(prediction_df: pd.DataFrame) -> str | None:
+        for column in (
+            "market_regime_label",
+            "market_regime_code",
+            "trend_regime_label",
+            "volatility_regime_label",
+        ):
+            if column in prediction_df.columns:
+                return column
+        return None
+
+    def _build_confidence_bucket_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        """Summarize BUY quality across confidence buckets."""
+
+        if "confidence" not in prediction_df.columns or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        buckets = [
+            (0.0, 0.40),
+            (0.40, 0.55),
+            (0.55, 0.70),
+            (0.70, 0.85),
+            (0.85, 1.01),
+        ]
+        actual_buy = prediction_df["target_signal"] == 1 if "target_signal" in prediction_df.columns else None
+
+        bucket_rows = []
+        for lower, upper in buckets:
+            bucket_mask = (prediction_df["confidence"] >= lower) & (prediction_df["confidence"] < upper)
+            predicted_buy = bucket_mask & (prediction_df["predicted_name"] == "BUY")
+            count = int(predicted_buy.sum())
+            precision = None
+            if actual_buy is not None:
+                precision = float((predicted_buy & actual_buy).sum() / max(count, 1))
+            avg_return = None
+            if "future_return" in prediction_df.columns:
+                avg_return = float(prediction_df.loc[predicted_buy, "future_return"].mean()) if count > 0 else 0.0
+
+            bucket_rows.append(
+                {
+                    "bucket": f"{lower:.2f}-{upper:.2f}",
+                    "predictedBuyCount": count,
+                    "buyPrecision": precision,
+                    "averageForwardReturn": avg_return,
+                }
+            )
+
+        return {"available": True, "buckets": bucket_rows}
+
+    def _build_regime_metrics(self, prediction_df: pd.DataFrame) -> Dict[str, Any]:
+        """Summarize BUY quality by detected regime."""
+
+        regime_column = self._find_regime_column(prediction_df)
+        if regime_column is None or "predicted_name" not in prediction_df.columns:
+            return {"available": False}
+
+        actual_buy = prediction_df["target_signal"] == 1 if "target_signal" in prediction_df.columns else None
+        grouped = prediction_df.groupby(regime_column)
+        rows = []
+        for regime_value, group in grouped:
+            predicted_buy = group["predicted_name"] == "BUY"
+            count = int(predicted_buy.sum())
+            precision = None
+            if actual_buy is not None:
+                precision = float((predicted_buy & (group["target_signal"] == 1)).sum() / max(count, 1))
+            avg_return = None
+            if "future_return" in group.columns:
+                avg_return = float(group.loc[predicted_buy, "future_return"].mean()) if count > 0 else 0.0
+            rows.append(
+                {
+                    "regime": str(regime_value),
+                    "predictedBuyCount": count,
+                    "buyPrecision": precision,
+                    "averageForwardReturn": avg_return,
+                }
+            )
+
+        return {"available": True, "regimeColumn": regime_column, "rows": rows[:12]}
+
+    def _build_policy_trade_metrics(
+        self,
+        prediction_df: pd.DataFrame,
+        evaluation_config: TrainingConfig,
+    ) -> Dict[str, Any]:
+        """Summarize post-policy trade quality for actionable model outputs."""
+
+        required_columns = {"predicted_signal", "confidence", "future_return"}
+        if not required_columns.issubset(prediction_df.columns):
+            return {"available": False}
+
+        policy_rows = [
+            evaluate_trading_decision(
+                signal_row=signal_row,
+                minimum_action_confidence=evaluation_config.backtest_min_confidence,
+                config=evaluation_config,
+            )
+            for _, signal_row in prediction_df.iterrows()
+        ]
+        policy_df = pd.DataFrame(
+            [
+                {
+                    "policy_signal_name": policy_row["signalName"],
+                    "policy_spot_action": policy_row["spotAction"],
+                    "policy_trade_readiness": policy_row["tradeReadiness"],
+                    "policy_score": policy_row["policyScore"],
+                    "policy_probability_margin": policy_row["probabilityMargin"],
+                    "policy_required_action_confidence": policy_row["requiredActionConfidence"],
+                    "model_signal_name": policy_row["modelSignalName"],
+                }
+                for policy_row in policy_rows
+            ],
+            index=prediction_df.index,
+        )
+        evaluated_df = pd.concat([prediction_df, policy_df], axis=1)
+        policy_buy_df = evaluated_df[evaluated_df["policy_spot_action"] == "buy"].copy()
+        blocked_buy_count = int(
+            (
+                (evaluated_df["model_signal_name"] == "BUY")
+                & (evaluated_df["policy_spot_action"] != "buy")
+            ).sum()
+        )
+
+        return {
+            "available": True,
+            "acceptedBuyCount": int(len(policy_buy_df)),
+            "blockedBuyCount": blocked_buy_count,
+            "buyWinRate": float((policy_buy_df["future_return"] > 0).mean()) if not policy_buy_df.empty else 0.0,
+            "averageForwardReturn": (
+                float(policy_buy_df["future_return"].mean()) if not policy_buy_df.empty else 0.0
+            ),
+            "averagePolicyScore": (
+                float(policy_buy_df["policy_score"].mean()) if not policy_buy_df.empty else 0.0
+            ),
+            "averageProbabilityMargin": (
+                float(policy_buy_df["policy_probability_margin"].mean()) if not policy_buy_df.empty else 0.0
+            ),
         }
 
     def run(self) -> Dict[str, Any]:
@@ -740,12 +890,13 @@ class WalkForwardValidationApp(TrainingApp):
         data during training.
         """
 
-        dataset, feature_columns = self._build_dataset()
+        dataset_bundle = self._build_dataset_bundle()
         walk_forward_result = self._run_walk_forward_validation(
-            dataset=dataset,
-            feature_columns=feature_columns,
+            dataset=dataset_bundle["dataset"],
+            feature_columns=dataset_bundle["feature_columns"],
             validation_config=self.config,
             backtester=self.backtester,
+            audit_source_df=dataset_bundle["labeled_df"],
         )
         return self._save_walk_forward_outputs(walk_forward_result)
 
@@ -755,6 +906,7 @@ class WalkForwardValidationApp(TrainingApp):
         feature_columns: List[str],
         validation_config: TrainingConfig,
         backtester: BaseSignalBacktester = None,
+        audit_source_df: pd.DataFrame | None = None,
     ) -> Dict[str, Any]:
         """
         Run walk-forward validation on a provided dataset and config.
@@ -791,6 +943,11 @@ class WalkForwardValidationApp(TrainingApp):
             prediction_frames.append(prediction_df)
 
             feature_importance_df = model.get_feature_importance_frame()
+            if not feature_importance_df.empty:
+                feature_importance_df["group"] = feature_importance_df["feature"].map(resolve_feature_group)
+                feature_importance_df["importance_rank"] = (
+                    feature_importance_df["importance"].rank(method="dense", ascending=False).astype(int)
+                )
             feature_importance_df["fold_number"] = fold_split["fold_number"]
             feature_importance_frames.append(feature_importance_df)
 
@@ -854,6 +1011,15 @@ class WalkForwardValidationApp(TrainingApp):
         backtest_result = local_backtester.run(walk_forward_predictions_df)
         walk_forward_summary = {
             **aggregate_metrics,
+            "feature_pack": str(validation_config.feature_pack),
+            "feature_count": int(len(feature_columns)),
+            "feature_group_counts": self._build_feature_group_counts(feature_columns),
+            "confidence_bucket_metrics": self._build_confidence_bucket_metrics(walk_forward_predictions_df),
+            "policy_trade_quality": self._build_policy_trade_metrics(
+                walk_forward_predictions_df,
+                evaluation_config=validation_config,
+            ),
+            "regime_metrics": self._build_regime_metrics(walk_forward_predictions_df),
             "backtest_summary": backtest_result["summary"],
         }
 
@@ -861,7 +1027,10 @@ class WalkForwardValidationApp(TrainingApp):
             "config": validation_config,
             "fold_metrics_df": fold_metrics_df,
             "walk_forward_predictions_df": walk_forward_predictions_df,
+            "feature_importance_by_fold_df": feature_importance_by_fold_df,
             "average_feature_importance_df": average_feature_importance_df,
+            "feature_audit_df": feature_audit_df,
+            "feature_group_summary_df": feature_group_summary_df,
             "summary": walk_forward_summary,
             "backtest_result": backtest_result,
         }
@@ -874,13 +1043,19 @@ class WalkForwardValidationApp(TrainingApp):
 
         fold_metrics_df = walk_forward_result["fold_metrics_df"]
         walk_forward_predictions_df = walk_forward_result["walk_forward_predictions_df"]
+        feature_importance_by_fold_df = walk_forward_result["feature_importance_by_fold_df"]
         average_feature_importance_df = walk_forward_result["average_feature_importance_df"]
+        feature_audit_df = walk_forward_result["feature_audit_df"]
+        feature_group_summary_df = walk_forward_result["feature_group_summary_df"]
         walk_forward_summary = walk_forward_result["summary"]
         backtest_result = walk_forward_result["backtest_result"]
 
         fold_metrics_path = OUTPUTS_DIR / "walkForwardFoldMetrics.csv"
         predictions_path = OUTPUTS_DIR / "walkForwardPredictions.csv"
+        feature_importance_by_fold_path = OUTPUTS_DIR / "walkForwardFeatureImportanceByFold.csv"
         feature_importance_path = OUTPUTS_DIR / "walkForwardFeatureImportance.csv"
+        feature_audit_path = OUTPUTS_DIR / "walkForwardFeatureAudit.csv"
+        feature_group_summary_path = OUTPUTS_DIR / "walkForwardFeatureGroupSummary.csv"
         summary_path = OUTPUTS_DIR / "walkForwardSummary.json"
         backtest_trades_path = OUTPUTS_DIR / "walkForwardBacktestTrades.csv"
         backtest_periods_path = OUTPUTS_DIR / "walkForwardBacktestPeriods.csv"
@@ -888,7 +1063,10 @@ class WalkForwardValidationApp(TrainingApp):
 
         self.save_dataframe(fold_metrics_df, fold_metrics_path)
         self.save_dataframe(walk_forward_predictions_df, predictions_path)
+        self.save_dataframe(feature_importance_by_fold_df, feature_importance_by_fold_path)
         self.save_dataframe(average_feature_importance_df, feature_importance_path)
+        self.save_dataframe(feature_audit_df, feature_audit_path)
+        self.save_dataframe(feature_group_summary_df, feature_group_summary_path)
         self.save_json(walk_forward_summary, summary_path)
         self.save_dataframe(backtest_result["trade_df"], backtest_trades_path)
         self.save_dataframe(backtest_result["period_df"], backtest_periods_path)
@@ -896,10 +1074,15 @@ class WalkForwardValidationApp(TrainingApp):
 
         return {
             "modelType": self.config.model_type,
+            "featurePack": str(self.config.feature_pack),
+            "featureCount": int(walk_forward_summary["feature_count"]),
             "datasetPath": str(self.dataset_path),
             "walkForwardFoldMetricsPath": str(fold_metrics_path),
             "walkForwardPredictionsPath": str(predictions_path),
+            "walkForwardFeatureImportanceByFoldPath": str(feature_importance_by_fold_path),
             "walkForwardFeatureImportancePath": str(feature_importance_path),
+            "walkForwardFeatureAuditPath": str(feature_audit_path),
+            "walkForwardFeatureGroupSummaryPath": str(feature_group_summary_path),
             "walkForwardSummaryPath": str(summary_path),
             "walkForwardBacktestTradesPath": str(backtest_trades_path),
             "walkForwardBacktestPeriodsPath": str(backtest_periods_path),
@@ -915,6 +1098,50 @@ class WalkForwardValidationApp(TrainingApp):
             "maxDrawdown": backtest_result["summary"]["maxDrawdown"],
         }
 
+    def _build_feature_group_counts(self, feature_columns: List[str]) -> Dict[str, int]:
+        """Count how many selected features belong to each feature family."""
+
+        feature_group_counts: Dict[str, int] = {}
+        for feature_name in feature_columns:
+            group_name = resolve_feature_group(feature_name)
+            feature_group_counts[group_name] = feature_group_counts.get(group_name, 0) + 1
+        return dict(sorted(feature_group_counts.items(), key=lambda item: item[0]))
+
+    def _build_feature_importance_by_fold(
+        self,
+        feature_importance_frames: List[pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Combine per-fold feature-importance frames into one audit table."""
+
+        valid_feature_importance_frames = [
+            feature_importance_df
+            for feature_importance_df in feature_importance_frames
+            if not feature_importance_df.empty
+            and {"feature", "importance", "fold_number"}.issubset(feature_importance_df.columns)
+        ]
+
+        if not valid_feature_importance_frames:
+            return pd.DataFrame(
+                columns=["feature", "group", "fold_number", "importance", "importance_rank"]
+            )
+
+        combined_feature_importance_df = pd.concat(valid_feature_importance_frames, ignore_index=True)
+        if "group" not in combined_feature_importance_df.columns:
+            combined_feature_importance_df["group"] = combined_feature_importance_df["feature"].map(
+                resolve_feature_group
+            )
+        if "importance_rank" not in combined_feature_importance_df.columns:
+            combined_feature_importance_df["importance_rank"] = (
+                combined_feature_importance_df.groupby("fold_number")["importance"]
+                .rank(method="dense", ascending=False)
+                .astype(int)
+            )
+
+        return combined_feature_importance_df.sort_values(
+            ["fold_number", "importance_rank", "feature"],
+            ascending=[True, True, True],
+        ).reset_index(drop=True)
+
     def _average_feature_importance(
         self,
         feature_importance_frames: List[pd.DataFrame],
@@ -929,15 +1156,221 @@ class WalkForwardValidationApp(TrainingApp):
         ]
 
         if not valid_feature_importance_frames:
-            return pd.DataFrame(columns=["feature", "importance"])
+            return pd.DataFrame(
+                columns=[
+                    "feature",
+                    "group",
+                    "importance",
+                    "importanceStd",
+                    "importanceRank",
+                    "importanceRankStd",
+                    "foldsWithImportance",
+                    "foldCoverage",
+                    "importanceStability",
+                ]
+            )
 
-        combined_feature_importance_df = pd.concat(valid_feature_importance_frames, ignore_index=True)
-        return (
+        combined_feature_importance_df = self._build_feature_importance_by_fold(feature_importance_frames)
+        total_fold_count = int(combined_feature_importance_df["fold_number"].nunique())
+        averaged_feature_importance_df = (
             combined_feature_importance_df.groupby("feature", as_index=False)
-            .agg(importance=("importance", "mean"))
+            .agg(
+                group=("group", "first"),
+                importance=("importance", "mean"),
+                importanceStd=("importance", "std"),
+                importanceRank=("importance_rank", "mean"),
+                importanceRankStd=("importance_rank", "std"),
+                foldsWithImportance=("fold_number", "nunique"),
+            )
             .sort_values("importance", ascending=False)
             .reset_index(drop=True)
         )
+        averaged_feature_importance_df["importanceStd"] = averaged_feature_importance_df["importanceStd"].fillna(0.0)
+        averaged_feature_importance_df["importanceRankStd"] = averaged_feature_importance_df[
+            "importanceRankStd"
+        ].fillna(0.0)
+        averaged_feature_importance_df["foldCoverage"] = (
+            averaged_feature_importance_df["foldsWithImportance"] / max(total_fold_count, 1)
+        )
+        averaged_feature_importance_df["importanceStability"] = averaged_feature_importance_df.apply(
+            lambda row: (
+                float(row["importance"] / (row["importance"] + row["importanceStd"]))
+                if (float(row["importance"]) + float(row["importanceStd"])) > 0
+                else 0.0
+            ),
+            axis=1,
+        )
+        return averaged_feature_importance_df
+
+    def _build_feature_correlation_clusters(
+        self,
+        usable_dataset: pd.DataFrame,
+        feature_columns: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Cluster highly correlated features so the audit can flag redundancy."""
+
+        cluster_lookup = {
+            feature_name: {
+                "correlationCluster": "",
+                "correlationClusterSize": 1,
+            }
+            for feature_name in feature_columns
+        }
+        if usable_dataset.empty or not feature_columns:
+            return cluster_lookup
+
+        numeric_feature_df = usable_dataset[feature_columns].apply(pd.to_numeric, errors="coerce")
+        correlation_df = numeric_feature_df.corr().abs().fillna(0.0)
+        threshold = min(max(float(self.config.feature_audit_correlation_threshold), 0.0), 0.999999)
+        visited_features: set[str] = set()
+        cluster_number = 1
+
+        for feature_name in feature_columns:
+            if feature_name in visited_features:
+                continue
+
+            stack = [feature_name]
+            connected_features: list[str] = []
+            while stack:
+                current_feature = stack.pop()
+                if current_feature in visited_features:
+                    continue
+
+                visited_features.add(current_feature)
+                connected_features.append(current_feature)
+                if current_feature not in correlation_df.columns:
+                    continue
+
+                neighbor_features = correlation_df.index[
+                    (correlation_df.loc[current_feature] >= threshold)
+                    & (correlation_df.index != current_feature)
+                ].tolist()
+                for neighbor_feature in neighbor_features:
+                    if neighbor_feature not in visited_features:
+                        stack.append(neighbor_feature)
+
+            connected_features = sorted(set(connected_features))
+            cluster_label = f"cluster_{cluster_number:03d}" if len(connected_features) > 1 else ""
+            if len(connected_features) > 1:
+                cluster_number += 1
+            for connected_feature in connected_features:
+                cluster_lookup[connected_feature] = {
+                    "correlationCluster": cluster_label,
+                    "correlationClusterSize": int(len(connected_features)),
+                }
+
+        return cluster_lookup
+
+    def _build_feature_audit_frame(
+        self,
+        feature_source_df: pd.DataFrame,
+        usable_dataset: pd.DataFrame,
+        feature_columns: List[str],
+        average_feature_importance_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build one per-feature audit table for walk-forward review."""
+
+        source_numeric_df = pd.DataFrame(index=feature_source_df.index)
+        for feature_name in feature_columns:
+            if feature_name in feature_source_df.columns:
+                source_numeric_df[feature_name] = pd.to_numeric(feature_source_df[feature_name], errors="coerce")
+            else:
+                source_numeric_df[feature_name] = pd.Series(float("nan"), index=feature_source_df.index, dtype=float)
+
+        importance_lookup = average_feature_importance_df.set_index("feature").to_dict("index")
+        cluster_lookup = self._build_feature_correlation_clusters(
+            usable_dataset=usable_dataset,
+            feature_columns=feature_columns,
+        )
+
+        audit_rows = []
+        for feature_name in feature_columns:
+            feature_series = source_numeric_df[feature_name]
+            non_missing_series = feature_series.dropna()
+            total_row_count = int(len(feature_series))
+            non_missing_count = int(len(non_missing_series))
+            non_zero_count = int((non_missing_series != 0).sum()) if non_missing_count > 0 else 0
+            importance_row = importance_lookup.get(feature_name, {})
+            cluster_row = cluster_lookup.get(
+                feature_name,
+                {"correlationCluster": "", "correlationClusterSize": 1},
+            )
+
+            audit_rows.append(
+                {
+                    "feature": feature_name,
+                    "group": resolve_feature_group(feature_name),
+                    "featurePack": str(self.config.feature_pack),
+                    "rowCount": total_row_count,
+                    "nonMissingCount": non_missing_count,
+                    "nonZeroCount": non_zero_count,
+                    "missingRate": float(feature_series.isna().mean()) if total_row_count > 0 else 1.0,
+                    "zeroRate": float((non_missing_series == 0).mean()) if non_missing_count > 0 else 1.0,
+                    "variance": float(non_missing_series.var(ddof=0)) if non_missing_count > 1 else 0.0,
+                    "correlationCluster": str(cluster_row["correlationCluster"]),
+                    "correlationClusterSize": int(cluster_row["correlationClusterSize"]),
+                    "importance": float(importance_row.get("importance", 0.0) or 0.0),
+                    "importanceStd": float(importance_row.get("importanceStd", 0.0) or 0.0),
+                    "importanceRank": float(importance_row.get("importanceRank", 0.0) or 0.0),
+                    "importanceRankStd": float(importance_row.get("importanceRankStd", 0.0) or 0.0),
+                    "foldsWithImportance": int(importance_row.get("foldsWithImportance", 0) or 0),
+                    "foldCoverage": float(importance_row.get("foldCoverage", 0.0) or 0.0),
+                    "importanceStability": float(importance_row.get("importanceStability", 0.0) or 0.0),
+                }
+            )
+
+        return pd.DataFrame(audit_rows).sort_values(
+            ["importance", "importanceStability", "variance"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+
+    def _build_feature_group_summary(
+        self,
+        feature_audit_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Roll the feature audit up to feature-family level."""
+
+        if feature_audit_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "group",
+                    "featureCount",
+                    "averageMissingRate",
+                    "averageZeroRate",
+                    "averageVariance",
+                    "averageImportance",
+                    "totalImportance",
+                    "averageImportanceStability",
+                    "correlatedFeatureCount",
+                    "topFeature",
+                ]
+            )
+
+        top_feature_df = (
+            feature_audit_df.sort_values(["group", "importance", "importanceStability"], ascending=[True, False, False])
+            .drop_duplicates(subset=["group"], keep="first")[["group", "feature"]]
+            .rename(columns={"feature": "topFeature"})
+        )
+        summary_df = (
+            feature_audit_df.groupby("group", as_index=False)
+            .agg(
+                featureCount=("feature", "size"),
+                averageMissingRate=("missingRate", "mean"),
+                averageZeroRate=("zeroRate", "mean"),
+                averageVariance=("variance", "mean"),
+                averageImportance=("importance", "mean"),
+                totalImportance=("importance", "sum"),
+                averageImportanceStability=("importanceStability", "mean"),
+                correlatedFeatureCount=(
+                    "correlationClusterSize",
+                    lambda cluster_sizes: int((pd.Series(cluster_sizes) > 1).sum()),
+                ),
+            )
+            .sort_values("totalImportance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        return summary_df.merge(top_feature_df, on="group", how="left")
 
     def _save_walk_forward_progress(
         self,
@@ -968,6 +1401,10 @@ class WalkForwardValidationApp(TrainingApp):
         self.save_dataframe(
             self._average_feature_importance(feature_importance_frames),
             OUTPUTS_DIR / "walkForwardFeatureImportance.partial.csv",
+        )
+        self.save_dataframe(
+            self._build_feature_importance_by_fold(feature_importance_frames),
+            OUTPUTS_DIR / "walkForwardFeatureImportanceByFold.partial.csv",
         )
         self.save_json(
             {
@@ -1165,6 +1602,11 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             prediction_frames.append(prediction_df)
 
             feature_importance_df = model.get_feature_importance_frame()
+            if not feature_importance_df.empty:
+                feature_importance_df["group"] = feature_importance_df["feature"].map(resolve_feature_group)
+                feature_importance_df["importance_rank"] = (
+                    feature_importance_df["importance"].rank(method="dense", ascending=False).astype(int)
+                )
             feature_importance_df["fold_number"] = fold_split["fold_number"]
             feature_importance_frames.append(feature_importance_df)
 
@@ -1283,15 +1725,221 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
         ]
 
         if not valid_feature_importance_frames:
-            return pd.DataFrame(columns=["feature", "importance"])
+            return pd.DataFrame(
+                columns=[
+                    "feature",
+                    "group",
+                    "importance",
+                    "importanceStd",
+                    "importanceRank",
+                    "importanceRankStd",
+                    "foldsWithImportance",
+                    "foldCoverage",
+                    "importanceStability",
+                ]
+            )
 
-        combined_feature_importance_df = pd.concat(valid_feature_importance_frames, ignore_index=True)
-        return (
+        combined_feature_importance_df = self._build_feature_importance_by_fold(feature_importance_frames)
+        total_fold_count = int(combined_feature_importance_df["fold_number"].nunique())
+        averaged_feature_importance_df = (
             combined_feature_importance_df.groupby("feature", as_index=False)
-            .agg(importance=("importance", "mean"))
+            .agg(
+                group=("group", "first"),
+                importance=("importance", "mean"),
+                importanceStd=("importance", "std"),
+                importanceRank=("importance_rank", "mean"),
+                importanceRankStd=("importance_rank", "std"),
+                foldsWithImportance=("fold_number", "nunique"),
+            )
             .sort_values("importance", ascending=False)
             .reset_index(drop=True)
         )
+        averaged_feature_importance_df["importanceStd"] = averaged_feature_importance_df["importanceStd"].fillna(0.0)
+        averaged_feature_importance_df["importanceRankStd"] = averaged_feature_importance_df[
+            "importanceRankStd"
+        ].fillna(0.0)
+        averaged_feature_importance_df["foldCoverage"] = (
+            averaged_feature_importance_df["foldsWithImportance"] / max(total_fold_count, 1)
+        )
+        averaged_feature_importance_df["importanceStability"] = averaged_feature_importance_df.apply(
+            lambda row: (
+                float(row["importance"] / (row["importance"] + row["importanceStd"]))
+                if (float(row["importance"]) + float(row["importanceStd"])) > 0
+                else 0.0
+            ),
+            axis=1,
+        )
+        return averaged_feature_importance_df
+
+    def _build_feature_correlation_clusters(
+        self,
+        usable_dataset: pd.DataFrame,
+        feature_columns: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Cluster highly correlated features so the audit can flag redundancy."""
+
+        cluster_lookup = {
+            feature_name: {
+                "correlationCluster": "",
+                "correlationClusterSize": 1,
+            }
+            for feature_name in feature_columns
+        }
+        if usable_dataset.empty or not feature_columns:
+            return cluster_lookup
+
+        numeric_feature_df = usable_dataset[feature_columns].apply(pd.to_numeric, errors="coerce")
+        correlation_df = numeric_feature_df.corr().abs().fillna(0.0)
+        threshold = min(max(float(self.config.feature_audit_correlation_threshold), 0.0), 0.999999)
+        visited_features: set[str] = set()
+        cluster_number = 1
+
+        for feature_name in feature_columns:
+            if feature_name in visited_features:
+                continue
+
+            stack = [feature_name]
+            connected_features: list[str] = []
+            while stack:
+                current_feature = stack.pop()
+                if current_feature in visited_features:
+                    continue
+
+                visited_features.add(current_feature)
+                connected_features.append(current_feature)
+                if current_feature not in correlation_df.columns:
+                    continue
+
+                neighbor_features = correlation_df.index[
+                    (correlation_df.loc[current_feature] >= threshold)
+                    & (correlation_df.index != current_feature)
+                ].tolist()
+                for neighbor_feature in neighbor_features:
+                    if neighbor_feature not in visited_features:
+                        stack.append(neighbor_feature)
+
+            connected_features = sorted(set(connected_features))
+            cluster_label = f"cluster_{cluster_number:03d}" if len(connected_features) > 1 else ""
+            if len(connected_features) > 1:
+                cluster_number += 1
+            for connected_feature in connected_features:
+                cluster_lookup[connected_feature] = {
+                    "correlationCluster": cluster_label,
+                    "correlationClusterSize": int(len(connected_features)),
+                }
+
+        return cluster_lookup
+
+    def _build_feature_audit_frame(
+        self,
+        feature_source_df: pd.DataFrame,
+        usable_dataset: pd.DataFrame,
+        feature_columns: List[str],
+        average_feature_importance_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build one per-feature audit table for walk-forward review."""
+
+        source_numeric_df = pd.DataFrame(index=feature_source_df.index)
+        for feature_name in feature_columns:
+            if feature_name in feature_source_df.columns:
+                source_numeric_df[feature_name] = pd.to_numeric(feature_source_df[feature_name], errors="coerce")
+            else:
+                source_numeric_df[feature_name] = pd.Series(float("nan"), index=feature_source_df.index, dtype=float)
+
+        importance_lookup = average_feature_importance_df.set_index("feature").to_dict("index")
+        cluster_lookup = self._build_feature_correlation_clusters(
+            usable_dataset=usable_dataset,
+            feature_columns=feature_columns,
+        )
+
+        audit_rows = []
+        for feature_name in feature_columns:
+            feature_series = source_numeric_df[feature_name]
+            non_missing_series = feature_series.dropna()
+            total_row_count = int(len(feature_series))
+            non_missing_count = int(len(non_missing_series))
+            non_zero_count = int((non_missing_series != 0).sum()) if non_missing_count > 0 else 0
+            importance_row = importance_lookup.get(feature_name, {})
+            cluster_row = cluster_lookup.get(
+                feature_name,
+                {"correlationCluster": "", "correlationClusterSize": 1},
+            )
+
+            audit_rows.append(
+                {
+                    "feature": feature_name,
+                    "group": resolve_feature_group(feature_name),
+                    "featurePack": str(self.config.feature_pack),
+                    "rowCount": total_row_count,
+                    "nonMissingCount": non_missing_count,
+                    "nonZeroCount": non_zero_count,
+                    "missingRate": float(feature_series.isna().mean()) if total_row_count > 0 else 1.0,
+                    "zeroRate": float((non_missing_series == 0).mean()) if non_missing_count > 0 else 1.0,
+                    "variance": float(non_missing_series.var(ddof=0)) if non_missing_count > 1 else 0.0,
+                    "correlationCluster": str(cluster_row["correlationCluster"]),
+                    "correlationClusterSize": int(cluster_row["correlationClusterSize"]),
+                    "importance": float(importance_row.get("importance", 0.0) or 0.0),
+                    "importanceStd": float(importance_row.get("importanceStd", 0.0) or 0.0),
+                    "importanceRank": float(importance_row.get("importanceRank", 0.0) or 0.0),
+                    "importanceRankStd": float(importance_row.get("importanceRankStd", 0.0) or 0.0),
+                    "foldsWithImportance": int(importance_row.get("foldsWithImportance", 0) or 0),
+                    "foldCoverage": float(importance_row.get("foldCoverage", 0.0) or 0.0),
+                    "importanceStability": float(importance_row.get("importanceStability", 0.0) or 0.0),
+                }
+            )
+
+        return pd.DataFrame(audit_rows).sort_values(
+            ["importance", "importanceStability", "variance"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+
+    def _build_feature_group_summary(
+        self,
+        feature_audit_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Roll the feature audit up to feature-family level."""
+
+        if feature_audit_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "group",
+                    "featureCount",
+                    "averageMissingRate",
+                    "averageZeroRate",
+                    "averageVariance",
+                    "averageImportance",
+                    "totalImportance",
+                    "averageImportanceStability",
+                    "correlatedFeatureCount",
+                    "topFeature",
+                ]
+            )
+
+        top_feature_df = (
+            feature_audit_df.sort_values(["group", "importance", "importanceStability"], ascending=[True, False, False])
+            .drop_duplicates(subset=["group"], keep="first")[["group", "feature"]]
+            .rename(columns={"feature": "topFeature"})
+        )
+        summary_df = (
+            feature_audit_df.groupby("group", as_index=False)
+            .agg(
+                featureCount=("feature", "size"),
+                averageMissingRate=("missingRate", "mean"),
+                averageZeroRate=("zeroRate", "mean"),
+                averageVariance=("variance", "mean"),
+                averageImportance=("importance", "mean"),
+                totalImportance=("importance", "sum"),
+                averageImportanceStability=("importanceStability", "mean"),
+                correlatedFeatureCount=(
+                    "correlationClusterSize",
+                    lambda cluster_sizes: int((pd.Series(cluster_sizes) > 1).sum()),
+                ),
+            )
+            .sort_values("totalImportance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        return summary_df.merge(top_feature_df, on="group", how="left")
 
     def _save_walk_forward_progress(
         self,

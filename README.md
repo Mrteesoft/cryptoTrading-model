@@ -30,6 +30,18 @@ Equivalent npm shortcut:
 npm run model-service:start
 ```
 
+Broker worker command:
+
+```powershell
+python model-service/scripts/runBrokerWorker.py
+```
+
+Equivalent npm shortcut:
+
+```powershell
+npm run model-service:worker
+```
+
 Legacy compatibility command:
 
 ```powershell
@@ -81,6 +93,7 @@ Run these from the repo root.
 
 - Start the unified model service: `python model-service`
 - Start the cached signal API only: `python model-service/scripts/runSignalApi.py`
+- Start the async broker worker: `python model-service/scripts/runBrokerWorker.py`
 
 ### Data Refresh
 
@@ -187,6 +200,12 @@ Start with `model-service/.env.example`, then adjust these values as needed:
 - `SIGNAL_TRACK_GENERATED_TRADES`: automatically track generated trades
 - `SIGNAL_GENERATED_TRADE_STATUS`: initial status for generated trades
 - `DATABASE_URL`: shared database connection string
+- `REDIS_URL` or `BROKER_REDIS_URL`: shared job-state/cache store
+- `RABBITMQ_URL` or `BROKER_RABBITMQ_URL`: command queue broker
+- `RABBITMQ_COMMAND_EXCHANGE`: command exchange name
+- `KAFKA_BROKERS`: comma-separated Kafka broker list for published events
+- `KAFKA_CLIENT_ID`: Kafka producer client id
+- `KAFKA_TOPIC_PREFIX`: optional Kafka topic prefix
 
 Restart the Python process after editing `.env` so a fresh `TrainingConfig` is loaded.
 
@@ -214,4 +233,6 @@ Restart the Python process after editing `.env` so a fresh `TrainingConfig` is l
  #   c r y p t o T r a d i n g - m o d e l  
  #   c r y p t o T r a d i n g - m o d e l  
  #   c r y p t o T r a d i n g - m o d e l  
+ 
+#   c r y p t o T r a d i n g - m o d e l  
  

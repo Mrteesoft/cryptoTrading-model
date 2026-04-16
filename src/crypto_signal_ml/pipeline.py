@@ -1,7 +1,7 @@
 """Class-based dataset-building pipeline for training and prediction."""
 
 from abc import ABC
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
@@ -21,6 +21,7 @@ from .features import (
     FEATURE_COLUMNS,
     MULTI_TIMEFRAME_FEATURE_COLUMNS,
     TechnicalFeatureEngineer,
+    get_feature_pack_columns,
 )
 from .labels import BaseSignalLabeler, MarketRegimeLabeler, create_labeler_from_config, create_regime_labeler_from_config
 from .regimes import MarketRegimeDetector
@@ -87,13 +88,24 @@ class BaseDatasetBuilder(ABC):
         4. drop rows where features or future labels are missing
         """
 
+        dataset_bundle = self.build_labeled_dataset_bundle()
+        return dataset_bundle["dataset"], dataset_bundle["feature_columns"]
+
+    def build_labeled_dataset_bundle(self) -> Dict[str, Any]:
+        """Build the labeled dataset plus pre-clean frames for audit workflows."""
+
         feature_df = self.build_feature_table()
         if self.regime_labeler is not None:
             feature_df = self.regime_labeler.add_labels(feature_df)
         labeled_df = self.labeler.add_labels(feature_df)
         cleaned_df = self._clean_labeled_dataset(labeled_df)
 
-        return cleaned_df, self.feature_columns
+        return {
+            "feature_df": feature_df,
+            "labeled_df": labeled_df,
+            "dataset": cleaned_df,
+            "feature_columns": list(self.feature_columns),
+        }
 
     def _clean_labeled_dataset(self, labeled_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -177,7 +189,12 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
         feature_engineer: BaseFeatureEngineer = None,
         labeler: BaseSignalLabeler = None,
     ) -> None:
-        selected_feature_columns = feature_columns or list(FEATURE_COLUMNS)
+        if feature_columns is not None:
+            selected_feature_columns = list(feature_columns)
+        else:
+            selected_feature_columns = get_feature_pack_columns(config.feature_pack)
+            if not selected_feature_columns:
+                selected_feature_columns = list(FEATURE_COLUMNS)
 
         if data_loader is None:
             data_loader = CsvPriceDataLoader(config.data_file)

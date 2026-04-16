@@ -39,8 +39,34 @@ def _env_csv_tuple(env_var_name: str, default_values: Tuple[str, ...]) -> Tuple[
     return tuple(normalized_values) if normalized_values else tuple(default_values)
 
 
+def _env_csv_str_tuple(env_var_name: str, default_values: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Read one comma-separated environment variable into a trimmed tuple."""
+
+    raw_value = str(os.getenv(env_var_name, "")).strip()
+    if not raw_value:
+        return tuple(default_values)
+
+    normalized_values = []
+    seen_values = set()
+    for value in raw_value.split(","):
+        normalized_value = str(value).strip()
+        if not normalized_value or normalized_value in seen_values:
+            continue
+        seen_values.add(normalized_value)
+        normalized_values.append(normalized_value)
+
+    return tuple(normalized_values) if normalized_values else tuple(default_values)
+
+
 def _env_str(env_var_name: str, default_value: str) -> str:
     """Read one trimmed environment string, falling back when unset."""
+
+    raw_value = str(os.getenv(env_var_name, "")).strip()
+    return raw_value or default_value
+
+
+def _env_optional_str(env_var_name: str, default_value: Optional[str] = None) -> Optional[str]:
+    """Read one optional trimmed environment string."""
 
     raw_value = str(os.getenv(env_var_name, "")).strip()
     return raw_value or default_value
@@ -229,6 +255,8 @@ class TrainingConfig:
     live_total_candles: int = 120
     live_request_pause_seconds: float = 0.05
     live_signal_cache_seconds: int = 60
+    live_buy_signals_only: bool = _env_bool("LIVE_BUY_SIGNALS_ONLY", True)
+    live_auto_clear_loss_signals: bool = _env_bool("LIVE_AUTO_CLEAR_LOSS_SIGNALS", True)
     signal_monitor_run_initial_generation: bool = _env_bool("SIGNAL_MONITOR_RUN_INITIAL_GENERATION", True)
     signal_monitor_refresh_interval_seconds: int = (
         _env_optional_int("SIGNAL_MONITOR_REFRESH_INTERVAL_SECONDS", 900) or 900
@@ -326,6 +354,20 @@ class TrainingConfig:
     rag_fetch_timeout_seconds: float = 15.0
     rag_fetch_max_chars: int = 50000
     rag_search_limit: int = 6
+    broker_redis_url: Optional[str] = _env_optional_str("REDIS_URL") or _env_optional_str("BROKER_REDIS_URL")
+    job_state_ttl_seconds: int = _env_optional_int("JOB_STATE_TTL_SECONDS", 86400) or 86400
+    rabbitmq_url: Optional[str] = _env_optional_str("RABBITMQ_URL") or _env_optional_str("BROKER_RABBITMQ_URL")
+    rabbitmq_command_exchange: str = _env_str("RABBITMQ_COMMAND_EXCHANGE", "commands.topic")
+    kafka_brokers: Tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            value.strip()
+            for value in str(os.getenv("KAFKA_BROKERS", "")).split(",")
+            if value.strip()
+        )
+    )
+    kafka_client_id: str = _env_str("KAFKA_CLIENT_ID", "model-service-worker")
+    kafka_topic_prefix: str = _env_str("KAFKA_TOPIC_PREFIX", "")
+    worker_prefetch_count: int = _env_optional_int("WORKER_PREFETCH_COUNT", 2) or 2
     news_store_path: Path = OUTPUTS_DIR / "newsFeed.json"
     event_window_minutes: float = _env_float("EVENT_WINDOW_MINUTES", 360.0)
     event_post_window_minutes: float = _env_float("EVENT_POST_WINDOW_MINUTES", 240.0)
@@ -353,6 +395,14 @@ class TrainingConfig:
         )
     )
     feature_context_timeframes: Tuple[str, ...] = ("4h", "1d")
+    feature_pack: str = _env_str("FEATURE_PACK", "all")
+    feature_pack_candidates: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple(
+            "FEATURE_PACK_CANDIDATES",
+            ("core", "core_plus_market", "core_plus_context", "core_plus_fundamentals", "all"),
+        )
+    )
+    feature_audit_correlation_threshold: float = _env_float("FEATURE_AUDIT_CORRELATION_THRESHOLD", 0.95)
     regime_features_enabled: bool = True
     regime_trend_strength_threshold: float = 0.0125
     regime_high_volatility_ratio_threshold: float = 1.20
@@ -489,6 +539,8 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
         restored_config["comparison_model_types"] = tuple(restored_config["comparison_model_types"])
     if "feature_context_timeframes" in restored_config:
         restored_config["feature_context_timeframes"] = tuple(restored_config["feature_context_timeframes"])
+    if "feature_pack_candidates" in restored_config:
+        restored_config["feature_pack_candidates"] = tuple(restored_config["feature_pack_candidates"])
     if "signal_excluded_base_currencies" in restored_config:
         restored_config["signal_excluded_base_currencies"] = tuple(
             restored_config["signal_excluded_base_currencies"]

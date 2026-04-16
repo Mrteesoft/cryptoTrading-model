@@ -16,12 +16,12 @@ from .config import (
     is_coinmarketcap_market_data_source,
 )
 from .data import create_market_data_loader
-from .frontend import WatchlistPoolStore
+from .frontend import WatchlistPoolStore, build_frontend_signal_snapshot
 from .modeling import BaseSignalModel, get_model_class
 from .pipeline import CryptoDatasetBuilder
 from .source_refresh import ActiveUniversePlan, SignalUniverseCoordinator
 from .trading.portfolio import TradingPortfolioStore
-from .trading.signals import is_signal_product_excluded
+from .trading.signals import is_signal_product_excluded, select_primary_signal
 from .application import (
     SignalContextEnrichmentStage,
     SignalDecisionStage,
@@ -361,10 +361,29 @@ class LiveSignalEngine:
             inference_artifacts=inference_artifacts,
             portfolio_store=portfolio_store,
         )
+        live_actions = self._apply_live_execution_policy(
+            signal_summaries=pipeline_artifacts.decision.signal_summaries,
+            portfolio_store=portfolio_store,
+        )
+        visible_signals = self._select_visible_live_signals(
+            signal_summaries=pipeline_artifacts.decision.published_signals,
+            config=runtime_config,
+        )
+        actionable_visible_signals = self._select_visible_live_signals(
+            signal_summaries=pipeline_artifacts.decision.actionable_signals,
+            config=runtime_config,
+        )
+        primary_visible_signal = self._select_visible_primary_signal(
+            signal_summaries=visible_signals,
+            config=runtime_config,
+        )
 
-        live_snapshot = coordinator.build_live_snapshot(
+        live_snapshot = build_frontend_signal_snapshot(
             model_type=model.model_type,
-            pipeline_artifacts=pipeline_artifacts,
+            primary_signal=primary_visible_signal,
+            latest_signals=visible_signals,
+            actionable_signals=actionable_visible_signals,
+            trader_brain=pipeline_artifacts.enrichment.trader_brain_snapshot,
         )
         live_snapshot.update(
             {
@@ -384,7 +403,7 @@ class LiveSignalEngine:
                     else "configured-watchlist"
                 ),
                 "requestedProducts": resolved_product_ids,
-                "productsCovered": len(pipeline_artifacts.decision.published_signals),
+                "productsCovered": len(visible_signals),
                 "featureRowsScored": int(len(prediction_df)),
                 "granularitySeconds": int(runtime_config.live_granularity_seconds),
                 "liveSignalCacheSeconds": int(effective_cache_ttl_seconds),
@@ -392,6 +411,7 @@ class LiveSignalEngine:
                 "modelPath": str(self._resolve_model_path()),
                 "watchlistPool": watchlist_pool_summary,
                 "signalInference": dict(inference_artifacts.summary),
+                "livePolicy": live_actions,
             }
         )
 
@@ -440,6 +460,194 @@ class LiveSignalEngine:
             product_id=product_id,
         )
         return snapshot["signalsByProduct"].get(str(product_id).strip().upper())
+
+    def _apply_live_execution_policy(
+        self,
+        *,
+        signal_summaries: Sequence[Dict[str, Any]],
+        portfolio_store: TradingPortfolioStore,
+    ) -> dict[str, Any]:
+        """Auto-clear loss signals and summarize the live-engine execution policy."""
+
+        policy_summary = {
+            "buySignalsOnly": bool(getattr(self.config, "live_buy_signals_only", True)),
+            "autoClearLossSignals": bool(getattr(self.config, "live_auto_clear_loss_signals", True)),
+            "lossSignalsDetected": 0,
+            "lossSignalsCleared": 0,
+            "lossSignalsSkipped": 0,
+            "actions": [],
+            "storageBackend": portfolio_store.database.storage_backend,
+            "databaseTarget": portfolio_store.database.database_target,
+        }
+        if not bool(getattr(self.config, "live_auto_clear_loss_signals", True)):
+            return policy_summary
+
+        seen_product_ids: set[str] = set()
+        for signal_summary in signal_summaries:
+            product_id = str(signal_summary.get("productId", "")).strip().upper()
+            signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
+            if signal_name != "LOSS" or not product_id or product_id in seen_product_ids:
+                continue
+
+            seen_product_ids.add(product_id)
+            policy_summary["lossSignalsDetected"] += 1
+            action_row = self._clear_live_loss_signal(
+                signal_summary=dict(signal_summary),
+                portfolio_store=portfolio_store,
+            )
+            policy_summary["actions"].append(action_row)
+            if bool(action_row.get("cleared", False)):
+                policy_summary["lossSignalsCleared"] += 1
+            else:
+                policy_summary["lossSignalsSkipped"] += 1
+
+        return policy_summary
+
+    def _clear_live_loss_signal(
+        self,
+        *,
+        signal_summary: Dict[str, Any],
+        portfolio_store: TradingPortfolioStore,
+    ) -> dict[str, Any]:
+        """Close tracked exposure for one live LOSS signal and journal the result."""
+
+        product_id = str(signal_summary.get("productId", "")).strip().upper()
+        active_trade = portfolio_store.get_active_trade_for_product(product_id)
+        position = portfolio_store.get_position(product_id)
+        if active_trade is None and position is None:
+            return {
+                "productId": product_id,
+                "signalName": "LOSS",
+                "cleared": False,
+                "reason": "no_open_exposure",
+                "executionId": None,
+                "tradeId": None,
+            }
+
+        exit_price = self._resolve_loss_exit_price(
+            signal_summary=signal_summary,
+            active_trade=active_trade,
+            position=position,
+        )
+        executed_at = str(signal_summary.get("timestamp") or "").strip() or None
+        close_reason = (
+            str(signal_summary.get("tradeLifecycleReason") or "").strip()
+            or str(signal_summary.get("reasonSummary") or "").strip()
+            or "Live pipeline loss signal triggered an automatic exit."
+        )
+        metadata = {
+            "source": "live_pipeline_loss_autoclear",
+            "signalName": str(signal_summary.get("signal_name") or "").strip().upper(),
+            "spotAction": str(signal_summary.get("spotAction") or "").strip().lower(),
+            "reasonSummary": str(signal_summary.get("reasonSummary") or "").strip(),
+            "tradeLifecycleReason": str(signal_summary.get("tradeLifecycleReason") or "").strip(),
+            "timestamp": signal_summary.get("timestamp"),
+        }
+
+        execution_id = None
+        trade_id = None
+        if position is not None:
+            quantity = float(position.get("quantity") or 0.0)
+            if quantity > 0:
+                execution_result = portfolio_store.record_execution(
+                    product_id=product_id,
+                    side="sell",
+                    quantity=quantity,
+                    price=exit_price,
+                    current_price=exit_price,
+                    executed_at=executed_at,
+                    metadata={
+                        **metadata,
+                        "positionFractionBefore": position.get("positionFraction"),
+                    },
+                )
+                execution_payload = execution_result.get("execution") if isinstance(execution_result, dict) else None
+                if isinstance(execution_payload, dict):
+                    execution_id = execution_payload.get("executionId")
+
+        if active_trade is not None:
+            closed_trade = portfolio_store.close_trade(
+                trade_id=int(active_trade["tradeId"]),
+                exit_price=exit_price,
+                closed_at=executed_at,
+                close_reason="loss_signal_auto_clear",
+                current_price=exit_price,
+                metadata={
+                    **metadata,
+                    "autoClosedBy": "live_pipeline",
+                },
+            )
+            trade_id = closed_trade.get("tradeId") if isinstance(closed_trade, dict) else active_trade.get("tradeId")
+
+        return {
+            "productId": product_id,
+            "signalName": "LOSS",
+            "cleared": True,
+            "reason": "loss_signal_auto_clear",
+            "executionId": execution_id,
+            "tradeId": trade_id,
+            "exitPrice": exit_price,
+        }
+
+    @staticmethod
+    def _select_visible_live_signals(
+        *,
+        signal_summaries: Sequence[Dict[str, Any]],
+        config: TrainingConfig,
+    ) -> list[Dict[str, Any]]:
+        """Apply the response-side live visibility policy to the signal list."""
+
+        visible_signals = [dict(signal_summary) for signal_summary in signal_summaries]
+        if bool(getattr(config, "live_buy_signals_only", True)):
+            visible_signals = [
+                signal_summary
+                for signal_summary in visible_signals
+                if str(signal_summary.get("signal_name", "")).strip().upper() == "BUY"
+            ]
+        return visible_signals
+
+    @staticmethod
+    def _select_visible_primary_signal(
+        *,
+        signal_summaries: Sequence[Dict[str, Any]],
+        config: TrainingConfig,
+    ) -> Dict[str, Any] | None:
+        """Resolve the featured live signal after visibility filtering."""
+
+        if not signal_summaries:
+            return None
+        if len(signal_summaries) == 1:
+            return dict(signal_summaries[0])
+        return dict(select_primary_signal(list(signal_summaries), config=config))
+
+    @staticmethod
+    def _resolve_loss_exit_price(
+        *,
+        signal_summary: Dict[str, Any],
+        active_trade: Dict[str, Any] | None,
+        position: Dict[str, Any] | None,
+    ) -> float:
+        """Choose the best available price for an automatic loss-triggered exit."""
+
+        price_candidates = [
+            signal_summary.get("close"),
+            ((signal_summary.get("tradeContext") or {}).get("currentPrice") if isinstance(signal_summary.get("tradeContext"), dict) else None),
+            (active_trade.get("currentPrice") if active_trade is not None else None),
+            (position.get("currentPrice") if position is not None else None),
+            (active_trade.get("entryPrice") if active_trade is not None else None),
+            (position.get("entryPrice") if position is not None else None),
+        ]
+        for raw_price in price_candidates:
+            try:
+                normalized_price = float(raw_price)
+            except (TypeError, ValueError):
+                continue
+            if normalized_price > 0:
+                return normalized_price
+
+        raise ValueError(
+            f"Could not resolve a valid exit price for live LOSS auto-clear on {signal_summary.get('productId')!r}."
+        )
 
     def _load_model(self) -> BaseSignalModel:
         """Load the current deployed model artifact."""
