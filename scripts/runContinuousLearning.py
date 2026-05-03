@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import logging
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -60,9 +62,23 @@ def _env_bool(name: str, default_value: bool) -> bool:
     return default_value
 
 
+def _configure_logging() -> None:
+    """Send app-level learning logs to stdout so nohup/tail can show them."""
+
+    log_level_name = str(os.getenv("CONTINUOUS_LEARNING_LOG_LEVEL", "INFO")).strip().upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
 def main() -> None:
     """Refresh data, retrain, publish signals, and repeat."""
 
+    _configure_logging()
     interval_seconds = max(_env_int("CONTINUOUS_LEARNING_INTERVAL_SECONDS", 3600), 60)
     error_sleep_seconds = max(_env_int("CONTINUOUS_LEARNING_ERROR_SLEEP_SECONDS", 300), 60)
     evaluation_interval_cycles = max(_env_int("CONTINUOUS_LEARNING_EVALUATION_INTERVAL_CYCLES", 6), 0)
@@ -73,13 +89,14 @@ def main() -> None:
     print(
         "Continuous learning started. "
         f"source={os.getenv('MARKET_DATA_SOURCE', 'default')} "
-        f"interval={interval_seconds}s"
+        f"interval={interval_seconds}s",
+        flush=True,
     )
 
     while True:
         cycle_number += 1
         started_at = datetime.now(timezone.utc).isoformat()
-        print(f"==== {started_at} continuous learning cycle {cycle_number} start ====")
+        print(f"==== {started_at} continuous learning cycle {cycle_number} start ====", flush=True)
 
         try:
             results = ProductionCycleApp().run()
@@ -92,7 +109,8 @@ def main() -> None:
                 f"products={market_refresh.get('uniqueProducts')} "
                 f"model={training.get('modelType')} "
                 f"balancedAccuracy={float(training.get('balancedAccuracy', 0.0)):.4f} "
-                f"primarySignal={signal_generation.get('signalName')}"
+                f"primarySignal={signal_generation.get('signalName')}",
+                flush=True,
             )
 
             should_evaluate = (
@@ -107,17 +125,18 @@ def main() -> None:
                     f"trades={backtest.get('tradeCount')} "
                     f"strategyReturn={float(backtest.get('strategyTotalReturn', 0.0)):.4f} "
                     f"benchmarkReturn={float(backtest.get('benchmarkTotalReturn', 0.0)):.4f} "
-                    f"maxDrawdown={float(backtest.get('maxDrawdown', 0.0)):.4f}"
+                    f"maxDrawdown={float(backtest.get('maxDrawdown', 0.0)):.4f}",
+                    flush=True,
                 )
         except Exception as error:
-            print(f"Cycle failed: {error}")
+            print(f"Cycle failed: {error}", flush=True)
             if max_cycles and cycle_number >= max_cycles:
                 raise
             time.sleep(error_sleep_seconds)
             continue
 
         if max_cycles and cycle_number >= max_cycles:
-            print("Continuous learning stopped after configured max cycles.")
+            print("Continuous learning stopped after configured max cycles.", flush=True)
             return
 
         time.sleep(interval_seconds)
