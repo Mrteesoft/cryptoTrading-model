@@ -9,10 +9,8 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
-import pandas as pd
-
 from .config import TrainingConfig, is_coinmarketcap_market_data_source
-from .data import CoinMarketCapRateLimitError, create_market_data_loader
+from .data import CoinMarketCapRateLimitError, create_market_data_loader, read_market_price_csv
 from .frontend import WatchlistPoolStore
 from .trading.portfolio import TradingPortfolioStore
 from .trading.signal_store import TradingSignalStore
@@ -547,7 +545,7 @@ class SignalUniverseCoordinator:
             return []
 
         try:
-            price_df = pd.read_csv(data_path, usecols=["product_id"])
+            price_df = read_market_price_csv(data_path)
         except (OSError, ValueError):
             return []
 

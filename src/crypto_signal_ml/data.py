@@ -25,6 +25,53 @@ from .trading.symbols import is_signal_eligible_base_currency, normalize_base_cu
 REQUIRED_PRICE_COLUMNS = ["open", "high", "low", "close", "volume"]
 
 
+def read_market_price_csv(data_path: Path) -> pd.DataFrame:
+    """
+    Read a market-price CSV, repairing malformed rows from interrupted appends.
+
+    Long-running refresh jobs can leave a mixed or partially malformed raw file
+    behind. Pandas then fails before the new batch can be merged and rewritten.
+    The raw market schema is fixed, so rows with extra trailing fields can be
+    safely truncated and short rows can be padded with empty values.
+    """
+
+    try:
+        return pd.read_csv(data_path)
+    except pd.errors.ParserError as error:
+        header: list[str] | None = None
+        repaired_rows: list[list[str]] = []
+        repaired_count = 0
+
+        with Path(data_path).open("r", encoding="utf-8", newline="") as csv_file:
+            reader = csv.reader(csv_file)
+            for line_number, row in enumerate(reader, start=1):
+                if line_number == 1:
+                    header = row
+                    continue
+
+                if header is None:
+                    raise
+
+                expected_width = len(header)
+                if len(row) > expected_width:
+                    row = row[:expected_width]
+                    repaired_count += 1
+                elif len(row) < expected_width:
+                    row = [*row, *([""] * (expected_width - len(row)))]
+                    repaired_count += 1
+
+                repaired_rows.append(row)
+
+        if header is None:
+            raise error
+
+        repaired_df = pd.DataFrame(repaired_rows, columns=header)
+        if repaired_count <= 0:
+            raise error
+
+        return repaired_df
+
+
 class CoinMarketCapApiError(ValueError):
     """Base error for CoinMarketCap request failures."""
 
@@ -222,7 +269,7 @@ class CsvPriceDataLoader(BasePriceDataLoader):
     def _read_data(self) -> pd.DataFrame:
         """Read raw price data from a CSV file."""
 
-        return pd.read_csv(self.data_path)
+        return read_market_price_csv(self.data_path)
 
 
 class BasePriceDataEnricher(ABC):
@@ -1756,7 +1803,7 @@ class CoinMarketCapOhlcvPriceDataLoader(BaseApiPriceDataLoader):
         existing_row_count = 0
 
         if self.product_batch_size is not None and self.data_path.exists():
-            existing_df = pd.read_csv(self.data_path)
+            existing_df = read_market_price_csv(self.data_path)
             existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
             existing_row_count = len(existing_df)
             final_df = pd.concat([existing_df, price_df], ignore_index=True)
@@ -2525,7 +2572,7 @@ class CoinMarketCapLatestQuotesPriceDataLoader(BaseApiPriceDataLoader):
         existing_row_count = 0
 
         if self.data_path.exists():
-            existing_df = pd.read_csv(self.data_path)
+            existing_df = read_market_price_csv(self.data_path)
             existing_row_count = len(existing_df)
             if "timestamp" in existing_df.columns:
                 existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
@@ -2710,7 +2757,7 @@ class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
         existing_row_count = 0
 
         if self.product_batch_size is not None and self.data_path.exists():
-            existing_df = pd.read_csv(self.data_path)
+            existing_df = read_market_price_csv(self.data_path)
             existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
             existing_row_count = len(existing_df)
             final_df = pd.concat([existing_df, price_df], ignore_index=True)
@@ -3288,7 +3335,7 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
         final_df = price_df.copy()
         final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
         if self.data_path.exists():
-            existing_df = pd.read_csv(self.data_path)
+            existing_df = read_market_price_csv(self.data_path)
             existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
             final_df = pd.concat([existing_df, final_df], ignore_index=True)
             final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")
@@ -3681,7 +3728,7 @@ class BinancePublicDataPriceDataLoader(BaseApiPriceDataLoader):
         final_df = price_df.copy()
         final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
         if self.data_path.exists():
-            existing_df = pd.read_csv(self.data_path)
+            existing_df = read_market_price_csv(self.data_path)
             existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
             final_df = pd.concat([existing_df, final_df], ignore_index=True)
             final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")

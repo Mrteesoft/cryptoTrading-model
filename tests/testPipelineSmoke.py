@@ -17,6 +17,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig, apply_runtime_market_data_settings  # noqa: E402
+from crypto_signal_ml.data import read_market_price_csv  # noqa: E402
 from crypto_signal_ml.application import (  # noqa: E402
     MarketEventsRefreshApp,
     MarketDataRefreshApp,
@@ -368,6 +369,45 @@ def test_coinbase_loader_merges_batches_into_existing_market_file(tmp_path: Path
 
     assert len(merged_df) == 2
     assert set(merged_df["product_id"]) == {"BTC-USD", "ETH-USD"}
+
+
+def test_market_price_csv_reader_repairs_malformed_existing_rows(tmp_path: Path) -> None:
+    """Malformed raw rows should not block the next continuous-learning cycle."""
+
+    data_path = tmp_path / "marketPrices.csv"
+    data_path.write_text(
+        "\n".join(
+            [
+                "timestamp,open,high,low,close,volume,product_id,base_currency,quote_currency,granularity_seconds,source",
+                "2026-01-01T00:00:00+00:00,1,2,0.5,1.5,10,BTC-USD,BTC,USD,3600,coinbaseExchange",
+                "2026-01-01T00:00:00+00:00,1,2,0.5,1.5,10,BTC-USD,BTC,USD,3600,coinbaseExchange,extra,fields",
+                "2026-01-01T01:00:00+00:00,1.5,2.5,1.0,2.0,12,ETH-USD,ETH,USD,3600",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(pd.errors.ParserError):
+        pd.read_csv(data_path)
+
+    repaired_df = read_market_price_csv(data_path)
+
+    assert list(repaired_df.columns) == [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "product_id",
+        "base_currency",
+        "quote_currency",
+        "granularity_seconds",
+        "source",
+    ]
+    assert repaired_df.loc[1, "product_id"] == "BTC-USD"
+    assert repaired_df.loc[1, "source"] == "coinbaseExchange"
+    assert pd.isna(repaired_df.loc[2, "source"]) or repaired_df.loc[2, "source"] == ""
 
 
 def test_coinbase_loader_dedupes_existing_batch_rows_by_coin_and_timestamp(tmp_path: Path) -> None:
