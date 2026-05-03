@@ -1,0 +1,16 @@
+{
+  "modelVersion": "histGradientBoostingSignalModel-2026-05-03T07:06:51.201112+00:00",
+  "featureVersion": "feature-registry-v1",
+  "labelVersion": "atr-triple-barrier-v1",
+  "calibrationVersion": "sigmoid-v1",
+  "trainingConfigHash": "5b8fa390d185940fee98831cac4db20a2f20817e838a9de64bd84b9626888870",
+  "gitCommitHash": "cf3d7105696061bfa9f45c4ff526b332dcabe7b1",
+  "trainedAt": "2026-05-03T07:06:51.201112+00:00",
+  "modelType": "histGradientBoostingSignalModel",
+  "featurePack": "all",
+  "classOrder": [
+    -1,
+    0,
+    1
+  ]
+}

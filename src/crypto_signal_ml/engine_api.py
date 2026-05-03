@@ -296,6 +296,14 @@ class TraderTrackedTradeCloseRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class SignalPipelineRequest(BaseModel):
+    """Request payload for forcing one live signal-pipeline run and returning a signal."""
+
+    productId: str | None = None
+    productIds: list[str] | None = None
+    forceRefresh: bool = True
+
+
 class ModelArtifactStore:
     """Load and summarize the latest trained model artifact if one exists."""
 
@@ -913,6 +921,10 @@ def create_app(
                     "command": "python model-service/scripts/generateSignals.py",
                 },
                 {
+                    "step": "Run the live signal pipeline and return the latest signal",
+                    "command": "POST /api/live/signals/generate",
+                },
+                {
                     "step": "Start the Python AI engine",
                     "command": "python model-service",
                 },
@@ -1001,6 +1013,10 @@ def create_app(
                 {
                     "label": "Live signals",
                     "path": "/api/live/signals?action=all&limit=12",
+                },
+                {
+                    "label": "Generate live signal",
+                    "path": "/api/live/signals/generate",
                 },
                 {
                     "label": "Tool market overview",
@@ -1181,6 +1197,69 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+
+    @app.post("/api/live/signals/generate")
+    def generate_live_signal(request: SignalPipelineRequest) -> dict[str, Any]:
+        """Run the live signal pipeline on demand and return one resolved signal payload."""
+
+        normalized_product_id = str(request.productId or "").strip().upper() or None
+        normalized_product_ids = [
+            str(product_id).strip().upper()
+            for product_id in list(request.productIds or [])
+            if str(product_id).strip()
+        ]
+        if normalized_product_id is not None and normalized_product_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either productId or productIds, not both.",
+            )
+
+        try:
+            snapshot = live_signal_engine.get_live_snapshot(
+                force_refresh=bool(request.forceRefresh),
+                product_id=normalized_product_id,
+                product_ids=normalized_product_ids or None,
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+
+        signals_by_product = (
+            snapshot.get("signalsByProduct")
+            if isinstance(snapshot.get("signalsByProduct"), dict)
+            else {}
+        )
+        resolved_signal = (
+            signals_by_product.get(normalized_product_id)
+            if normalized_product_id is not None
+            else snapshot.get("primarySignal")
+        )
+        if not isinstance(resolved_signal, dict):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No live signal found for {normalized_product_id}."
+                    if normalized_product_id is not None
+                    else "No live primary signal was generated."
+                ),
+            )
+
+        return {
+            "status": "ok",
+            "requestedAt": datetime.now(timezone.utc).isoformat(),
+            "forceRefresh": bool(request.forceRefresh),
+            "productId": normalized_product_id,
+            "productIds": normalized_product_ids,
+            "requestMode": snapshot.get("requestMode"),
+            "productsCovered": snapshot.get("productsCovered"),
+            "signal": resolved_signal,
+            "primarySignal": snapshot.get("primarySignal"),
+            "marketSummary": snapshot.get("marketSummary", {}),
+            "marketState": snapshot.get("marketState", {}),
+        }
 
     @app.get("/api/live/signals/{product_id}")
     def live_signal_detail(

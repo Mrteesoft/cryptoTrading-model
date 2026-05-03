@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..config import TrainingConfig
-from ..events import EventCalendar, build_event_features
-from ..news import LocalNewsProvider, build_news_features, build_trend_features
+from ..signal_generation import (
+    SignalContextEnricher,
+    context_enriched_candidate_to_summary,
+    gated_candidate_from_summary,
+)
 
 
 @dataclass
@@ -25,8 +28,7 @@ class SignalContextEnrichmentStage:
 
     def __init__(self, config: TrainingConfig) -> None:
         self.config = config
-        self.event_calendar = EventCalendar(config=config)
-        self.news_provider = LocalNewsProvider(config=config)
+        self.enricher = SignalContextEnricher(config=config)
 
     def enrich(
         self,
@@ -36,39 +38,18 @@ class SignalContextEnrichmentStage:
         news_context_by_product: dict[str, dict[str, Any]] = {}
         trend_context_by_product: dict[str, dict[str, Any]] = {}
 
+        enriched_candidates = self.enricher.enrich_candidates(
+            [gated_candidate_from_summary(signal_summary) for signal_summary in signal_summaries]
+        )
         enriched_signals: list[dict[str, Any]] = []
-        for signal_summary in signal_summaries:
-            enriched = dict(signal_summary)
-            product_id = str(enriched.get("productId", "")).strip().upper()
-            base_currency = str(enriched.get("baseCurrency", "")).strip().upper()
-            if not base_currency and product_id:
-                base_currency = product_id.split("-")[0].upper()
-
-            event_features = build_event_features(
-                base_currency=base_currency,
-                calendar=self.event_calendar,
-                config=self.config,
-            )
-            news_features = build_news_features(
-                product_id=product_id,
-                base_currency=base_currency,
-                provider=self.news_provider,
-                config=self.config,
-            )
-            trend_features = build_trend_features(news_features)
-
-            event_context = dict(enriched.get("eventContext") or {})
-            event_context.update(event_features.to_dict())
-            enriched["eventContext"] = event_context
-            enriched["newsContext"] = news_features.to_dict()
-            enriched["trendContext"] = trend_features.to_dict()
-
+        for enriched_candidate in enriched_candidates:
+            product_id = str(enriched_candidate.productId).strip().upper()
             if product_id:
-                event_context_by_product[product_id] = event_context
-                news_context_by_product[product_id] = news_features.to_dict()
-                trend_context_by_product[product_id] = trend_features.to_dict()
+                event_context_by_product[product_id] = dict(enriched_candidate.eventContext)
+                news_context_by_product[product_id] = dict(enriched_candidate.newsContext)
+                trend_context_by_product[product_id] = dict(enriched_candidate.trendContext)
 
-            enriched_signals.append(enriched)
+            enriched_signals.append(context_enriched_candidate_to_summary(enriched_candidate))
 
         return SignalContextEnrichmentArtifacts(
             signal_summaries=enriched_signals,

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ...labels import signal_to_text
+from ...labels_core import signal_to_text
 from ...modeling import BaseSignalModel, register_model
 
 
@@ -63,7 +63,11 @@ class LightGBMRankerSignalModel(BaseSignalModel):
             random_state=int(self.config.random_state),
         )
 
-    def fit(self, train_df: pd.DataFrame) -> "LightGBMRankerSignalModel":
+    def fit(
+        self,
+        train_df: pd.DataFrame,
+        valid_frame: pd.DataFrame | None = None,
+    ) -> "LightGBMRankerSignalModel":
         self._validate_feature_columns()
         if "timestamp" not in train_df.columns:
             raise ValueError("LightGBM ranker requires a timestamp column for group sizing.")

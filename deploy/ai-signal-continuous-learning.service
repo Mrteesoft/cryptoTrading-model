@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Signal Model Continuous Learning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mrteesoft/ai-signalModel/cryptoTrading-model
+ExecStart=/home/mrteesoft/ai-signalModel/cryptoTrading-model/scripts/startContinuousLearning.sh
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -143,6 +143,11 @@ def build_frontend_signal_snapshot(
         for signal_summary in latest_signals
         if "productId" in signal_summary
     }
+    watchlist_promotion = (
+        dict((trader_brain or {}).get("watchlistPromotion") or {})
+        if isinstance(trader_brain, dict)
+        else {}
+    )
 
     return {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -172,6 +177,7 @@ def build_frontend_signal_snapshot(
         "signals": latest_signals,
         "actionableSignals": actionable_signals,
         "signalsByProduct": signals_by_product,
+        "watchlistPromotion": watchlist_promotion,
         "traderBrain": trader_brain or {},
     }
 

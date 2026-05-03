@@ -153,6 +153,14 @@ class TradingDecisionDeliberator:
         policy_score = _safe_float(signal_summary, "policyScore")
         context_alignment_score = _safe_float(confidence_calibration, "contextAlignmentScore")
         confidence_quality = str(confidence_calibration.get("confidenceQuality", "balanced"))
+        chart_confirmation_status = str(
+            signal_summary.get("chartDecision", signal_summary.get("chartConfirmationStatus", "early")) or "early"
+        ).strip().lower()
+        chart_confirmation_score = _safe_float(signal_summary, "chartConfirmationScore")
+        chart_setup_type = str(
+            signal_summary.get("chartPatternLabel", signal_summary.get("chartSetupType", "no_clean_setup"))
+            or "no_clean_setup"
+        ).strip().lower()
         regime_label = str(market_state.get("label", "unknown")).strip().lower()
         is_high_volatility = _safe_bool(market_state, "isHighVolatility")
         has_event_next_7d = _safe_bool(event_context, "hasEventNext7d")
@@ -286,6 +294,8 @@ class TradingDecisionDeliberator:
             supporting_factors.append("Market-wide intelligence is supportive for selective risk.")
         if watchlist_stage == "entry_ready" and watchlist_confirmation_strength >= 0.70:
             supporting_factors.append("Repeated watchlist checks and chart confirmation have materially improved the setup.")
+        if chart_confirmation_status == "confirmed":
+            supporting_factors.append("Chart confirmation is explicit rather than still early or blocked.")
         if profit_lock_triggered:
             supporting_factors.append("The open trade is already far enough in profit to justify active management.")
         if memory_bias == "supportive":
@@ -305,6 +315,12 @@ class TradingDecisionDeliberator:
             risk_factors.append("The policy layer has already blocked fresh risk.")
         elif trade_readiness == "standby":
             risk_factors.append("Trade readiness is still only on standby.")
+        if signal_name == "BUY" and chart_confirmation_status == "early":
+            risk_factors.append("Chart confirmation is not explicit enough yet for fresh entry capital.")
+        elif signal_name == "BUY" and chart_confirmation_status == "blocked":
+            risk_factors.append(
+                f"Chart confirmation is blocked because the current pattern is {chart_setup_type.replace('_', ' ')}."
+            )
         if confidence_quality == "fragile":
             risk_factors.append("Context-adjusted confidence is fragile after applying chart, news, and risk filters.")
         if is_execution_blocked:
@@ -351,6 +367,11 @@ class TradingDecisionDeliberator:
             "setupScore": float(setup_score),
             "policyScore": float(policy_score),
             "contextAlignmentScore": float(context_alignment_score),
+            "chartConfirmationStatus": chart_confirmation_status,
+            "chartConfirmationScore": float(chart_confirmation_score),
+            "chartSetupType": chart_setup_type or None,
+            "chartDecision": chart_confirmation_status,
+            "chartPatternLabel": chart_setup_type or None,
             "positionFraction": float(position_fraction),
             "positionAgeHours": float(position_age_hours) if position_age_hours > 0 else None,
             "positionUnrealizedReturn": position_unrealized_return,
@@ -405,6 +426,9 @@ class TradingDecisionDeliberator:
         market_stance = str(evidence.get("marketStance", "balanced"))
         has_position = _safe_bool(evidence, "hasPosition")
         memory_bias = str((evidence.get("tradeMemory") or {}).get("bias", "neutral"))
+        chart_confirmation_status = str(
+            evidence.get("chartDecision", evidence.get("chartConfirmationStatus", "early")) or "early"
+        )
 
         recommended_decision = str(base_decision)
         if base_decision in ENTRY_DECISIONS:
@@ -415,6 +439,7 @@ class TradingDecisionDeliberator:
         elif (
             base_decision in {"watchlist", "avoid_long"}
             and signal_name == "BUY"
+            and chart_confirmation_status == "confirmed"
             and conviction_score >= 0.76
             and risk_score <= 0.25
             and market_stance != "defensive"
@@ -491,6 +516,8 @@ class TradingDecisionDeliberator:
         objections: list[str] = []
 
         if recommended_decision in ENTRY_DECISIONS:
+            if str(evidence.get("chartDecision", evidence.get("chartConfirmationStatus", "early"))) != "confirmed":
+                objections.append("Chart confirmation is not explicit enough for a fresh entry.")
             if str(evidence.get("macroRiskMode", "neutral")) == "risk_off" and not watchlist_soft_risk_override:
                 objections.append("Macro risk mode is risk-off against a fresh long.")
             if _safe_bool(evidence, "isHighVolatility"):
@@ -515,12 +542,33 @@ class TradingDecisionDeliberator:
         verdict = "approve"
         size_multiplier = float(decision_memo.get("sizeMultiplier", 1.0) or 1.0)
         score_multiplier = 1.0
+        severe_buy_risk_cluster = bool(
+            signal_name == "BUY"
+            and not _safe_bool(evidence, "hasPosition")
+            and risk_score >= 0.62
+            and (
+                str(evidence.get("macroRiskMode", "neutral")) == "risk_off"
+                or _safe_bool(evidence, "isHighVolatility")
+                or str((evidence.get("tradeMemory") or {}).get("bias", "neutral")) == "cautious"
+            )
+        )
 
         if recommended_decision in ENTRY_DECISIONS and (len(objections) >= 3 or risk_score >= 0.70):
             verdict = "block"
             approved_decision = "hold_position" if _safe_bool(evidence, "hasPosition") else "watchlist"
             size_multiplier = 0.0
             score_multiplier = 0.72
+        elif recommended_decision not in ENTRY_DECISIONS and severe_buy_risk_cluster:
+            verdict = "block"
+            approved_decision = "hold_position" if _safe_bool(evidence, "hasPosition") else "watchlist"
+            size_multiplier = 0.0
+            score_multiplier = 0.78
+            if str(evidence.get("macroRiskMode", "neutral")) == "risk_off":
+                objections.append("Macro risk mode is risk-off against a fresh long.")
+            if _safe_bool(evidence, "isHighVolatility"):
+                objections.append("Volatility is elevated for a new entry.")
+            if str((evidence.get("tradeMemory") or {}).get("bias", "neutral")) == "cautious":
+                objections.append("Tracked-trade memory is cautionary on similar setups.")
         elif len(objections) >= 1 or risk_score >= 0.52:
             verdict = "caution"
             size_multiplier *= 0.85

@@ -1,12 +1,15 @@
 """Application-level classes for training, comparison, and signal generation."""
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
+from time import perf_counter
 from typing import Any, Dict, List, Type
 
 import pandas as pd
@@ -20,7 +23,9 @@ from .config import (
     apply_runtime_market_data_settings,
     config_to_dict,
     ensure_project_directories,
+    is_binance_market_data_source,
     is_coinmarketcap_market_data_source,
+    is_kraken_market_data_source,
 )
 from .data import (
     CoinMarketCalEventEnricher,
@@ -30,11 +35,13 @@ from .data import (
     create_market_data_loader,
 )
 from .frontend import WatchlistPoolStore
-from .features import resolve_feature_group
-from .labels import create_labeler_from_config, create_regime_labeler_from_config
+from .features_core import resolve_feature_group
+from .labels_core import build_label_diagnostics, create_labeler_from_config, create_regime_labeler_from_config
 from .modeling import BaseSignalModel, create_model_from_config, get_model_class
+from .modeling_core import rank_model_comparison_rows, save_model_artifact_bundle, split_calibration_tail_by_time
 from .pipeline import CryptoDatasetBuilder
-from .source_refresh import SignalUniverseCoordinator
+from .source_refresh import CoinMarketCapUniverseRefreshService, SignalUniverseCoordinator
+from .logging_utils import format_bool_for_log, format_path_for_log
 from .trading.portfolio import TradingPortfolioStore
 from .trading.policy import evaluate_trading_decision
 from .trading.signal_store import TradingSignalStore
@@ -155,6 +162,59 @@ class BaseSignalApp:
         return model_path.with_suffix(".metadata.json")
 
     @staticmethod
+    def model_artifact_dir(model_path: Path) -> Path:
+        """Return the production artifact directory for one saved model path."""
+
+        return model_path.parent / f"{model_path.stem}.artifact"
+
+    @staticmethod
+    def _normalize_run_label_token(value: Any) -> str:
+        """Return one filesystem-safe lowercase token for run labeling."""
+
+        normalized_value = re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            str(value or "").strip().lower(),
+        ).strip("-")
+        return normalized_value or "none"
+
+    @classmethod
+    def _build_feature_selection_run_label(cls, config: TrainingConfig) -> str:
+        """Return one compact label for the active feature-family selection."""
+
+        include_group_tokens = [
+            cls._normalize_run_label_token(group_name)
+            for group_name in config.feature_include_groups
+        ]
+        exclude_group_tokens = [
+            cls._normalize_run_label_token(group_name)
+            for group_name in config.feature_exclude_groups
+        ]
+
+        run_label_parts = [
+            f"pack-{cls._normalize_run_label_token(config.feature_pack)}",
+        ]
+        if include_group_tokens:
+            run_label_parts.append(f"inc-{'+'.join(include_group_tokens)}")
+        if exclude_group_tokens:
+            run_label_parts.append(f"exc-{'+'.join(exclude_group_tokens)}")
+
+        run_label = "__".join(run_label_parts)
+        if len(run_label) <= 96:
+            return run_label
+
+        run_label_hash = hashlib.sha1(run_label.encode("utf-8")).hexdigest()[:8]
+        shortened_run_label = run_label[:87].rstrip("-_+")
+        return f"{shortened_run_label}-{run_label_hash}"
+
+    @staticmethod
+    def _build_timestamped_run_directory(output_root: Path, run_label: str) -> Path:
+        """Return one unique output directory for a single validation run."""
+
+        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return output_root / f"{run_timestamp}__{run_label}"
+
+    @staticmethod
     def _file_timestamp_to_isoformat(file_path: Path) -> str | None:
         """Return the file's modified timestamp as a UTC ISO string when it exists."""
 
@@ -172,11 +232,68 @@ class BaseSignalApp:
 
         return int(config.prediction_horizon)
 
+    @staticmethod
+    def _summarize_dataframe(dataframe: pd.DataFrame) -> Dict[str, Any]:
+        """Return a compact row/product/time summary for logging."""
+
+        summary: Dict[str, Any] = {
+            "rows": int(len(dataframe)),
+            "columns": int(len(dataframe.columns)),
+        }
+        if "product_id" in dataframe.columns:
+            summary["products"] = int(dataframe["product_id"].astype(str).nunique())
+        if not dataframe.empty and "timestamp" in dataframe.columns:
+            summary["firstTimestamp"] = str(dataframe["timestamp"].min())
+            summary["lastTimestamp"] = str(dataframe["timestamp"].max())
+        return summary
+
+    @staticmethod
+    def _elapsed_seconds(started_at: float) -> float:
+        """Return the elapsed wall-clock time since one monotonic timestamp."""
+
+        return perf_counter() - started_at
+
+    @staticmethod
+    def _format_signal_reference(signal_summary: Dict[str, Any] | None) -> str:
+        """Return one compact product/signal reference for logs."""
+
+        if signal_summary is None:
+            return "none"
+
+        product_id = str(signal_summary.get("productId", "")).strip().upper() or "UNKNOWN"
+        signal_name = str(signal_summary.get("signal_name", "")).strip().upper() or "UNKNOWN"
+        return f"{product_id}:{signal_name}"
+
+    @staticmethod
+    def _format_log_path(path_like: Any) -> str:
+        """Return one shorter project-relative path for logging."""
+
+        return format_path_for_log(path_like)
+
+    @staticmethod
+    def _preview_values(values: List[Any], limit: int = 6) -> str:
+        """Return a short preview of a sequence for logs."""
+
+        normalized_values = [
+            str(value).strip().upper()
+            for value in values
+            if str(value).strip()
+        ]
+        if not normalized_values:
+            return "-"
+        if len(normalized_values) <= limit:
+            return ", ".join(normalized_values)
+        return f"{', '.join(normalized_values[:limit])}, +{len(normalized_values) - limit} more"
+
     def _resolve_market_quote_currency(self) -> str:
         """Return the active quote currency for the configured market source."""
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return self.config.coinmarketcap_quote_currency
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return self.config.kraken_quote_currency
+        if is_binance_market_data_source(self.config.market_data_source):
+            return self.config.binance_quote_currency
 
         return self.config.coinbase_quote_currency
 
@@ -185,6 +302,10 @@ class BaseSignalApp:
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return bool(self.config.coinmarketcap_fetch_all_quote_products)
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return False
+        if is_binance_market_data_source(self.config.market_data_source):
+            return bool(self.config.binance_fetch_all_quote_products)
 
         return bool(self.config.coinbase_fetch_all_quote_products)
 
@@ -193,6 +314,10 @@ class BaseSignalApp:
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_granularity_seconds)
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return int(self.config.kraken_granularity_seconds)
+        if is_binance_market_data_source(self.config.market_data_source):
+            return int(self.config.binance_granularity_seconds)
 
         return int(self.config.coinbase_granularity_seconds)
 
@@ -201,6 +326,10 @@ class BaseSignalApp:
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_product_batch_number)
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return int(self.config.kraken_product_batch_number)
+        if is_binance_market_data_source(self.config.market_data_source):
+            return int(self.config.binance_product_batch_number)
 
         return int(self.config.coinbase_product_batch_number)
 
@@ -209,6 +338,10 @@ class BaseSignalApp:
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             batch_size = self.config.coinmarketcap_product_batch_size
+        elif is_kraken_market_data_source(self.config.market_data_source):
+            batch_size = self.config.kraken_product_batch_size
+        elif is_binance_market_data_source(self.config.market_data_source):
+            batch_size = self.config.binance_product_batch_size
         else:
             batch_size = self.config.coinbase_product_batch_size
 
@@ -224,6 +357,16 @@ class BaseSignalApp:
             return replace(
                 self.config,
                 coinmarketcap_product_batch_number=int(batch_number),
+            )
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return replace(
+                self.config,
+                kraken_product_batch_number=int(batch_number),
+            )
+        if is_binance_market_data_source(self.config.market_data_source):
+            return replace(
+                self.config,
+                binance_product_batch_number=int(batch_number),
             )
 
         return replace(
@@ -429,19 +572,30 @@ class BaseSignalApp:
         self.save_dataframe(prediction_df, predictions_path)
         self.save_dataframe(model.get_feature_importance_frame(), feature_importance_path)
 
+        label_recipe = create_labeler_from_config(model.config).label_recipe()
+        artifact_dir = self.model_artifact_dir(model_path)
+        manifest = save_model_artifact_bundle(
+            artifact_dir=artifact_dir,
+            model=model,
+            metrics=metrics,
+            prediction_df=prediction_df,
+            label_recipe=label_recipe,
+            dataset_path=dataset_path,
+            train_df=train_df,
+            test_df=test_df,
+        )
+
         metadata_path = self.model_metadata_path(model_path)
         metadata_payload = {
             "artifactCreatedAt": datetime.now(timezone.utc).isoformat(),
             "artifactPath": str(model_path),
+            "artifactDirectory": str(artifact_dir),
             "modelType": model.model_type,
             "featurePack": str(model.config.feature_pack),
             "featureCount": len(model.feature_columns),
             "featurePreview": list(model.feature_columns[:10]),
             "labeling": {
-                "strategy": model.config.labeling_strategy,
-                "predictionHorizon": int(model.config.prediction_horizon),
-                "buyThreshold": float(model.config.buy_threshold),
-                "sellThreshold": float(model.config.sell_threshold),
+                **label_recipe.to_dict(),
                 "walkForwardPurgeGapTimestamps": int(self._resolve_walkforward_purge_gap(model.config)),
             },
             "datasetPath": str(dataset_path),
@@ -457,13 +611,19 @@ class BaseSignalApp:
                 "metricsPath": str(metrics_path),
                 "predictionsPath": str(predictions_path),
                 "featureImportancePath": str(feature_importance_path),
+                "manifestPath": str(artifact_dir / "manifest.json"),
+                "featureRegistrySnapshotPath": str(artifact_dir / "feature_registry_snapshot.json"),
+                "labelRecipePath": str(artifact_dir / "label_recipe.json"),
+                "evaluationSummaryPath": str(artifact_dir / "evaluation_summary.json"),
             },
+            "manifest": manifest.to_dict(),
             "config": config_to_dict(model.config),
         }
         self.save_json(metadata_payload, metadata_path)
 
         return {
             "modelPath": str(model_path),
+            "artifactDir": str(artifact_dir),
             "metricsPath": str(metrics_path),
             "predictionsPath": str(predictions_path),
             "featureImportancePath": str(feature_importance_path),
@@ -494,6 +654,37 @@ class BaseSignalApp:
             config=config,
             data_path=config.data_file,
             should_save_downloaded_data=True,
+        )
+
+    def _resolve_cached_coinmarketcap_universe_config(
+        self,
+        config: TrainingConfig,
+    ) -> tuple[TrainingConfig, Dict[str, Any]]:
+        """Use the persisted CMC universe cache to avoid repeated map discovery calls."""
+
+        if not is_coinmarketcap_market_data_source(config.market_data_source):
+            return config, {}
+        if not bool(config.coinmarketcap_fetch_all_quote_products):
+            return config, {}
+
+        universe_service = CoinMarketCapUniverseRefreshService(config)
+        universe_payload = universe_service.resolve()
+        product_ids = [
+            str(product_id).strip().upper()
+            for product_id in universe_payload.get("productIds", [])
+            if str(product_id).strip()
+        ]
+        if not product_ids:
+            return config, universe_service.summarize(universe_payload)
+
+        return (
+            replace(
+                config,
+                coinmarketcap_fetch_all_quote_products=False,
+                coinmarketcap_product_id="",
+                coinmarketcap_product_ids=tuple(product_ids),
+            ),
+            universe_service.summarize(universe_payload),
         )
 
     def build_coinmarketcap_context_enricher(
@@ -589,7 +780,9 @@ class TrainingApp(BaseSignalApp):
 
         self._ensure_market_data_available()
         dataset_bundle = self.dataset_builder.build_labeled_dataset_bundle()
+        dataset_bundle["label_diagnostics"] = build_label_diagnostics(dataset_bundle["labeled_df"])
         self.save_dataframe(dataset_bundle["dataset"], self.dataset_path)
+        self.save_json(dataset_bundle["label_diagnostics"], OUTPUTS_DIR / "labelDiagnostics.json")
         return dataset_bundle
 
     def _build_dataset(self) -> tuple[pd.DataFrame, List[str]]:
@@ -655,14 +848,20 @@ class TrainingApp(BaseSignalApp):
             feature_columns=feature_columns,
         )
 
-        model.fit(train_df)
-        prediction_df, metrics = model.evaluate(train_df, test_df)
+        fit_train_df, calibration_df = split_calibration_tail_by_time(
+            train_df,
+            holdout_fraction=training_config.calibration_holdout_fraction,
+        )
+        model.fit(fit_train_df, calibration_df)
+        prediction_df, metrics = model.evaluate(fit_train_df, test_df)
         metrics["config"] = config_to_dict(training_config)
+        metrics["calibration_rows"] = int(len(calibration_df)) if calibration_df is not None else 0
 
         return {
             "config": training_config,
             "model": model,
-            "train_df": train_df,
+            "train_df": fit_train_df,
+            "calibration_df": calibration_df,
             "test_df": test_df,
             "prediction_df": prediction_df,
             "metrics": metrics,
@@ -683,6 +882,7 @@ class TrainingApp(BaseSignalApp):
         prediction_df = training_result["prediction_df"]
         metrics = training_result["metrics"]
         train_df = training_result["train_df"]
+        calibration_df = training_result.get("calibration_df")
         test_df = training_result["test_df"]
         output_paths = self.save_model_artifact_outputs(
             model=self.model,
@@ -702,8 +902,10 @@ class TrainingApp(BaseSignalApp):
             "featurePack": str(self.model.config.feature_pack),
             "featureCount": int(len(self.model.feature_columns)),
             "datasetPath": str(self.dataset_path),
+            "labelDiagnosticsPath": str(OUTPUTS_DIR / "labelDiagnostics.json"),
             **output_paths,
             "trainRows": len(train_df),
+            "calibrationRows": int(len(calibration_df)) if calibration_df is not None else 0,
             "testRows": len(test_df),
             "accuracy": metrics["accuracy"],
             "balancedAccuracy": metrics["balanced_accuracy"],
@@ -890,6 +1092,11 @@ class WalkForwardValidationApp(TrainingApp):
         data during training.
         """
 
+        run_label = self._build_feature_selection_run_label(self.config)
+        output_directory = self._build_timestamped_run_directory(
+            OUTPUTS_DIR / "walkForwardRuns",
+            run_label,
+        )
         dataset_bundle = self._build_dataset_bundle()
         walk_forward_result = self._run_walk_forward_validation(
             dataset=dataset_bundle["dataset"],
@@ -897,6 +1104,8 @@ class WalkForwardValidationApp(TrainingApp):
             validation_config=self.config,
             backtester=self.backtester,
             audit_source_df=dataset_bundle["labeled_df"],
+            output_directory=output_directory,
+            run_label=run_label,
         )
         return self._save_walk_forward_outputs(walk_forward_result)
 
@@ -907,6 +1116,8 @@ class WalkForwardValidationApp(TrainingApp):
         validation_config: TrainingConfig,
         backtester: BaseSignalBacktester = None,
         audit_source_df: pd.DataFrame | None = None,
+        output_directory: Path | None = None,
+        run_label: str | None = None,
     ) -> Dict[str, Any]:
         """
         Run walk-forward validation on a provided dataset and config.
@@ -966,12 +1177,14 @@ class WalkForwardValidationApp(TrainingApp):
                     "purgedTimestampCount": int(fold_split["purgedTimestampCount"]),
                     "accuracy": metrics["accuracy"],
                     "balancedAccuracy": metrics["balanced_accuracy"],
+                    "calibratedBrierScore": float(metrics.get("calibration", {}).get("calibratedBrierScore", 0.0) or 0.0),
                 }
             )
             self._save_walk_forward_progress(
                 fold_metric_rows=fold_metric_rows,
                 prediction_frames=prediction_frames,
                 feature_importance_frames=feature_importance_frames,
+                output_directory=output_directory,
             )
 
         walk_forward_predictions_df = pd.concat(prediction_frames, ignore_index=True)
@@ -979,7 +1192,16 @@ class WalkForwardValidationApp(TrainingApp):
             by=["timestamp", "product_id"] if "product_id" in walk_forward_predictions_df.columns else ["timestamp"]
         ).reset_index(drop=True)
         fold_metrics_df = pd.DataFrame(fold_metric_rows)
+        feature_importance_by_fold_df = self._build_feature_importance_by_fold(feature_importance_frames)
         average_feature_importance_df = self._average_feature_importance(feature_importance_frames)
+        feature_source_df = audit_source_df if audit_source_df is not None else dataset
+        feature_audit_df = self._build_feature_audit_frame(
+            feature_source_df=feature_source_df,
+            usable_dataset=dataset,
+            feature_columns=feature_columns,
+            average_feature_importance_df=average_feature_importance_df,
+        )
+        feature_group_summary_df = self._build_feature_group_summary(feature_audit_df)
 
         aggregate_metrics = BaseSignalModel.build_classification_metrics(
             actual_signals=walk_forward_predictions_df["target_signal"],
@@ -992,8 +1214,13 @@ class WalkForwardValidationApp(TrainingApp):
                 "out_of_sample_rows": int(len(walk_forward_predictions_df)),
                 "average_fold_accuracy": float(fold_metrics_df["accuracy"].mean()),
                 "average_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].mean()),
+                "fold_balanced_accuracy_variance": float(fold_metrics_df["balancedAccuracy"].var(ddof=0) or 0.0),
                 "best_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].max()),
                 "worst_fold_balanced_accuracy": float(fold_metrics_df["balancedAccuracy"].min()),
+                "calibration": {
+                    "enabled": bool(walk_forward_predictions_df["calibrationApplied"].any()) if "calibrationApplied" in walk_forward_predictions_df.columns else False,
+                    "averageCalibratedBrierScore": float(fold_metrics_df["calibratedBrierScore"].mean() or 0.0),
+                },
                 "test_class_distribution": BaseSignalModel.build_signal_distribution(
                     walk_forward_predictions_df["target_signal"]
                 ),
@@ -1020,8 +1247,13 @@ class WalkForwardValidationApp(TrainingApp):
                 evaluation_config=validation_config,
             ),
             "regime_metrics": self._build_regime_metrics(walk_forward_predictions_df),
+            "label_diagnostics": build_label_diagnostics(audit_source_df) if audit_source_df is not None else {"available": False},
             "backtest_summary": backtest_result["summary"],
         }
+        if run_label is not None:
+            walk_forward_summary["run_label"] = str(run_label)
+        if output_directory is not None:
+            walk_forward_summary["run_directory"] = str(output_directory)
 
         return {
             "config": validation_config,
@@ -1033,6 +1265,8 @@ class WalkForwardValidationApp(TrainingApp):
             "feature_group_summary_df": feature_group_summary_df,
             "summary": walk_forward_summary,
             "backtest_result": backtest_result,
+            "output_directory": output_directory,
+            "run_label": run_label,
         }
 
     def _save_walk_forward_outputs(
@@ -1047,19 +1281,25 @@ class WalkForwardValidationApp(TrainingApp):
         average_feature_importance_df = walk_forward_result["average_feature_importance_df"]
         feature_audit_df = walk_forward_result["feature_audit_df"]
         feature_group_summary_df = walk_forward_result["feature_group_summary_df"]
-        walk_forward_summary = walk_forward_result["summary"]
+        walk_forward_summary = dict(walk_forward_result["summary"])
         backtest_result = walk_forward_result["backtest_result"]
+        output_directory = Path(walk_forward_result.get("output_directory") or OUTPUTS_DIR)
+        run_label = str(walk_forward_result.get("run_label") or "")
 
-        fold_metrics_path = OUTPUTS_DIR / "walkForwardFoldMetrics.csv"
-        predictions_path = OUTPUTS_DIR / "walkForwardPredictions.csv"
-        feature_importance_by_fold_path = OUTPUTS_DIR / "walkForwardFeatureImportanceByFold.csv"
-        feature_importance_path = OUTPUTS_DIR / "walkForwardFeatureImportance.csv"
-        feature_audit_path = OUTPUTS_DIR / "walkForwardFeatureAudit.csv"
-        feature_group_summary_path = OUTPUTS_DIR / "walkForwardFeatureGroupSummary.csv"
-        summary_path = OUTPUTS_DIR / "walkForwardSummary.json"
-        backtest_trades_path = OUTPUTS_DIR / "walkForwardBacktestTrades.csv"
-        backtest_periods_path = OUTPUTS_DIR / "walkForwardBacktestPeriods.csv"
-        backtest_summary_path = OUTPUTS_DIR / "walkForwardBacktestSummary.json"
+        if run_label:
+            walk_forward_summary["run_label"] = run_label
+        walk_forward_summary["run_directory"] = str(output_directory)
+
+        fold_metrics_path = output_directory / "walkForwardFoldMetrics.csv"
+        predictions_path = output_directory / "walkForwardPredictions.csv"
+        feature_importance_by_fold_path = output_directory / "walkForwardFeatureImportanceByFold.csv"
+        feature_importance_path = output_directory / "walkForwardFeatureImportance.csv"
+        feature_audit_path = output_directory / "walkForwardFeatureAudit.csv"
+        feature_group_summary_path = output_directory / "walkForwardFeatureGroupSummary.csv"
+        summary_path = output_directory / "walkForwardSummary.json"
+        backtest_trades_path = output_directory / "walkForwardBacktestTrades.csv"
+        backtest_periods_path = output_directory / "walkForwardBacktestPeriods.csv"
+        backtest_summary_path = output_directory / "walkForwardBacktestSummary.json"
 
         self.save_dataframe(fold_metrics_df, fold_metrics_path)
         self.save_dataframe(walk_forward_predictions_df, predictions_path)
@@ -1077,6 +1317,9 @@ class WalkForwardValidationApp(TrainingApp):
             "featurePack": str(self.config.feature_pack),
             "featureCount": int(walk_forward_summary["feature_count"]),
             "datasetPath": str(self.dataset_path),
+            "labelDiagnosticsPath": str(OUTPUTS_DIR / "labelDiagnostics.json"),
+            "runLabel": run_label,
+            "runDirectory": str(output_directory),
             "walkForwardFoldMetricsPath": str(fold_metrics_path),
             "walkForwardPredictionsPath": str(predictions_path),
             "walkForwardFeatureImportanceByFoldPath": str(feature_importance_by_fold_path),
@@ -1377,15 +1620,18 @@ class WalkForwardValidationApp(TrainingApp):
         fold_metric_rows: List[Dict[str, Any]],
         prediction_frames: List[pd.DataFrame],
         feature_importance_frames: List[pd.DataFrame],
+        output_directory: Path | None = None,
     ) -> None:
         """Persist partial walk-forward results while the folds are still running."""
 
         if not fold_metric_rows:
             return
 
+        progress_directory = output_directory or OUTPUTS_DIR
+
         self.save_dataframe(
             pd.DataFrame(fold_metric_rows),
-            OUTPUTS_DIR / "walkForwardFoldMetrics.partial.csv",
+            progress_directory / "walkForwardFoldMetrics.partial.csv",
         )
 
         if prediction_frames:
@@ -1395,23 +1641,23 @@ class WalkForwardValidationApp(TrainingApp):
             ).reset_index(drop=True)
             self.save_dataframe(
                 partial_predictions_df,
-                OUTPUTS_DIR / "walkForwardPredictions.partial.csv",
+                progress_directory / "walkForwardPredictions.partial.csv",
             )
 
         self.save_dataframe(
             self._average_feature_importance(feature_importance_frames),
-            OUTPUTS_DIR / "walkForwardFeatureImportance.partial.csv",
+            progress_directory / "walkForwardFeatureImportance.partial.csv",
         )
         self.save_dataframe(
             self._build_feature_importance_by_fold(feature_importance_frames),
-            OUTPUTS_DIR / "walkForwardFeatureImportanceByFold.partial.csv",
+            progress_directory / "walkForwardFeatureImportanceByFold.partial.csv",
         )
         self.save_json(
             {
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "completedFolds": int(len(fold_metric_rows)),
             },
-            OUTPUTS_DIR / "walkForwardProgress.json",
+            progress_directory / "walkForwardProgress.json",
         )
 
 
@@ -1493,6 +1739,7 @@ class RegimeTrainingApp(BaseSignalApp):
         prediction_df = training_result["prediction_df"]
         metrics = training_result["metrics"]
         train_df = training_result["train_df"]
+        calibration_df = training_result["calibration_df"]
         test_df = training_result["test_df"]
         output_paths = self.save_model_artifact_outputs(
             model=self.model,
@@ -1560,11 +1807,18 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
     def run(self) -> Dict[str, Any]:
         """Execute walk-forward validation for the dedicated regime model."""
 
+        run_label = self._build_feature_selection_run_label(self.config)
+        output_directory = self._build_timestamped_run_directory(
+            OUTPUTS_DIR / "regimeWalkForwardRuns",
+            run_label,
+        )
         dataset, feature_columns = self._build_dataset()
         walk_forward_result = self._run_walk_forward_validation(
             dataset=dataset,
             feature_columns=feature_columns,
             validation_config=self.config,
+            output_directory=output_directory,
+            run_label=run_label,
         )
         return self._save_walk_forward_outputs(walk_forward_result)
 
@@ -1573,6 +1827,8 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
         dataset: pd.DataFrame,
         feature_columns: List[str],
         validation_config: TrainingConfig,
+        output_directory: Path | None = None,
+        run_label: str | None = None,
     ) -> Dict[str, Any]:
         """Run walk-forward validation for the standalone regime classifier."""
 
@@ -1595,6 +1851,7 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
                 feature_columns=feature_columns,
                 training_config=validation_config,
             )
+            calibration_df = training_result.get("calibration_df")
             model = training_result["model"]
             metrics = training_result["metrics"]
             prediction_df = training_result["prediction_df"].copy()
@@ -1613,7 +1870,8 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             fold_metric_rows.append(
                 {
                     "foldNumber": fold_split["fold_number"],
-                    "trainRows": int(len(fold_split["train_df"])),
+                    "trainRows": int(len(training_result["train_df"])),
+                    "calibrationRows": int(len(calibration_df)) if calibration_df is not None else 0,
                     "testRows": int(len(fold_split["test_df"])),
                     "trainTimestampCount": fold_split["train_timestamp_count"],
                     "testTimestampCount": fold_split["test_timestamp_count"],
@@ -1631,6 +1889,7 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
                 fold_metric_rows=fold_metric_rows,
                 prediction_frames=prediction_frames,
                 feature_importance_frames=feature_importance_frames,
+                output_directory=output_directory,
             )
 
         walk_forward_predictions_df = pd.concat(prediction_frames, ignore_index=True)
@@ -1666,6 +1925,10 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
                 "config": config_to_dict(validation_config),
             }
         )
+        if run_label is not None:
+            aggregate_metrics["run_label"] = str(run_label)
+        if output_directory is not None:
+            aggregate_metrics["run_directory"] = str(output_directory)
 
         return {
             "config": validation_config,
@@ -1673,6 +1936,8 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             "walk_forward_predictions_df": walk_forward_predictions_df,
             "average_feature_importance_df": average_feature_importance_df,
             "summary": aggregate_metrics,
+            "output_directory": output_directory,
+            "run_label": run_label,
         }
 
     def _save_walk_forward_outputs(
@@ -1684,12 +1949,18 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
         fold_metrics_df = walk_forward_result["fold_metrics_df"]
         walk_forward_predictions_df = walk_forward_result["walk_forward_predictions_df"]
         average_feature_importance_df = walk_forward_result["average_feature_importance_df"]
-        walk_forward_summary = walk_forward_result["summary"]
+        walk_forward_summary = dict(walk_forward_result["summary"])
+        output_directory = Path(walk_forward_result.get("output_directory") or OUTPUTS_DIR)
+        run_label = str(walk_forward_result.get("run_label") or "")
 
-        fold_metrics_path = OUTPUTS_DIR / "regimeWalkForwardFoldMetrics.csv"
-        predictions_path = OUTPUTS_DIR / "regimeWalkForwardPredictions.csv"
-        feature_importance_path = OUTPUTS_DIR / "regimeWalkForwardFeatureImportance.csv"
-        summary_path = OUTPUTS_DIR / "regimeWalkForwardSummary.json"
+        if run_label:
+            walk_forward_summary["run_label"] = run_label
+        walk_forward_summary["run_directory"] = str(output_directory)
+
+        fold_metrics_path = output_directory / "regimeWalkForwardFoldMetrics.csv"
+        predictions_path = output_directory / "regimeWalkForwardPredictions.csv"
+        feature_importance_path = output_directory / "regimeWalkForwardFeatureImportance.csv"
+        summary_path = output_directory / "regimeWalkForwardSummary.json"
 
         self.save_dataframe(fold_metrics_df, fold_metrics_path)
         self.save_dataframe(walk_forward_predictions_df, predictions_path)
@@ -1700,6 +1971,8 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             "modelType": MarketRegimeModel.model_type,
             "estimatorType": self.config.model_type,
             "datasetPath": str(self.dataset_path),
+            "runLabel": run_label,
+            "runDirectory": str(output_directory),
             "walkForwardFoldMetricsPath": str(fold_metrics_path),
             "walkForwardPredictionsPath": str(predictions_path),
             "walkForwardFeatureImportancePath": str(feature_importance_path),
@@ -1710,6 +1983,14 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             "balancedAccuracy": float(walk_forward_summary["balanced_accuracy"]),
             "averageFoldBalancedAccuracy": float(walk_forward_summary["average_fold_balanced_accuracy"]),
         }
+
+    def _build_feature_importance_by_fold(
+        self,
+        feature_importance_frames: List[pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Reuse the shared per-fold feature-importance rollup for regime validation."""
+
+        return WalkForwardValidationApp._build_feature_importance_by_fold(self, feature_importance_frames)
 
     def _average_feature_importance(
         self,
@@ -1946,15 +2227,18 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
         fold_metric_rows: List[Dict[str, Any]],
         prediction_frames: List[pd.DataFrame],
         feature_importance_frames: List[pd.DataFrame],
+        output_directory: Path | None = None,
     ) -> None:
         """Persist partial regime walk-forward outputs while folds are still running."""
 
         if not fold_metric_rows:
             return
 
+        progress_directory = output_directory or OUTPUTS_DIR
+
         self.save_dataframe(
             pd.DataFrame(fold_metric_rows),
-            OUTPUTS_DIR / "regimeWalkForwardFoldMetrics.partial.csv",
+            progress_directory / "regimeWalkForwardFoldMetrics.partial.csv",
         )
 
         if prediction_frames:
@@ -1964,19 +2248,19 @@ class RegimeWalkForwardValidationApp(RegimeTrainingApp):
             ).reset_index(drop=True)
             self.save_dataframe(
                 partial_predictions_df,
-                OUTPUTS_DIR / "regimeWalkForwardPredictions.partial.csv",
+                progress_directory / "regimeWalkForwardPredictions.partial.csv",
             )
 
         self.save_dataframe(
             self._average_feature_importance(feature_importance_frames),
-            OUTPUTS_DIR / "regimeWalkForwardFeatureImportance.partial.csv",
+            progress_directory / "regimeWalkForwardFeatureImportance.partial.csv",
         )
         self.save_json(
             {
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "completedFolds": int(len(fold_metric_rows)),
             },
-            OUTPUTS_DIR / "regimeWalkForwardProgress.json",
+            progress_directory / "regimeWalkForwardProgress.json",
         )
 
 
@@ -2395,7 +2679,7 @@ class ModelComparisonApp(TrainingApp):
 
         dataset, feature_columns = self._build_dataset()
         comparison_rows = []
-        comparison_details = []
+        comparison_details_by_type = {}
 
         for model_type in self.config.comparison_model_types:
             training_result = self._train_model_for_type(
@@ -2452,26 +2736,37 @@ class ModelComparisonApp(TrainingApp):
                 "modelType": model.model_type,
                 "accuracy": metrics["accuracy"],
                 "balancedAccuracy": metrics["balanced_accuracy"],
+                "calibratedBrierScore": float(metrics.get("calibration", {}).get("calibratedBrierScore", 0.0) or 0.0),
+                "tradeCount": int(backtest_summary["tradeCount"]),
+                "winRate": float(backtest_summary["winRate"]),
+                "averageTradeReturn": float(backtest_summary["averageTradeReturn"]),
+                "foldBalancedAccuracyVariance": float(
+                    (walk_forward_summary or {}).get("fold_balanced_accuracy_variance", 0.0) or 0.0
+                ),
                 "trainRows": len(train_df),
                 "testRows": len(test_df),
             }
             comparison_rows.append(comparison_row)
 
-            comparison_details.append(
-                {
-                    **comparison_row,
-                    **saved_artifact_paths,
-                    "evaluation": evaluation_metrics,
-                    "walkForwardSummary": walk_forward_summary,
-                }
-            )
+            comparison_details_by_type[model.model_type] = {
+                **comparison_row,
+                **saved_artifact_paths,
+                "evaluation": evaluation_metrics,
+                "walkForwardSummary": walk_forward_summary,
+            }
 
-        comparison_df = pd.DataFrame(comparison_rows).sort_values(
-            by=["balancedAccuracy", "accuracy"],
-            ascending=False,
-        ).reset_index(drop=True)
+        comparison_rows = rank_model_comparison_rows(
+            comparison_rows,
+            minimum_trade_count=int(self.config.comparison_min_trade_count),
+        )
+        comparison_df = pd.DataFrame(comparison_rows).reset_index(drop=True)
 
         best_model_type = str(comparison_df.iloc[0]["modelType"])
+        comparison_details = [
+            comparison_details_by_type[str(model_type)]
+            for model_type in comparison_df["modelType"].tolist()
+            if str(model_type) in comparison_details_by_type
+        ]
         comparison_json = {
             "datasetPath": str(self.dataset_path),
             "bestModelType": best_model_type,
@@ -2615,6 +2910,12 @@ class SignalGenerationApp(BaseSignalApp):
         if not normalized_product_ids:
             raise ValueError("At least one explicit product id is required for signal scoring.")
 
+        scoring_started_at = perf_counter()
+        LOGGER.info(
+            "Live universe | scoring explicit set | products=%s | ids=%s",
+            len(normalized_product_ids),
+            self._preview_values(normalized_product_ids),
+        )
         loader_config = self._build_unbatched_market_loader_config()
         explicit_loader = create_market_data_loader(
             config=loader_config,
@@ -2636,8 +2937,7 @@ class SignalGenerationApp(BaseSignalApp):
         )
         explicit_feature_df = explicit_dataset_builder.build_feature_table()
         explicit_prediction_df = self.model.predict(explicit_feature_df)
-
-        return explicit_prediction_df, {
+        explicit_summary = {
             "productsRequested": len(normalized_product_ids),
             "rowsScored": int(len(explicit_prediction_df)),
             "productsScored": (
@@ -2646,6 +2946,14 @@ class SignalGenerationApp(BaseSignalApp):
                 else int(len(explicit_prediction_df))
             ),
         }
+        LOGGER.info(
+            "Live universe | explicit set ready | %.2fs | rows=%s | products=%s",
+            self._elapsed_seconds(scoring_started_at),
+            int(explicit_summary["rowsScored"]),
+            int(explicit_summary["productsScored"]),
+        )
+
+        return explicit_prediction_df, explicit_summary
 
     def _build_signal_store(self) -> TradingSignalStore:
         """Create the persistent live-signal store for current and historical rows."""
@@ -2702,6 +3010,11 @@ class SignalGenerationApp(BaseSignalApp):
         if self._should_use_prioritized_active_universe():
             return self._build_prioritized_signal_prediction_frame()
 
+        LOGGER.info(
+            "Live universe | scoring top market set | max_products=%s | granularity=%ss",
+            self.config.live_max_products if self.config.live_max_products is not None else "all",
+            self.config.live_granularity_seconds,
+        )
         loader_config = self._build_unbatched_market_loader_config()
         fresh_market_loader = create_market_data_loader(
             config=loader_config,
@@ -2776,6 +3089,15 @@ class SignalGenerationApp(BaseSignalApp):
         If no model object was passed in, we load it from disk first.
         """
 
+        pipeline_started_at = perf_counter()
+        LOGGER.info(
+            "Run start | model=%s | source=%s | refresh=%s | data=%s",
+            getattr(self.config, "model_type", "unknown"),
+            self.config.market_data_source,
+            format_bool_for_log(bool(self.config.signal_refresh_market_data_before_generation)),
+            self._format_log_path(self.config.data_file),
+        )
+
         if self.model is None:
             if not self.model_path.exists():
                 raise FileNotFoundError(
@@ -2792,23 +3114,53 @@ class SignalGenerationApp(BaseSignalApp):
                 config=self.config,
                 feature_columns=self.model.feature_columns,
             )
+            LOGGER.info(
+                "Model ready | name=%s | features=%s | file=%s",
+                self.model.model_type,
+                len(self.model.feature_columns),
+                self._format_log_path(self.model_path),
+            )
+        else:
+            LOGGER.info(
+                "Model ready | name=%s | features=%s | file=provided-instance",
+                self.model.model_type,
+                len(self.model.feature_columns),
+            )
 
         prefetched_signal_prediction_df: pd.DataFrame | None = None
         prefetched_signal_inference_summary: dict[str, Any] | None = None
         prefetched_signal_inference_warning = ""
         if self._should_score_fresh_signal_universe():
+            LOGGER.info("Live universe | prefetch start")
+            prefetched_universe_started_at = perf_counter()
             try:
                 (
                     prefetched_signal_prediction_df,
                     prefetched_signal_inference_summary,
                 ) = self._build_fresh_signal_prediction_frame()
+                prefetched_summary = self._summarize_dataframe(prefetched_signal_prediction_df)
+                LOGGER.info(
+                    "Live universe | ready | %.2fs | mode=%s | rows=%s | products=%s | requested=%s",
+                    self._elapsed_seconds(prefetched_universe_started_at),
+                    prefetched_signal_inference_summary.get("mode", "unknown"),
+                    prefetched_summary["rows"],
+                    prefetched_summary.get("products", 0),
+                    prefetched_signal_inference_summary.get("productsRequested"),
+                )
             except Exception as error:
                 prefetched_signal_inference_warning = str(error)
+                LOGGER.warning(
+                    "Live universe | prefetch failed | %.2fs | fallback=historical | reason=%s",
+                    self._elapsed_seconds(prefetched_universe_started_at),
+                    error,
+                )
 
         market_data_refresh = None
         market_data_refreshed_at = None
         should_use_prioritized_active_universe = self._should_use_prioritized_active_universe()
         if self.config.signal_refresh_market_data_before_generation and not should_use_prioritized_active_universe:
+            LOGGER.info("Market refresh | start")
+            market_refresh_started_at = perf_counter()
             market_data_refreshed_at = datetime.now(timezone.utc).isoformat()
             market_data_refresh = MarketDataRefreshApp(config=self.config).run()
             self.save_json(
@@ -2819,11 +3171,47 @@ class SignalGenerationApp(BaseSignalApp):
                 },
                 OUTPUTS_DIR / "signalMarketDataRefresh.json",
             )
+            LOGGER.info(
+                "Market refresh | ready | %.2fs | source=%s | rows=%s | products=%s | batch=%s/%s | latest=%s",
+                self._elapsed_seconds(market_refresh_started_at),
+                market_data_refresh.get("marketDataSource", "unknown"),
+                int(market_data_refresh.get("rowsDownloaded", 0)),
+                int(market_data_refresh.get("uniqueProducts", 0)),
+                int(market_data_refresh.get("batchNumber", 1)),
+                int(market_data_refresh.get("totalBatches", 1)),
+                market_data_refresh.get("lastTimestamp") or "unknown",
+            )
         elif not self.config.data_file.exists():
+            LOGGER.info("Market refresh | required because %s is missing", self._format_log_path(self.config.data_file))
             self._ensure_market_data_available()
 
+        LOGGER.info("Features | building from %s", self._format_log_path(self.config.data_file))
+        feature_build_started_at = perf_counter()
         feature_df = self.dataset_builder.build_feature_table()
+        feature_summary = self._summarize_dataframe(feature_df)
+        LOGGER.info(
+            "Features | ready | %.2fs | rows=%s | columns=%s | products=%s | window=%s -> %s",
+            self._elapsed_seconds(feature_build_started_at),
+            feature_summary["rows"],
+            feature_summary["columns"],
+            feature_summary.get("products", 0),
+            feature_summary.get("firstTimestamp", "unknown"),
+            feature_summary.get("lastTimestamp", "unknown"),
+        )
+        LOGGER.info("Prediction | start")
+        prediction_started_at = perf_counter()
         prediction_df = self.model.predict(feature_df)
+        prediction_summary = self._summarize_dataframe(prediction_df)
+        LOGGER.info(
+            "Prediction | done | %.2fs | rows=%s | products=%s | window=%s -> %s",
+            self._elapsed_seconds(prediction_started_at),
+            prediction_summary["rows"],
+            prediction_summary.get("products", 0),
+            prediction_summary.get("firstTimestamp", "unknown"),
+            prediction_summary.get("lastTimestamp", "unknown"),
+        )
+        LOGGER.info("Inference | historical start")
+        inference_started_at = perf_counter()
         inference_stage = SignalInferenceStage(self.config)
         allow_empty_historical_inference = (
             prefetched_signal_prediction_df is not None
@@ -2833,10 +3221,19 @@ class SignalGenerationApp(BaseSignalApp):
             prediction_df,
             mode="historical-market-data",
             raise_on_empty=not allow_empty_historical_inference,
+            log_candidates=not allow_empty_historical_inference,
+        )
+        LOGGER.info(
+            "Inference | historical done | %.2fs | candidates=%s | mode=%s",
+            self._elapsed_seconds(inference_started_at),
+            len(inference_artifacts.signal_candidates),
+            inference_artifacts.summary.get("mode", "historical-market-data"),
         )
         signal_prediction_df = prediction_df
         used_fresh_signal_prediction = False
         if prefetched_signal_prediction_df is not None and prefetched_signal_inference_summary is not None:
+            LOGGER.info("Inference | evaluating live universe")
+            fresh_selection_started_at = perf_counter()
             fresh_inference_artifacts = inference_stage.build_from_prediction_frame(
                 prefetched_signal_prediction_df,
                 summary=prefetched_signal_inference_summary,
@@ -2847,17 +3244,35 @@ class SignalGenerationApp(BaseSignalApp):
                 signal_prediction_df = prefetched_signal_prediction_df
                 inference_artifacts = fresh_inference_artifacts
                 used_fresh_signal_prediction = True
+                live_prediction_summary = self._summarize_dataframe(prefetched_signal_prediction_df)
+                LOGGER.info(
+                    "Inference | using live universe | %.2fs | mode=%s | candidates=%s | rows=%s | products=%s",
+                    self._elapsed_seconds(fresh_selection_started_at),
+                    fresh_inference_artifacts.summary.get("mode", "unknown"),
+                    len(fresh_inference_artifacts.signal_candidates),
+                    live_prediction_summary["rows"],
+                    live_prediction_summary.get("products", 0),
+                )
             else:
                 inference_artifacts.summary["mode"] = "historical-market-data-fallback"
                 inference_artifacts.summary["warning"] = (
                     "Fresh active-universe signal scoring produced no eligible signal rows, "
                     "so publication fell back to the persisted market dataset."
                 )
+                LOGGER.warning(
+                    "Inference | live universe empty | %.2fs | fallback=historical",
+                    self._elapsed_seconds(fresh_selection_started_at),
+                )
         elif prefetched_signal_inference_warning:
             inference_artifacts.summary["mode"] = "historical-market-data-fallback"
             inference_artifacts.summary["warning"] = prefetched_signal_inference_warning
+            LOGGER.warning(
+                "Inference | fallback=historical | reason=%s",
+                prefetched_signal_inference_warning,
+            )
 
         if not inference_artifacts.signal_candidates:
+            LOGGER.error("Inference | no candidates left after exclusions")
             raise ValueError(
                 "No signal summaries remained after applying the configured signal-universe exclusions."
             )
@@ -2892,6 +3307,11 @@ class SignalGenerationApp(BaseSignalApp):
             decision_stage=decision_stage,
             publication_stage=publication_stage,
         )
+        LOGGER.info(
+            "Stages | start | candidates=%s",
+            len(inference_artifacts.signal_candidates),
+        )
+        pipeline_stage_started_at = perf_counter()
         pipeline_artifacts = coordinator.run_pipeline(
             inference_artifacts=inference_artifacts,
             portfolio_store=portfolio_store,
@@ -2900,6 +3320,13 @@ class SignalGenerationApp(BaseSignalApp):
         latest_signals = pipeline_artifacts.decision.published_signals
         actionable_signals = pipeline_artifacts.decision.actionable_signals
         top_signal = pipeline_artifacts.decision.primary_signal
+        LOGGER.info(
+            "Stages | done | %.2fs | published=%s | actionable=%s | primary=%s",
+            self._elapsed_seconds(pipeline_stage_started_at),
+            len(latest_signals),
+            len(actionable_signals),
+            self._format_signal_reference(top_signal),
+        )
         prediction_timestamps = signal_prediction_df["timestamp"] if "timestamp" in signal_prediction_df.columns else None
         data_first_timestamp = (
             str(prediction_timestamps.min())
@@ -2934,6 +3361,12 @@ class SignalGenerationApp(BaseSignalApp):
             ),
             "marketDataRefreshedAt": market_data_refreshed_at,
         }
+        LOGGER.info(
+            "Publish | start | source=%s | primary=%s",
+            signal_source,
+            self._format_signal_reference(top_signal),
+        )
+        publication_started_at = perf_counter()
         publication_artifacts = coordinator.publish_signal_generation(
             model_type=self.model.model_type,
             historical_prediction_df=prediction_df,
@@ -2943,6 +3376,19 @@ class SignalGenerationApp(BaseSignalApp):
             market_data_refresh=market_data_refresh,
             market_data_refreshed_at=market_data_refreshed_at,
             portfolio_store=portfolio_store,
+        )
+        LOGGER.info(
+            "Publish | done | %.2fs | published=%s | actionable=%s | store=%s | tracked_created=%s | tracked_refreshed=%s",
+            self._elapsed_seconds(publication_started_at),
+            len(publication_artifacts.latest_signals),
+            len(publication_artifacts.actionable_signals),
+            int(publication_artifacts.signal_store_summary.get("signalCount", 0)),
+            int(publication_artifacts.tracked_trade_sync.get("createdCount", 0)),
+            int(publication_artifacts.tracked_trade_sync.get("refreshedCount", 0)),
+        )
+        LOGGER.info(
+            "Run done | %.2fs",
+            self._elapsed_seconds(pipeline_started_at),
         )
 
         return {
@@ -3066,6 +3512,14 @@ class MarketDataRefreshApp(BaseSignalApp):
         Refresh the raw market-data file from the configured live source.
         """
 
+        refresh_started_at = perf_counter()
+        LOGGER.info(
+            "Market refresh | source=%s | data=%s | fetch_all=%s | granularity=%ss",
+            self.config.market_data_source,
+            self._format_log_path(self.config.data_file),
+            format_bool_for_log(self._resolve_market_fetch_all_quote_products()),
+            self._resolve_market_granularity_seconds(),
+        )
         effective_config = self.config
         batch_rotation_summary = {
             "enabled": False,
@@ -3074,12 +3528,17 @@ class MarketDataRefreshApp(BaseSignalApp):
             "totalBatches": 1,
             "statePath": str(self.config.market_product_batch_state_file),
         }
-        preview_loader = self.build_market_data_loader()
+        universe_refresh_summary: Dict[str, Any] = {}
+        effective_config, universe_refresh_summary = self._resolve_cached_coinmarketcap_universe_config(self.config)
+        preview_loader = (
+            self.build_market_data_loader()
+            if effective_config is self.config
+            else self._build_market_data_loader_for_config(effective_config)
+        )
         data_loader = preview_loader
 
         should_rotate_batches = bool(
-            self.config.market_product_batch_rotation_enabled
-            and self._resolve_market_fetch_all_quote_products()
+            effective_config.market_product_batch_rotation_enabled
             and self._resolve_market_product_batch_size() is not None
             and hasattr(preview_loader, "get_total_batches")
         )
@@ -3090,9 +3549,27 @@ class MarketDataRefreshApp(BaseSignalApp):
             )
             if active_batch_number != self._resolve_market_product_batch_number():
                 effective_config = self._with_market_product_batch_number(active_batch_number)
+                effective_config, universe_refresh_summary = self._resolve_cached_coinmarketcap_universe_config(
+                    effective_config
+                )
                 data_loader = self._build_market_data_loader_for_config(effective_config)
+            LOGGER.info(
+                "Market refresh | batch=%s/%s | next=%s",
+                int(batch_rotation_summary["activeBatchNumber"]),
+                int(batch_rotation_summary["totalBatches"]),
+                int(batch_rotation_summary["nextBatchNumber"]),
+            )
 
         price_df = data_loader.refresh_data()
+        price_summary = self._summarize_dataframe(price_df)
+        LOGGER.info(
+            "Market refresh | base ready | %.2fs | rows=%s | products=%s | window=%s -> %s",
+            self._elapsed_seconds(refresh_started_at),
+            price_summary["rows"],
+            price_summary.get("products", 0),
+            price_summary.get("firstTimestamp", "unknown"),
+            price_summary.get("lastTimestamp", "unknown"),
+        )
         persisted_batch_state: Dict[str, Any] = {}
         if batch_rotation_summary.get("enabled"):
             persisted_batch_state = self._save_market_product_batch_state(
@@ -3133,6 +3610,12 @@ class MarketDataRefreshApp(BaseSignalApp):
                         coinmarketcap_context_error = error_message
             else:
                 coinmarketcap_context_status = "enabled_cached_only"
+            LOGGER.info(
+                "CMC context | status=%s | rows=%s | warning=%s",
+                coinmarketcap_context_status,
+                coinmarketcap_context_rows,
+                coinmarketcap_context_error or "none",
+            )
 
         if self.config.coinmarketcap_use_market_intelligence:
             market_intelligence_enricher = self.build_coinmarketcap_market_intelligence_enricher(
@@ -3167,6 +3650,11 @@ class MarketDataRefreshApp(BaseSignalApp):
                         coinmarketcap_market_intelligence_error = error_message
             else:
                 coinmarketcap_market_intelligence_status = "enabled_cached_only"
+            LOGGER.info(
+                "CMC intelligence | status=%s | warning=%s",
+                coinmarketcap_market_intelligence_status,
+                coinmarketcap_market_intelligence_error or "none",
+            )
 
         if self.config.coinmarketcal_use_events:
             event_enricher = self.build_coinmarketcal_event_enricher(
@@ -3187,6 +3675,23 @@ class MarketDataRefreshApp(BaseSignalApp):
                         coinmarketcal_events_error = error_message
             else:
                 coinmarketcal_events_status = "enabled_cached_only"
+            LOGGER.info(
+                "CMCAL events | status=%s | rows=%s | warning=%s",
+                coinmarketcal_events_status,
+                coinmarketcal_events_rows,
+                coinmarketcal_events_error or "none",
+            )
+
+        LOGGER.info(
+            "Market refresh | done | %.2fs | source=%s | rows=%s | products=%s | batch=%s/%s | saved=%s",
+            self._elapsed_seconds(refresh_started_at),
+            self.config.market_data_source,
+            price_summary["rows"],
+            price_summary.get("products", 0),
+            int(batch_rotation_summary.get("activeBatchNumber", self._resolve_market_product_batch_number())),
+            int(batch_rotation_summary.get("totalBatches", 1)),
+            self._format_log_path(self.config.data_file),
+        )
 
         return {
             "marketDataSource": self.config.market_data_source,
@@ -3201,6 +3706,7 @@ class MarketDataRefreshApp(BaseSignalApp):
             "totalBatches": int(batch_rotation_summary.get("totalBatches", 1)),
             "batchRotationStatePath": str(batch_rotation_summary.get("statePath", self.config.market_product_batch_state_file)),
             "batchRotationState": persisted_batch_state,
+            "universeRefresh": universe_refresh_summary,
             "granularitySeconds": self._resolve_market_granularity_seconds(),
             "savedPath": str(self.config.data_file),
             "rowsDownloaded": len(price_df),

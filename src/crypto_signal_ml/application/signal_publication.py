@@ -12,6 +12,7 @@ import pandas as pd
 
 from ..config import OUTPUTS_DIR, TrainingConfig
 from ..frontend import SignalSnapshotStore, build_frontend_signal_snapshot, build_watchlist_pool_snapshot
+from ..logging_utils import format_path_for_log
 from ..trading.portfolio import TradingPortfolioStore
 from ..trading.signal_store import TradingSignalStore
 
@@ -115,6 +116,11 @@ class SignalPublicationStage:
             watchlist_pool_snapshot,
             Path(self.config.signal_watchlist_pool_path),
         )
+        LOGGER.info(
+            "Watchlist pool | saved %s | products=%s",
+            format_path_for_log(self.config.signal_watchlist_pool_path),
+            int(watchlist_pool_snapshot.get("count", 0)),
+        )
 
     def publish(
         self,
@@ -186,6 +192,13 @@ class SignalPublicationStage:
         self.save_json({"signals": published_signals}, OUTPUTS_DIR / "latestSignals.json")
         self.save_json({"signals": published_actionable_signals}, OUTPUTS_DIR / "actionableSignals.json")
         self.save_json(frontend_signal_snapshot, OUTPUTS_DIR / "frontendSignalSnapshot.json")
+        LOGGER.info(
+            "Artifacts | saved historical=%s latest=%s actionable=%s snapshot=%s",
+            format_path_for_log(OUTPUTS_DIR / "historicalSignals.csv"),
+            format_path_for_log(OUTPUTS_DIR / "latestSignals.json"),
+            format_path_for_log(OUTPUTS_DIR / "actionableSignals.json"),
+            format_path_for_log(OUTPUTS_DIR / "frontendSignalSnapshot.json"),
+        )
         if published_primary_signal is not None and self.primary_history_store is not None:
             self.primary_history_store.save_primary_signal(published_primary_signal, signal_source)
 
@@ -232,10 +245,7 @@ class SignalPublicationStage:
                 signal_summary.get("pairSymbol", "")
             ).strip().upper()
             LOGGER.info(
-                (
-                    "Live signal created: symbol=%s signal=%s action=%s confidence=%.4f "
-                    "timestamp=%s price=%.8f watchlistFallback=%s"
-                ),
+                "%s | live=%s | action=%s | conf=%.2f | at=%s | price=%.8f | watchlist=%s",
                 product_id or str(signal_summary.get("symbol", "")).strip().upper() or "UNKNOWN",
                 str(signal_summary.get("signal_name", "UNKNOWN")).strip().upper(),
                 str(signal_summary.get("spotAction", "wait")).strip().lower(),
@@ -261,7 +271,7 @@ class SignalPublicationStage:
         )
         self._log_live_signal_rows(latest_signals)
         LOGGER.info(
-            "Persisted %s live signal(s) to %s via %s.",
+            "Signal store | saved=%s | target=%s | backend=%s",
             int(persistence_summary["signalCount"]),
             persistence_summary["databaseTarget"],
             persistence_summary["storageBackend"],

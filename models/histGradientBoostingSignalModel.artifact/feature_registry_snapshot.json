@@ -1,0 +1,1631 @@
+{
+  "version": "feature-registry-v1",
+  "featureCount": 112,
+  "features": [
+    {
+      "name": "return_1",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "return_3",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "return_5",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "return_12",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "return_24",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "candle_body_pct",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "range_pct",
+      "family": "returns",
+      "source": "price_history",
+      "required_inputs": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "momentum_10",
+      "family": "momentum",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "rsi_14",
+      "family": "momentum",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "positive_close_ratio_10",
+      "family": "momentum",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_change_1",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_change_5",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_vs_sma_20",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_vs_sma_50",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_zscore_20",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volume_trend_5_20",
+      "family": "volume",
+      "source": "price_history",
+      "required_inputs": [
+        "volume",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volatility_5",
+      "family": "volatility",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volatility_20",
+      "family": "volatility",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "atr_pct_14",
+      "family": "volatility",
+      "source": "price_history",
+      "required_inputs": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "volatility_compression_5_20",
+      "family": "volatility",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_sma_5",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_sma_10",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_sma_20",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_sma_50",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_ema_5",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_ema_20",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "close_vs_ema_50",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "trend_acceleration_5_20",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "trend_acceleration_10_50",
+      "family": "trend",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_return_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_return_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_return_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_breadth_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_breadth_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_breadth_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_dispersion_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_dispersion_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_rank_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_rank_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "relative_strength_rank_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_volatility_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_trend_strength_20",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "benchmark_btc_return_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "benchmark_btc_return_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "benchmark_btc_return_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "asset_vs_btc_return_1",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "asset_vs_btc_return_5",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "asset_vs_btc_return_24",
+      "family": "market_context",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_normalized",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "breakout_up_20",
+      "family": "market_structure",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "breakout_down_20",
+      "family": "market_structure",
+      "source": "price_history",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "range_position_20",
+      "family": "market_structure",
+      "source": "price_history",
+      "required_inputs": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "drawdown_from_high_20",
+      "family": "market_structure",
+      "source": "price_history",
+      "required_inputs": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "rebound_from_low_20",
+      "family": "market_structure",
+      "source": "price_history",
+      "required_inputs": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "hour_of_day_sin",
+      "family": "time_context",
+      "source": "price_history",
+      "required_inputs": [
+        "timestamp"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "bounded_periodic",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "hour_of_day_cos",
+      "family": "time_context",
+      "source": "price_history",
+      "required_inputs": [
+        "timestamp"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "bounded_periodic",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "day_of_week_sin",
+      "family": "time_context",
+      "source": "price_history",
+      "required_inputs": [
+        "timestamp"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "bounded_periodic",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "day_of_week_cos",
+      "family": "time_context",
+      "source": "price_history",
+      "required_inputs": [
+        "timestamp"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "bounded_periodic",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_return_1",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_range_pct",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_volume_change_1",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_close_vs_sma_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_close_vs_ema_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_4h_volatility_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_return_1",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_range_pct",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_volume_change_1",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_close_vs_sma_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_close_vs_ema_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "htf_1d_volatility_3",
+      "family": "higher_timeframe",
+      "source": "aligned_higher_timeframe",
+      "required_inputs": [
+        "timestamp",
+        "close",
+        "volume",
+        "aligned_higher_timeframe"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "regime_trend_score",
+      "family": "regime",
+      "source": "regime_detector",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "regime_volatility_ratio",
+      "family": "regime",
+      "source": "regime_detector",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "regime_is_trending",
+      "family": "regime",
+      "source": "regime_detector",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "regime_is_high_volatility",
+      "family": "regime",
+      "source": "regime_detector",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "market_regime_code",
+      "family": "regime",
+      "source": "regime_detector",
+      "required_inputs": [
+        "close"
+      ],
+      "missing_handling": "fill_zero_optional_context",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_mixed",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_context_available",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_rank_score",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_cap_log",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_volume_24h_log",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_percent_change_24h",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_percent_change_7d",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_percent_change_30d",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_circulating_supply_ratio",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_num_market_pairs_log",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_tags_count",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_platform_present",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_is_mineable",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_has_defi_tag",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_has_ai_tag",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_has_layer1_tag",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_has_gaming_tag",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_has_meme_tag",
+      "family": "fundamentals_context",
+      "source": "coinmarketcap_context",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_intelligence_available",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_total_market_cap_log",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_total_volume_24h_log",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_total_market_cap_change_24h",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_total_volume_change_24h",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_altcoin_share",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_btc_dominance",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_btc_dominance_change_24h",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_eth_dominance",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_stablecoin_share",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_defi_market_cap_log",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_defi_volume_24h_log",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_derivatives_volume_24h_log",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_fear_greed_score",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_is_fear",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_is_greed",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_is_extreme_fear",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    },
+    {
+      "name": "cmc_market_is_extreme_greed",
+      "family": "market_intelligence",
+      "source": "coinmarketcap_market_intelligence",
+      "required_inputs": [
+        "context_enrichment"
+      ],
+      "missing_handling": "drop_before_model",
+      "online_available": true,
+      "offline_available": true,
+      "expected_scale": "continuous_contextual",
+      "importance_stability": "unknown",
+      "owner": "signal-platform"
+    }
+  ]
+}

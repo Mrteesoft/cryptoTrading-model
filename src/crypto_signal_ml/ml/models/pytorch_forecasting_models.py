@@ -33,7 +33,11 @@ class TFTSequenceSignalModel(BaseSignalModel):
         _require_tft()
         return None
 
-    def fit(self, train_df: pd.DataFrame) -> "TFTSequenceSignalModel":
+    def fit(
+        self,
+        train_df: pd.DataFrame,
+        valid_frame: pd.DataFrame | None = None,
+    ) -> "TFTSequenceSignalModel":
         if not bool(getattr(self.config, "enable_tft_experiments", False)):
             raise ValueError("TFT experiments are disabled. Set ENABLE_TFT_EXPERIMENTS=true to proceed.")
         _require_tft()

@@ -38,6 +38,7 @@ from crypto_signal_ml.frontend import (  # noqa: E402
 from crypto_signal_ml.live import LiveSignalEngine  # noqa: E402
 from crypto_signal_ml.ml import (  # noqa: E402
     BaseSignalModel,
+    BinancePublicDataPriceDataLoader,
     CoinbaseExchangePriceDataLoader,
     CoinMarketCalEventEnricher,
     CoinMarketCapRateLimitError,
@@ -49,6 +50,7 @@ from crypto_signal_ml.ml import (  # noqa: E402
     CsvPriceDataLoader,
     FutureReturnSignalLabeler,
     HistGradientBoostingSignalModel,
+    KrakenOhlcPriceDataLoader,
     LogisticRegressionSignalModel,
     RandomForestSignalModel,
     TechnicalFeatureEngineer,
@@ -56,6 +58,7 @@ from crypto_signal_ml.ml import (  # noqa: E402
     create_market_data_loader,
     create_model_from_config,
 )
+from crypto_signal_ml.portfolio_core import TraderBrain  # noqa: E402
 from crypto_signal_ml.retrieval import RagKnowledgeStore  # noqa: E402
 from crypto_signal_ml.service import SignalMonitorService  # noqa: E402
 from crypto_signal_ml.source_refresh import (  # noqa: E402
@@ -64,7 +67,6 @@ from crypto_signal_ml.source_refresh import (  # noqa: E402
     SignalUniverseCoordinator,
 )
 from crypto_signal_ml.trading import (  # noqa: E402
-    TraderBrain,
     TradingPortfolioStore,
     TradingSignalStore,
     WatchlistStateStore,
@@ -73,6 +75,7 @@ from crypto_signal_ml.trading import (  # noqa: E402
     build_latest_signal_summaries,
     filter_published_signal_summaries,
     is_signal_eligible_base_currency,
+    is_signal_product_excluded,
     select_primary_signal,
 )
 
@@ -190,6 +193,19 @@ def test_config_can_read_signal_exclusions_from_env(monkeypatch: pytest.MonkeyPa
     config = TrainingConfig()
 
     assert config.signal_excluded_base_currencies == ("BTC", "ETH", "USDT", "USDC")
+
+
+def test_default_signal_exclusions_block_btc_eth_and_common_stablecoins() -> None:
+    """Default signal settings should keep majors and stablecoins out of surfaced signals."""
+
+    config = TrainingConfig()
+
+    assert is_signal_product_excluded(product_id="BTC-USD", config=config) is True
+    assert is_signal_product_excluded(product_id="ETH-USD", config=config) is True
+    assert is_signal_product_excluded(product_id="USDT-USD", config=config) is True
+    assert is_signal_product_excluded(product_id="DAI-USD", config=config) is True
+    assert is_signal_product_excluded(product_id="FDUSD-USD", config=config) is True
+    assert is_signal_product_excluded(product_id="SOL-USD", config=config) is False
 
 
 def test_config_can_create_hist_gradient_boosting_model() -> None:
@@ -1366,6 +1382,150 @@ def test_market_data_refresh_app_reports_context_failure_without_aborting(
     assert "simulated CoinMarketCap failure" in result["coinMarketCapContextError"]
 
 
+def test_kraken_loader_normalizes_public_ohlc_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kraken OHLC rows should land in the shared market-price schema."""
+
+    loader = KrakenOhlcPriceDataLoader(
+        data_path=tmp_path / "marketPrices.csv",
+        product_ids=("BTC-USD",),
+        product_id="",
+        granularity_seconds=3600,
+        total_candles=2,
+        log_progress=False,
+    )
+
+    def fake_request_ohlc_rows(exchange_pair: str) -> list[list[object]]:
+        assert exchange_pair == "XBTUSD"
+        return [
+            [1767225600, "100.0", "110.0", "90.0", "105.0", "101.0", "12.5", 20],
+            [1767229200, "105.0", "115.0", "95.0", "112.0", "108.0", "8.0", 18],
+        ]
+
+    monkeypatch.setattr(loader, "_request_ohlc_rows", fake_request_ohlc_rows)
+
+    price_df = loader.refresh_data()
+
+    assert list(price_df["product_id"].unique()) == ["BTC-USD"]
+    assert price_df.iloc[0]["open"] == pytest.approx(100.0)
+    assert price_df.iloc[1]["close"] == pytest.approx(112.0)
+    assert price_df.iloc[0]["source"] == "kraken"
+
+
+def test_binance_public_data_loader_normalizes_archive_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binance archive rows should be normalized as exchange OHLCV data."""
+
+    loader = BinancePublicDataPriceDataLoader(
+        data_path=tmp_path / "marketPrices.csv",
+        product_ids=("BTC-USD",),
+        product_id="",
+        quote_currency="USDT",
+        interval="1h",
+        granularity_seconds=3600,
+        total_candles=2,
+        log_progress=False,
+    )
+
+    monkeypatch.setattr(loader, "_resolve_months_to_download", lambda: ["2026-01"])
+
+    def fake_request_month_rows(
+        product_details: dict[str, str],
+        year_month: str,
+    ) -> list[dict[str, object]]:
+        assert product_details["exchange_symbol"] == "BTCUSDT"
+        assert year_month == "2026-01"
+        return [
+            loader._normalize_kline_row(
+                product_details,
+                ["1767225600000", "100.0", "110.0", "90.0", "105.0", "12.5"],
+            ),
+            loader._normalize_kline_row(
+                product_details,
+                ["1767229200000", "105.0", "115.0", "95.0", "112.0", "8.0"],
+            ),
+        ]
+
+    monkeypatch.setattr(loader, "_request_month_rows", fake_request_month_rows)
+
+    price_df = loader.refresh_data()
+
+    assert list(price_df["product_id"].unique()) == ["BTC-USDT"]
+    assert price_df.iloc[0]["quote_currency"] == "USDT"
+    assert price_df.iloc[0]["high"] == pytest.approx(110.0)
+    assert price_df.iloc[1]["source"] == "binancePublicData"
+
+
+def test_binance_public_data_loader_discovers_quote_universe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binance discovery should keep trading quote pairs and exclude stable bases."""
+
+    loader = BinancePublicDataPriceDataLoader(
+        data_path=tmp_path / "marketPrices.csv",
+        fetch_all_quote_products=True,
+        quote_currency="USDT",
+        excluded_base_currencies=("USDT", "USDC"),
+        max_products=2,
+        log_progress=False,
+    )
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "symbols": [
+                        {
+                            "symbol": "ADAUSDT",
+                            "status": "TRADING",
+                            "baseAsset": "ADA",
+                            "quoteAsset": "USDT",
+                            "isSpotTradingAllowed": True,
+                        },
+                        {
+                            "symbol": "USDCUSDT",
+                            "status": "TRADING",
+                            "baseAsset": "USDC",
+                            "quoteAsset": "USDT",
+                            "isSpotTradingAllowed": True,
+                        },
+                        {
+                            "symbol": "ETHBTC",
+                            "status": "TRADING",
+                            "baseAsset": "ETH",
+                            "quoteAsset": "BTC",
+                            "isSpotTradingAllowed": True,
+                        },
+                        {
+                            "symbol": "SOLUSDT",
+                            "status": "TRADING",
+                            "baseAsset": "SOL",
+                            "quoteAsset": "USDT",
+                            "isSpotTradingAllowed": True,
+                        },
+                    ]
+                }
+            ).encode("utf-8")
+
+    monkeypatch.setattr("crypto_signal_ml.data.urlopen", lambda request, timeout=30: FakeResponse())
+
+    products = loader.get_available_products()
+
+    assert [product["product_id"] for product in products] == ["ADA-USDT", "SOL-USDT"]
+    assert [product["exchange_symbol"] for product in products] == ["ADAUSDT", "SOLUSDT"]
+
+
 def test_market_data_refresh_app_reports_market_intelligence_failure_without_aborting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1772,11 +1932,11 @@ def test_walk_forward_validation_app_builds_out_of_sample_summary(
     config = TrainingConfig(
         data_file=raw_data_path,
         coinmarketcap_use_context=False,
-        model_type="logisticRegressionSignalModel",
+        model_type="randomForestSignalModel",
         walkforward_min_train_size=0.50,
         walkforward_test_size=0.25,
         walkforward_step_size=0.25,
-        logistic_max_iter=200,
+        n_estimators=25,
     )
     validation_app = WalkForwardValidationApp(config=config)
 
@@ -1789,6 +1949,42 @@ def test_walk_forward_validation_app_builds_out_of_sample_summary(
     assert result["outOfSampleRows"] > 0
     assert result["walkForwardSummaryPath"].endswith("walkForwardSummary.json")
     assert result["walkForwardBacktestSummaryPath"].endswith("walkForwardBacktestSummary.json")
+
+
+def test_walk_forward_validation_app_scopes_outputs_to_feature_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Walk-forward ablations should be saved under a run directory keyed by feature-family selection."""
+
+    raw_data_path = tmp_path / "marketPrices.csv"
+    _build_mixed_market_frame().to_csv(raw_data_path, index=False)
+
+    config = TrainingConfig(
+        data_file=raw_data_path,
+        coinmarketcap_use_context=False,
+        model_type="randomForestSignalModel",
+        walkforward_min_train_size=0.50,
+        walkforward_test_size=0.25,
+        walkforward_step_size=0.25,
+        n_estimators=25,
+        feature_pack="core",
+        feature_include_groups=("market_context",),
+        feature_exclude_groups=("regime",),
+    )
+    validation_app = WalkForwardValidationApp(config=config)
+
+    monkeypatch.setattr(validation_app, "save_dataframe", lambda dataframe, file_path: None)
+    monkeypatch.setattr(validation_app, "save_json", lambda payload, file_path: None)
+
+    result = validation_app.run()
+    run_directory = Path(result["runDirectory"])
+
+    assert result["runLabel"] == "pack-core__inc-market-context__exc-regime"
+    assert run_directory.parent.name == "walkForwardRuns"
+    assert run_directory.name.endswith("__pack-core__inc-market-context__exc-regime")
+    assert Path(result["walkForwardSummaryPath"]).parent == run_directory
+    assert Path(result["walkForwardBacktestSummaryPath"]).parent == run_directory
 
 
 def test_signal_parameter_tuning_app_returns_best_candidate(
@@ -2137,7 +2333,7 @@ def test_signal_generation_app_persists_current_signals_to_database(
     assert len(current_signals) == 1
     assert len(signal_history) == 1
     assert signal_history[0]["productId"] == "ALGO-USD"
-    assert "Live signal created: symbol=ALGO-USD signal=BUY" in caplog.text
+    assert "ALGO-USD | live=BUY | action=buy" in caplog.text
 
 
 def test_signal_generation_app_can_emit_watchlist_fallback_after_quiet_period(
@@ -2397,6 +2593,110 @@ def test_coinmarketcap_universe_refresh_service_reuses_cached_universe_after_rat
     assert payload["rateLimitedUntil"] is not None
     assert persisted_payload["productIds"] == ["ADA-USD"]
     assert persisted_payload["sourceStatus"] == "cached_rate_limited"
+
+
+def test_market_refresh_uses_cached_coinmarketcap_universe_after_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Market refresh should reuse the CMC universe cache instead of crashing on map 429."""
+
+    cache_path = tmp_path / "coinmarketcapUniverse.json"
+    stale_fetched_at = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    stale_expires_at = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    cache_path.write_text(
+        json.dumps(
+            {
+                "source": "coinmarketcapUniverse",
+                "marketDataSource": "coinmarketcapLatestQuotes",
+                "quoteCurrency": "USD",
+                "lastFetchedAt": stale_fetched_at,
+                "expiresAt": stale_expires_at,
+                "ttlSeconds": 21600,
+                "sourceStatus": "refreshed",
+                "lastError": "",
+                "rateLimitedUntil": None,
+                "productCount": 2,
+                "productIds": ["ADA-USD", "BTC-USD"],
+                "products": [
+                    {
+                        "productId": "ADA-USD",
+                        "baseCurrency": "ADA",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 1,
+                    },
+                    {
+                        "productId": "BTC-USD",
+                        "baseCurrency": "BTC",
+                        "quoteCurrency": "USD",
+                        "marketCapRank": 2,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = TrainingConfig(
+        data_file=tmp_path / "marketPrices.csv",
+        market_data_source="coinmarketcapLatestQuotes",
+        coinmarketcap_fetch_all_quote_products=True,
+        coinmarketcap_product_batch_size=1,
+        coinmarketcap_product_batch_number=1,
+        coinmarketcap_universe_cache_file=cache_path,
+        coinmarketcap_use_context=False,
+        coinmarketcap_use_market_intelligence=False,
+        coinmarketcal_use_events=False,
+        market_product_batch_rotation_enabled=True,
+        market_product_batch_state_file=tmp_path / "marketProductBatchState.json",
+    )
+    refresh_app = MarketDataRefreshApp(config=config)
+    monkeypatch.setenv(config.coinmarketcap_api_key_env_var, "test-key")
+
+    def fake_fetch_ranked_products(self) -> list[dict[str, object]]:
+        del self
+        raise CoinMarketCapRateLimitError("CoinMarketCap request failed with status 429.")
+
+    def fail_fetch_filtered_products(self) -> list[dict[str, str]]:
+        del self
+        raise AssertionError("market refresh should use cached explicit CMC products")
+
+    def fake_request_latest_quote_rows(
+        self: CoinMarketCapLatestQuotesPriceDataLoader,
+        selected_products: Sequence[dict[str, str]],
+    ) -> list[dict[str, object]]:
+        product = selected_products[0]
+        return [
+            {
+                "timestamp": pd.Timestamp("2026-05-03T00:00:00Z"),
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 100.0,
+                "product_id": product["product_id"],
+                "base_currency": product["base_currency"],
+                "quote_currency": product["quote_currency"],
+                "granularity_seconds": self.granularity_seconds,
+                "source": self.api_name,
+            }
+        ]
+
+    monkeypatch.setattr(CoinMarketCapUniverseRefreshService, "_fetch_ranked_products", fake_fetch_ranked_products)
+    monkeypatch.setattr(CoinMarketCapLatestQuotesPriceDataLoader, "_fetch_filtered_products", fail_fetch_filtered_products)
+    monkeypatch.setattr(
+        CoinMarketCapLatestQuotesPriceDataLoader,
+        "_request_latest_quote_rows",
+        fake_request_latest_quote_rows,
+    )
+
+    result = refresh_app.run()
+
+    assert result["rowsDownloaded"] == 1
+    assert result["totalBatches"] == 2
+    assert result["universeRefresh"]["sourceStatus"] == "cached_rate_limited"
+    assert result["universeRefresh"]["usedCachedSnapshot"] is True
+    assert result["downloadSummary"]["totalAvailableProducts"] == 2
 
 
 def test_signal_universe_coordinator_prioritizes_follow_up_products_before_cached_discovery(
@@ -4360,6 +4660,89 @@ def test_watchlist_first_check_stays_in_watchlist_for_alcx_calibration_case(tmp_
     assert promotion.hold_reason == "wait_for_setup_building"
 
 
+def test_watchlist_soft_reviews_confirmed_buy_slightly_below_confidence_cutoff(tmp_path: Path) -> None:
+    """Confirmed BUY setups slightly below the confidence cutoff should stay in review, not invalidate."""
+
+    config = _build_watchlist_test_config(
+        tmp_path,
+        signal_watchlist_invalidation_confidence=0.25,
+        signal_watchlist_soft_review_confidence_buffer=0.05,
+        signal_watchlist_soft_review_min_raw_confidence=0.50,
+        signal_watchlist_soft_review_min_probability_margin=0.12,
+    )
+    store = WatchlistStateStore(config)
+
+    weak_state, weak_promotion = store.update_from_signal(
+        signal_summary={
+            **_build_watchlist_follow_up_signal(
+                product_id="AERO-USD",
+                signal_name="HOLD",
+                confidence=0.18,
+                probability_margin=0.04,
+                trade_readiness="blocked",
+                breakout_confirmed=False,
+                near_resistance=True,
+            ),
+            "modelSignalName": "BUY",
+            "chartDecision": "blocked",
+            "chartPatternLabel": "near_resistance",
+            "confidenceCalibration": {
+                "calibratedConfidence": 0.18,
+            },
+        },
+        decision_score=0.12,
+        market_context={"marketStance": "balanced", "macroRiskMode": "neutral"},
+    )
+
+    assert weak_state["stage"] == "invalidated"
+    assert weak_promotion.blocked_reason == "signal_quality_veto"
+
+    state, promotion = store.update_from_signal(
+        signal_summary={
+            **_build_watchlist_follow_up_signal(
+                product_id="AERO-USD",
+                signal_name="HOLD",
+                confidence=0.52,
+                probability_margin=0.15,
+                trade_readiness="standby",
+                breakout_confirmed=True,
+                resistance_distance_pct=0.04,
+                near_resistance=False,
+            ),
+            "modelSignalName": "BUY",
+            "chartDecision": "confirmed",
+            "chartPatternLabel": "breakout_confirmed",
+            "confidenceCalibration": {
+                "calibratedConfidence": 0.23,
+                "reliabilityScore": 0.54,
+                "riskPenaltyScore": 0.18,
+                "executionPenaltyScore": 0.04,
+                "chartAlignmentScore": 0.32,
+                "contextAlignmentScore": 0.18,
+                "confidenceQuality": "fragile",
+            },
+            "executionContext": {
+                "executionQualityScore": 0.46,
+                "decisionPenalty": 0.04,
+                "isThinLiquidity": False,
+                "hasElevatedCost": False,
+                "isExecutionBlocked": False,
+            },
+        },
+        decision_score=0.36,
+        market_context={"marketStance": "balanced", "macroRiskMode": "neutral"},
+    )
+
+    assert state["stage"] == "watchlist"
+    assert state["recoveredFromInvalidation"] is True
+    assert state["softLowConfidenceReviewApplied"] is True
+    assert state["signalQualitySoftReasons"] == ["soft_low_calibrated_confidence"]
+    assert "low_calibrated_confidence" not in state["signalQualityReasons"]
+    assert promotion.blocked_reason is None
+    assert promotion.hold_reason == "needs_more_signal_confirmation"
+    assert promotion.review_reason == "needs_more_signal_confirmation"
+
+
 def test_watchlist_follow_up_promotes_on_second_and_third_checks(tmp_path: Path) -> None:
     """Repeated positive follow-up checks should move from watchlist into explicit setup stages."""
 
@@ -4398,9 +4781,20 @@ def test_watchlist_follow_up_promotes_on_second_and_third_checks(tmp_path: Path)
     assert second_state["stage"] == "setup_building"
     assert second_promotion.hold_reason == "wait_for_setup_confirmation"
     assert second_promotion.promotion_ready is False
+    assert second_state["reviewOutcome"] == "advanced"
+    assert second_state["reviewReason"] == "wait_for_setup_confirmation"
     assert third_state["stage"] == "setup_confirmed"
     assert third_promotion.hold_reason == "wait_for_breakout_confirmation"
     assert third_promotion.promotion_ready is False
+    assert third_state["previousStage"] == "setup_building"
+    assert third_state["lastTransition"]["toStage"] == "setup_confirmed"
+
+    store.save()
+    saved_payload = json.loads((tmp_path / "watchlistState.json").read_text(encoding="utf-8"))
+    assert saved_payload["lastCycleSummary"]["reviewedCount"] == 3
+    assert saved_payload["lastCycleSummary"]["advancedThisCycle"] == 2
+    assert saved_payload["lastCycleSummary"]["stageCounts"]["setup_confirmed"] == 1
+    assert saved_payload["lastCycleSummary"]["transitions"][0]["productId"] == "ALCX-USD"
 
 
 def test_watchlist_entry_ready_separates_soft_risk_from_hard_blocks(tmp_path: Path) -> None:
@@ -4435,7 +4829,7 @@ def test_watchlist_entry_ready_separates_soft_risk_from_hard_blocks(tmp_path: Pa
     assert soft_promotion.promotion_ready is False
     assert soft_promotion.hard_blocks == ()
     assert "macro_risk_off" in soft_promotion.soft_penalties
-    assert soft_promotion.blocked_reason in {"defensive_market", "macro_risk_off"}
+    assert soft_promotion.blocked_reason == "market_regime_veto"
     assert soft_promotion.exceptional_override_applied is False
 
     hard_store = WatchlistStateStore(
@@ -4465,7 +4859,99 @@ def test_watchlist_entry_ready_separates_soft_risk_from_hard_blocks(tmp_path: Pa
     assert hard_state["stage"] == "entry_ready"
     assert hard_promotion.promotion_ready is False
     assert "blocked_by_event_risk" in hard_promotion.hard_blocks
-    assert hard_promotion.blocked_reason == "blocked_by_event_risk"
+    assert hard_promotion.blocked_reason == "market_regime_veto"
+    assert hard_promotion.blocked_reason_detail == "blocked_by_event_risk"
+
+
+def test_watchlist_preserves_strong_blocked_buy_and_recovers_from_invalidation(tmp_path: Path) -> None:
+    """Strong blocked BUY candidates should recover into watchlist review instead of staying invalidated."""
+
+    config = _build_watchlist_test_config(
+        tmp_path,
+        signal_watchlist_state_path=tmp_path / "aeroWatchlistState.json",
+        signal_watchlist_preserve_strong_blocked_buys=True,
+        signal_watchlist_strong_buy_min_raw_confidence=0.72,
+        signal_watchlist_strong_buy_min_probability_margin=0.18,
+        signal_watchlist_invalidation_confidence=0.25,
+        signal_watchlist_invalidation_min_probability_margin=0.08,
+    )
+    store = WatchlistStateStore(config)
+    market_context = {"marketStance": "defensive", "macroRiskMode": "risk_off"}
+
+    weak_state, weak_promotion = store.update_from_signal(
+        signal_summary={
+            **_build_watchlist_follow_up_signal(
+                product_id="AERO-USD",
+                signal_name="HOLD",
+                confidence=0.18,
+                probability_margin=0.03,
+                trade_readiness="blocked",
+                regime_label="trend_down_high_volatility",
+                is_high_volatility=True,
+                macro_risk_mode="risk_off",
+            ),
+            "modelSignalName": "BUY",
+            "confidenceCalibration": {
+                "calibratedConfidence": 0.18,
+            },
+            "executionContext": {
+                "executionQualityScore": 0.0,
+                "decisionPenalty": 0.08,
+                "isThinLiquidity": True,
+                "hasElevatedCost": True,
+                "isExecutionBlocked": True,
+            },
+        },
+        decision_score=0.12,
+        market_context=market_context,
+    )
+
+    assert weak_state["stage"] == "invalidated"
+    assert weak_promotion.blocked_reason == "signal_quality_veto"
+
+    strong_state, strong_promotion = store.update_from_signal(
+        signal_summary={
+            **_build_watchlist_follow_up_signal(
+                product_id="AERO-USD",
+                signal_name="HOLD",
+                confidence=0.7865,
+                probability_margin=0.6455,
+                trade_readiness="blocked",
+                regime_label="trend_down_high_volatility",
+                is_high_volatility=True,
+                macro_risk_mode="risk_off",
+            ),
+            "modelSignalName": "BUY",
+            "confidenceCalibration": {
+                "calibratedConfidence": 0.4782,
+                "chartAlignmentScore": 0.12,
+                "newsAlignmentScore": 0.0,
+                "trendAlignmentScore": 0.04,
+                "contextAlignmentScore": 0.10,
+            },
+            "executionContext": {
+                "executionQualityScore": 0.0,
+                "decisionPenalty": 0.08,
+                "isThinLiquidity": True,
+                "hasElevatedCost": True,
+                "isExecutionBlocked": True,
+            },
+        },
+        decision_score=0.84,
+        market_context=market_context,
+    )
+
+    assert strong_state["stage"] == "setup_building"
+    assert strong_state["lastModelSignalName"] == "BUY"
+    assert strong_state["recoveredFromInvalidation"] is True
+    assert strong_state["strongBlockedBuyPreserved"] is True
+    assert strong_state["primaryVetoBucket"] == "market_regime_veto"
+    assert set(strong_state["vetoBuckets"]) == {"market_regime_veto", "execution_veto"}
+    assert "blocked_by_risk" not in strong_state["hardBlocks"]
+    assert strong_promotion.blocked_reason == "market_regime_veto"
+    assert strong_promotion.blocked_reason_detail == "severe_downtrend_regime"
+    assert strong_promotion.hold_reason == "blocked_high_risk"
+    assert strong_promotion.strong_blocked_buy_preserved is True
 
 
 def test_trader_brain_promotes_breakout_confirmed_watchlist_on_follow_up_cycle(tmp_path: Path) -> None:
@@ -4976,6 +5462,7 @@ def test_frontend_snapshot_store_serves_cached_signal_views(tmp_path: Path) -> N
     assert len(actionable_list) == 2
     assert eth_signal is not None
     assert eth_signal["signal_name"] == "TAKE_PROFIT"
+    assert overview["watchlistPromotion"] == {}
     assert overview["traderBrain"] == {}
 
 

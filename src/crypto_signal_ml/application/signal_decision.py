@@ -11,10 +11,12 @@ from typing import Any, Callable
 import pandas as pd
 
 from ..config import OUTPUTS_DIR, TrainingConfig
-from ..trading.signals import (
-    build_actionable_signal_summaries,
-    filter_published_signal_summaries,
-    select_primary_signal,
+from ..signal_generation.publication import (
+    decide_publication,
+    decorate_watchlist_fallback_signal,
+    rank_watchlist_fallback_candidates,
+    should_publish_watchlist_fallback,
+    supplement_published_signals_with_watchlist_candidates,
 )
 
 
@@ -187,60 +189,41 @@ class SignalDecisionStage:
     def decide(self, signal_summaries: list[dict[str, Any]]) -> SignalDecisionArtifacts:
         """Turn enriched signals into published, actionable, and primary outputs."""
 
-        published_signals = filter_published_signal_summaries(signal_summaries)
-        if not published_signals:
-            if self.allow_watchlist_fallback:
-                watchlist_fallback_signal = self._select_watchlist_fallback_signal(signal_summaries)
-                if watchlist_fallback_signal is not None:
-                    published_signals = [watchlist_fallback_signal]
-        elif self.allow_watchlist_supplement:
-            published_signals = self._supplement_published_signals_with_watchlist_candidates(
-                published_signals=published_signals,
-                signal_summaries=signal_summaries,
-            )
-
-        actionable_signals = build_actionable_signal_summaries(published_signals)
-        recent_primary_product_ids = (
-            self.primary_history_store.load_recent_product_ids()
-            if self.primary_history_store is not None
-            else []
+        publication_selection = decide_publication(
+            signal_summaries=signal_summaries,
+            config=self.config,
+            recent_primary_product_ids=(
+                self.primary_history_store.load_recent_product_ids()
+                if self.primary_history_store is not None
+                else []
+            ),
+            allow_watchlist_fallback=self.allow_watchlist_fallback,
+            allow_watchlist_supplement=self.allow_watchlist_supplement,
+            last_primary_signal_at=(
+                self.primary_history_store.load_last_generated_at()
+                if self.primary_history_store is not None
+                else None
+            ),
         )
-        primary_signal = None
-        if published_signals:
-            primary_signal = select_primary_signal(
-                published_signals,
-                config=self.config,
-                recent_primary_product_ids=recent_primary_product_ids,
-            )
 
         return SignalDecisionArtifacts(
-            signal_summaries=list(signal_summaries),
-            published_signals=published_signals,
-            actionable_signals=actionable_signals,
-            primary_signal=primary_signal,
+            signal_summaries=list(publication_selection.signal_summaries),
+            published_signals=list(publication_selection.published_signals),
+            actionable_signals=list(publication_selection.actionable_signals),
+            primary_signal=dict(publication_selection.primary_signal) if publication_selection.primary_signal is not None else None,
         )
 
     def _should_publish_watchlist_fallback(self) -> bool:
         """Return whether the public feed should emit a watchlist fallback signal."""
 
-        if not bool(getattr(self.config, "signal_watchlist_fallback_enabled", True)):
-            return False
-
-        quiet_period_hours = max(
-            float(getattr(self.config, "signal_watchlist_fallback_hours", 12.0) or 0.0),
-            0.0,
+        return should_publish_watchlist_fallback(
+            config=self.config,
+            last_primary_signal_at=(
+                self.primary_history_store.load_last_generated_at()
+                if self.primary_history_store is not None
+                else None
+            ),
         )
-        last_primary_signal_at = (
-            self.primary_history_store.load_last_generated_at()
-            if self.primary_history_store is not None
-            else None
-        )
-        if last_primary_signal_at is None:
-            return True
-        if quiet_period_hours <= 0:
-            return True
-
-        return (datetime.now(timezone.utc) - last_primary_signal_at) >= timedelta(hours=quiet_period_hours)
 
     def _select_watchlist_fallback_signal(
         self,
@@ -264,104 +247,17 @@ class SignalDecisionStage:
     ) -> list[dict[str, Any]]:
         """Return the strongest watchlist candidates that are safe to surface publicly."""
 
-        readiness_priority = {
-            "high": 0,
-            "medium": 1,
-            "standby": 2,
-            "blocked": 3,
-        }
-        minimum_decision_score = float(
-            getattr(self.config, "signal_watchlist_min_decision_score", 0.30) or 0.30
+        return rank_watchlist_fallback_candidates(
+            signal_summaries,
+            config=self.config,
+            excluded_product_ids=excluded_product_ids,
         )
-        minimum_confidence = float(
-            getattr(self.config, "signal_watchlist_min_confidence", 0.55) or 0.55
-        )
-        excluded_product_ids = {
-            str(product_id).strip().upper()
-            for product_id in list(excluded_product_ids or set())
-            if str(product_id).strip()
-        }
-        ranked_candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-
-        for signal_summary in signal_summaries:
-            product_id = str(signal_summary.get("productId", "")).strip().upper()
-            if not product_id or product_id in excluded_product_ids:
-                continue
-
-            brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
-            if str(brain.get("decision", "")).strip().lower() != "watchlist":
-                continue
-
-            trade_context = (
-                signal_summary.get("tradeContext")
-                if isinstance(signal_summary.get("tradeContext"), dict)
-                else {}
-            )
-            if bool(trade_context.get("hasActiveTrade", False)):
-                continue
-
-            raw_signal_name = str(signal_summary.get("modelSignalName", "")).strip().upper()
-            final_signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
-            if raw_signal_name == "TAKE_PROFIT" or final_signal_name == "LOSS":
-                continue
-
-            confidence = float(signal_summary.get("confidence", 0.0) or 0.0)
-            decision_score = float(brain.get("decisionScore", 0.0) or 0.0)
-            if confidence < minimum_confidence or decision_score < minimum_decision_score:
-                continue
-
-            trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).strip().lower()
-            ranked_candidates.append(
-                (
-                    (
-                        0 if raw_signal_name == "BUY" else 1,
-                        readiness_priority.get(trade_readiness, 99),
-                        -decision_score,
-                        -float(signal_summary.get("policyScore", 0.0) or 0.0),
-                        -confidence,
-                        product_id,
-                    ),
-                    dict(signal_summary),
-                )
-            )
-
-        if not ranked_candidates:
-            return []
-
-        return [candidate for _, candidate in sorted(ranked_candidates, key=lambda item: item[0])]
 
     @staticmethod
     def _decorate_watchlist_fallback_signal(selected_signal: dict[str, Any]) -> dict[str, Any]:
         """Label one internal watchlist candidate as a public fallback row."""
 
-        fallback_note = (
-            "No actionable trade cleared the live gate recently, so this strongest watchlist candidate is surfaced instead."
-        )
-        existing_reason_items = [
-            str(reason_item).strip()
-            for reason_item in list(selected_signal.get("reasonItems", []))
-            if str(reason_item).strip()
-        ]
-        merged_reason_items = [fallback_note]
-        for reason_item in existing_reason_items:
-            if reason_item not in merged_reason_items:
-                merged_reason_items.append(reason_item)
-
-        fallback_signal = dict(selected_signal)
-        fallback_signal["watchlistFallback"] = True
-        fallback_signal["publicSignalType"] = "watchlist"
-        fallback_signal["actionable"] = False
-        fallback_signal["spotAction"] = "wait"
-        fallback_signal["reasonItems"] = merged_reason_items[:4]
-        fallback_signal["reasonSummary"] = merged_reason_items[0]
-        existing_chat = str(fallback_signal.get("signalChat", "")).strip()
-        fallback_signal["signalChat"] = (
-            f"{fallback_note} {existing_chat}".strip()
-            if existing_chat
-            else fallback_note
-        )
-
-        return fallback_signal
+        return decorate_watchlist_fallback_signal(selected_signal)
 
     def _supplement_published_signals_with_watchlist_candidates(
         self,
@@ -370,30 +266,8 @@ class SignalDecisionStage:
     ) -> list[dict[str, Any]]:
         """Keep one primary public signal while backfilling a thin feed with watchlist ideas."""
 
-        minimum_published_signals = max(
-            int(getattr(self.config, "signal_watchlist_min_published_signals", 2) or 2),
-            1,
+        return supplement_published_signals_with_watchlist_candidates(
+            published_signals=published_signals,
+            signal_summaries=signal_summaries,
+            config=self.config,
         )
-        if len(published_signals) >= minimum_published_signals:
-            return list(published_signals)
-        if not published_signals:
-            return []
-
-        existing_product_ids = {
-            str(signal_summary.get("productId", "")).strip().upper()
-            for signal_summary in published_signals
-            if str(signal_summary.get("productId", "")).strip()
-        }
-        ranked_candidates = self._rank_watchlist_fallback_candidates(
-            signal_summaries,
-            excluded_product_ids=existing_product_ids,
-        )
-        if not ranked_candidates:
-            return list(published_signals)
-
-        supplemented_signals = list(published_signals)
-        remaining_slots = minimum_published_signals - len(supplemented_signals)
-        for candidate in ranked_candidates[:remaining_slots]:
-            supplemented_signals.append(self._decorate_watchlist_fallback_signal(candidate))
-
-        return supplemented_signals

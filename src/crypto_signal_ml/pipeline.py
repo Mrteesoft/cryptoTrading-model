@@ -5,7 +5,12 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from .config import TrainingConfig, is_coinmarketcap_market_data_source
+from .config import (
+    TrainingConfig,
+    is_binance_market_data_source,
+    is_coinmarketcap_market_data_source,
+    is_kraken_market_data_source,
+)
 from .data import (
     BasePriceDataEnricher,
     BasePriceDataLoader,
@@ -21,9 +26,9 @@ from .features import (
     FEATURE_COLUMNS,
     MULTI_TIMEFRAME_FEATURE_COLUMNS,
     TechnicalFeatureEngineer,
-    get_feature_pack_columns,
 )
-from .labels import BaseSignalLabeler, MarketRegimeLabeler, create_labeler_from_config, create_regime_labeler_from_config
+from .features_core import get_feature_pack_columns
+from .labels_core import BaseSignalLabeler, MarketRegimeLabeler, create_labeler_from_config, create_regime_labeler_from_config
 from .regimes import MarketRegimeDetector
 
 
@@ -153,6 +158,10 @@ class BaseDatasetBuilder(ABC):
 
         if is_coinmarketcap_market_data_source(self.config.market_data_source):
             return int(self.config.coinmarketcap_granularity_seconds)
+        if is_kraken_market_data_source(self.config.market_data_source):
+            return int(self.config.kraken_granularity_seconds)
+        if is_binance_market_data_source(self.config.market_data_source):
+            return int(self.config.binance_granularity_seconds)
 
         return int(self.config.coinbase_granularity_seconds)
 
@@ -192,9 +201,16 @@ class CryptoDatasetBuilder(BaseDatasetBuilder):
         if feature_columns is not None:
             selected_feature_columns = list(feature_columns)
         else:
-            selected_feature_columns = get_feature_pack_columns(config.feature_pack)
+            selected_feature_columns = get_feature_pack_columns(
+                config.feature_pack,
+                include_groups=config.feature_include_groups,
+                exclude_groups=config.feature_exclude_groups,
+            )
             if not selected_feature_columns:
-                selected_feature_columns = list(FEATURE_COLUMNS)
+                raise ValueError(
+                    "The configured feature selection resolved to zero columns. "
+                    "Check `feature_pack`, `feature_include_groups`, and `feature_exclude_groups`."
+                )
 
         if data_loader is None:
             data_loader = CsvPriceDataLoader(config.data_file)

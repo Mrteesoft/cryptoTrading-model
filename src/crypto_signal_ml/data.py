@@ -1,6 +1,8 @@
 """Classes and helpers for loading, validating, and downloading market data."""
 
 from abc import ABC, abstractmethod
+import csv
+import io
 import math
 from datetime import datetime, timedelta, timezone
 import json
@@ -11,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zipfile import ZipFile
 
 import pandas as pd
 import numpy as np
@@ -3068,6 +3071,640 @@ class CoinbaseExchangePriceDataLoader(BaseApiPriceDataLoader):
             print(message)
 
 
+class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
+    """Download recent OHLCV candles from Kraken's public REST API."""
+
+    api_name = "kraken"
+    api_base_url = "https://api.kraken.com/0/public/OHLC"
+    valid_granularities = {60: 1, 300: 5, 900: 15, 1800: 30, 3600: 60, 14400: 240, 86400: 1440}
+
+    def __init__(
+        self,
+        data_path: Path,
+        product_id: Optional[str] = None,
+        product_ids: Sequence[str] = None,
+        quote_currency: str = "USD",
+        granularity_seconds: int = 3600,
+        total_candles: int = 720,
+        request_pause_seconds: float = 0.2,
+        should_save_downloaded_data: bool = True,
+        product_batch_size: Optional[int] = None,
+        product_batch_number: int = 1,
+        save_progress_every_products: int = 5,
+        log_progress: bool = True,
+    ) -> None:
+        super().__init__(data_path=data_path, should_save_downloaded_data=should_save_downloaded_data)
+        self.product_id = product_id
+        self.product_ids = tuple(product_ids or ())
+        self.quote_currency = quote_currency
+        self.granularity_seconds = granularity_seconds
+        self.total_candles = total_candles
+        self.request_pause_seconds = request_pause_seconds
+        self.product_batch_size = product_batch_size
+        self.product_batch_number = product_batch_number
+        self.save_progress_every_products = save_progress_every_products
+        self.log_progress = log_progress
+
+    def _read_data(self) -> pd.DataFrame:
+        """Download and normalize Kraken OHLC rows."""
+
+        self._validate_download_settings()
+        available_products = self._resolve_products_to_download()
+        selected_products, batch_summary = self._slice_products_for_batch(available_products)
+        all_candle_rows: List[Dict[str, object]] = []
+
+        self._log_progress(
+            "Starting Kraken market refresh: "
+            f"{len(selected_products)} products, up to {self.total_candles} candles each."
+        )
+        for product_index, product_details in enumerate(selected_products):
+            self._log_progress(f"[{product_index + 1}/{len(selected_products)}] Downloading {product_details['product_id']}")
+            raw_rows = self._request_ohlc_rows(product_details["exchange_pair"])
+            normalized_rows = self._normalize_candle_rows(product_details, raw_rows[-self.total_candles :])
+            all_candle_rows.extend(normalized_rows)
+            self._maybe_save_partial_progress(all_candle_rows, product_index + 1)
+            if product_index < len(selected_products) - 1 and self.request_pause_seconds > 0:
+                time.sleep(self.request_pause_seconds)
+
+        if not all_candle_rows:
+            raise ValueError("The Kraken API returned no candle data for the selected products.")
+
+        price_df = self._build_price_frame(all_candle_rows)
+        self.last_refresh_summary = {
+            "totalAvailableProducts": len(available_products),
+            "productsDownloaded": len(selected_products),
+            "requestWindowsPerProduct": 1,
+            "batchSize": batch_summary["batchSize"],
+            "batchNumber": batch_summary["batchNumber"],
+            "batchStartIndex": batch_summary["batchStartIndex"],
+            "batchEndIndex": batch_summary["batchEndIndex"],
+            "partialSavePath": str(self.partial_data_path),
+            "rowsDownloaded": len(price_df),
+        }
+        return price_df
+
+    def _save_downloaded_data(self, price_df: pd.DataFrame) -> None:
+        final_df = self._merge_existing_rows(price_df)
+        super()._save_downloaded_data(final_df)
+        self.last_refresh_summary["finalRowsSaved"] = len(final_df)
+
+    def _validate_download_settings(self) -> None:
+        if self.granularity_seconds not in self.valid_granularities:
+            raise ValueError(f"kraken_granularity_seconds must be one of {sorted(self.valid_granularities)}.")
+        if self.total_candles <= 0:
+            raise ValueError("kraken_total_candles must be greater than zero.")
+        if self.total_candles > 720:
+            self._log_progress("Kraken REST OHLC returns at most 720 recent committed candles per product.")
+        if self.product_batch_size is not None and self.product_batch_size <= 0:
+            raise ValueError("kraken_product_batch_size must be greater than zero when provided.")
+        if self.product_batch_number <= 0:
+            raise ValueError("kraken_product_batch_number must be greater than zero.")
+
+    def _resolve_products_to_download(self) -> List[Dict[str, str]]:
+        explicit_product_ids = list(self.product_ids)
+        if self.product_id:
+            explicit_product_ids.append(self.product_id)
+        if not explicit_product_ids:
+            raise ValueError("No Kraken products were provided for download.")
+
+        products = []
+        seen_ids = set()
+        for product_id in explicit_product_ids:
+            base_currency, quote_currency = self._split_product_id(product_id)
+            normalized_product_id = f"{base_currency}-{quote_currency}"
+            if normalized_product_id in seen_ids:
+                continue
+            seen_ids.add(normalized_product_id)
+            products.append(
+                {
+                    "product_id": normalized_product_id,
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "exchange_pair": self._to_kraken_pair(base_currency, quote_currency),
+                }
+            )
+        return products
+
+    def get_available_products(self) -> List[Dict[str, str]]:
+        self._validate_download_settings()
+        return self._resolve_products_to_download()
+
+    def get_total_batches(self) -> int:
+        available_products = self.get_available_products()
+        if self.product_batch_size is None:
+            return 1
+        return max(1, math.ceil(len(available_products) / self.product_batch_size))
+
+    def _slice_products_for_batch(
+        self,
+        selected_products: List[Dict[str, str]],
+    ) -> tuple[List[Dict[str, str]], Dict[str, int]]:
+        if self.product_batch_size is None:
+            return selected_products, {
+                "batchSize": len(selected_products),
+                "batchNumber": 1,
+                "batchStartIndex": 1,
+                "batchEndIndex": len(selected_products),
+            }
+
+        total_products = len(selected_products)
+        total_batches = max(1, math.ceil(total_products / self.product_batch_size))
+        if self.product_batch_number > total_batches:
+            raise ValueError(
+                "Requested Kraken product batch is out of range. "
+                f"Requested batch {self.product_batch_number}, available batches {total_batches}."
+            )
+        batch_start_index = (self.product_batch_number - 1) * self.product_batch_size
+        batch_end_index = min(batch_start_index + self.product_batch_size, total_products)
+        return selected_products[batch_start_index:batch_end_index], {
+            "batchSize": batch_end_index - batch_start_index,
+            "batchNumber": self.product_batch_number,
+            "batchStartIndex": batch_start_index + 1,
+            "batchEndIndex": batch_end_index,
+        }
+
+    def _request_ohlc_rows(self, exchange_pair: str) -> List[Sequence[object]]:
+        query_params = urlencode(
+            {
+                "pair": exchange_pair,
+                "interval": self.valid_granularities[self.granularity_seconds],
+            }
+        )
+        request = Request(
+            f"{self.api_base_url}?{query_params}",
+            headers={"User-Agent": "crypto-signal-ml/0.1", "Accept": "application/json"},
+        )
+        with urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+
+        errors = response_payload.get("error", []) if isinstance(response_payload, dict) else []
+        if errors:
+            raise ValueError(f"Kraken OHLC request failed for {exchange_pair}: {errors}")
+
+        result_payload = response_payload.get("result", {}) if isinstance(response_payload, dict) else {}
+        result_keys = [key for key in result_payload.keys() if key != "last"]
+        raw_rows = result_payload.get(result_keys[0], []) if result_keys else []
+        if not isinstance(raw_rows, list):
+            raise ValueError(f"Unexpected response received from Kraken OHLC endpoint for {exchange_pair}.")
+
+        # Kraken includes the current not-yet-committed candle as the final row.
+        return raw_rows[:-1] if len(raw_rows) > 1 else raw_rows
+
+    def _normalize_candle_rows(
+        self,
+        product_details: Dict[str, str],
+        candle_rows: Sequence[Sequence[object]],
+    ) -> List[Dict[str, object]]:
+        normalized_rows: List[Dict[str, object]] = []
+        for candle_row in candle_rows:
+            if len(candle_row) < 7:
+                continue
+            timestamp_epoch, open_price, high_price, low_price, close_price, _vwap, volume = candle_row[:7]
+            normalized_rows.append(
+                {
+                    "timestamp": datetime.fromtimestamp(float(timestamp_epoch), tz=timezone.utc),
+                    "open": float(open_price),
+                    "high": float(high_price),
+                    "low": float(low_price),
+                    "close": float(close_price),
+                    "volume": float(volume),
+                    "product_id": product_details["product_id"],
+                    "base_currency": product_details["base_currency"],
+                    "quote_currency": product_details["quote_currency"],
+                    "granularity_seconds": self.granularity_seconds,
+                    "source": self.api_name,
+                }
+            )
+        return normalized_rows
+
+    def _maybe_save_partial_progress(self, all_candle_rows: Sequence[Dict[str, object]], completed_products: int) -> None:
+        if not self.should_save_downloaded_data or self.save_progress_every_products == 0:
+            return
+        if completed_products % self.save_progress_every_products != 0:
+            return
+        self._save_partial_download(self._build_price_frame(all_candle_rows))
+
+    def _merge_existing_rows(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        final_df = price_df.copy()
+        final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+        if self.data_path.exists():
+            existing_df = pd.read_csv(self.data_path)
+            existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
+            final_df = pd.concat([existing_df, final_df], ignore_index=True)
+            final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")
+        return self._sort_rows(final_df)
+
+    def _build_price_frame(self, normalized_rows: Sequence[Dict[str, object]]) -> pd.DataFrame:
+        price_df = pd.DataFrame(normalized_rows)
+        price_df = price_df.drop_duplicates(subset=["product_id", "timestamp"])
+        return price_df.sort_values(["timestamp", "product_id"]).reset_index(drop=True)
+
+    def _split_product_id(self, product_id: str) -> tuple[str, str]:
+        normalized_product_id = str(product_id).strip().upper()
+        if "-" in normalized_product_id:
+            base_currency, quote_currency = normalized_product_id.split("-", 1)
+        else:
+            base_currency, quote_currency = normalized_product_id, self.quote_currency
+        return normalize_base_currency(base_currency), quote_currency.upper()
+
+    @staticmethod
+    def _to_kraken_pair(base_currency: str, quote_currency: str) -> str:
+        kraken_base = "XBT" if base_currency.upper() == "BTC" else base_currency.upper()
+        return f"{kraken_base}{quote_currency.upper()}"
+
+    def _log_progress(self, message: str) -> None:
+        if self.log_progress:
+            print(message)
+
+
+class BinancePublicDataPriceDataLoader(BaseApiPriceDataLoader):
+    """Download OHLCV candles from Binance's public historical data archives."""
+
+    api_name = "binancePublicData"
+    api_base_url = "https://data.binance.vision/data/spot/monthly/klines"
+    api_exchange_info_url = "https://api.binance.com/api/v3/exchangeInfo"
+    api_ticker_24hr_url = "https://api.binance.com/api/v3/ticker/24hr"
+
+    def __init__(
+        self,
+        data_path: Path,
+        product_id: Optional[str] = None,
+        product_ids: Sequence[str] = None,
+        fetch_all_quote_products: bool = False,
+        quote_currency: str = "USDT",
+        excluded_base_currencies: Sequence[str] = None,
+        max_products: Optional[int] = None,
+        interval: str = "1h",
+        granularity_seconds: int = 3600,
+        total_candles: int = 4320,
+        archive_lookback_months: int = 36,
+        request_pause_seconds: float = 0.1,
+        should_save_downloaded_data: bool = True,
+        product_batch_size: Optional[int] = None,
+        product_batch_number: int = 1,
+        save_progress_every_products: int = 5,
+        log_progress: bool = True,
+    ) -> None:
+        super().__init__(data_path=data_path, should_save_downloaded_data=should_save_downloaded_data)
+        self.product_id = product_id
+        self.product_ids = tuple(product_ids or ())
+        self.fetch_all_quote_products = fetch_all_quote_products
+        self.quote_currency = quote_currency
+        self.excluded_base_currencies = tuple(excluded_base_currencies or ())
+        self.max_products = max_products
+        self.interval = interval
+        self.granularity_seconds = granularity_seconds
+        self.total_candles = total_candles
+        self.archive_lookback_months = archive_lookback_months
+        self.request_pause_seconds = request_pause_seconds
+        self.product_batch_size = product_batch_size
+        self.product_batch_number = product_batch_number
+        self.save_progress_every_products = save_progress_every_products
+        self.log_progress = log_progress
+
+    def _read_data(self) -> pd.DataFrame:
+        self._validate_download_settings()
+        available_products = self._resolve_products_to_download()
+        selected_products, batch_summary = self._slice_products_for_batch(available_products)
+        year_months = self._resolve_months_to_download()
+        all_candle_rows: List[Dict[str, object]] = []
+
+        self._log_progress(
+            "Starting Binance public-data refresh: "
+            f"{len(selected_products)} products, {len(year_months)} monthly archive(s) each."
+        )
+        for product_index, product_details in enumerate(selected_products):
+            product_rows: List[Dict[str, object]] = []
+            for year_month in year_months:
+                product_rows.extend(self._request_month_rows(product_details, year_month))
+                if len(product_rows) >= self.total_candles:
+                    break
+                if self.request_pause_seconds > 0:
+                    time.sleep(self.request_pause_seconds)
+            product_rows = sorted(product_rows, key=lambda row: row["timestamp"])[-self.total_candles :]
+            all_candle_rows.extend(product_rows)
+            self._maybe_save_partial_progress(all_candle_rows, product_index + 1)
+
+        if not all_candle_rows:
+            raise ValueError("Binance public data returned no candle rows for the selected products.")
+
+        price_df = self._build_price_frame(all_candle_rows)
+        self.last_refresh_summary = {
+            "totalAvailableProducts": len(available_products),
+            "productsDownloaded": len(selected_products),
+            "requestWindowsPerProduct": len(year_months),
+            "batchSize": batch_summary["batchSize"],
+            "batchNumber": batch_summary["batchNumber"],
+            "batchStartIndex": batch_summary["batchStartIndex"],
+            "batchEndIndex": batch_summary["batchEndIndex"],
+            "partialSavePath": str(self.partial_data_path),
+            "rowsDownloaded": len(price_df),
+        }
+        return price_df
+
+    def _save_downloaded_data(self, price_df: pd.DataFrame) -> None:
+        final_df = self._merge_existing_rows(price_df)
+        super()._save_downloaded_data(final_df)
+        self.last_refresh_summary["finalRowsSaved"] = len(final_df)
+
+    def _validate_download_settings(self) -> None:
+        if self.total_candles <= 0:
+            raise ValueError("binance_total_candles must be greater than zero.")
+        if self.granularity_seconds <= 0:
+            raise ValueError("binance_granularity_seconds must be greater than zero.")
+        if self.archive_lookback_months <= 0:
+            raise ValueError("binance_archive_lookback_months must be greater than zero.")
+        if not self.interval:
+            raise ValueError("binance_interval must not be empty.")
+        if self.product_batch_size is not None and self.product_batch_size <= 0:
+            raise ValueError("binance_product_batch_size must be greater than zero when provided.")
+        if self.product_batch_number <= 0:
+            raise ValueError("binance_product_batch_number must be greater than zero.")
+
+    def _resolve_products_to_download(self) -> List[Dict[str, str]]:
+        if self.fetch_all_quote_products:
+            return self._fetch_filtered_products()
+
+        explicit_product_ids = list(self.product_ids)
+        if self.product_id:
+            explicit_product_ids.append(self.product_id)
+        if not explicit_product_ids:
+            raise ValueError("No Binance products were provided for download.")
+
+        products = []
+        seen_ids = set()
+        for product_id in explicit_product_ids:
+            base_currency, _quote_currency = self._split_product_id(product_id)
+            quote_currency = self.quote_currency.upper()
+            normalized_product_id = f"{base_currency}-{quote_currency}"
+            if normalized_product_id in seen_ids:
+                continue
+            seen_ids.add(normalized_product_id)
+            products.append(
+                {
+                    "product_id": normalized_product_id,
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "exchange_symbol": f"{base_currency}{quote_currency}",
+                }
+            )
+        return products
+
+    def _fetch_filtered_products(self) -> List[Dict[str, str]]:
+        """Fetch Binance spot symbols and keep eligible quote-currency products."""
+
+        query_params = urlencode({"symbolStatus": "TRADING"})
+        request = Request(
+            f"{self.api_exchange_info_url}?{query_params}",
+            headers={"User-Agent": "crypto-signal-ml/0.1", "Accept": "application/json"},
+        )
+        with urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+
+        raw_symbols = response_payload.get("symbols", []) if isinstance(response_payload, dict) else []
+        if not isinstance(raw_symbols, list):
+            raise ValueError(
+                "Unexpected response received from Binance exchangeInfo endpoint. "
+                f"Response type: {type(raw_symbols)}"
+            )
+
+        excluded_bases = {currency.upper() for currency in self.excluded_base_currencies}
+        filtered_products: List[Dict[str, str]] = []
+
+        for symbol_details in raw_symbols:
+            if not isinstance(symbol_details, dict):
+                continue
+
+            base_currency = normalize_base_currency(symbol_details.get("baseAsset"))
+            quote_currency = str(symbol_details.get("quoteAsset", "")).strip().upper()
+            exchange_symbol = str(symbol_details.get("symbol", "")).strip().upper()
+            status = str(symbol_details.get("status", "")).strip().upper()
+            is_spot_allowed = bool(symbol_details.get("isSpotTradingAllowed", True))
+
+            if not base_currency or not quote_currency or not exchange_symbol:
+                continue
+            if quote_currency != self.quote_currency.upper():
+                continue
+            if base_currency in excluded_bases:
+                continue
+            if not is_signal_eligible_base_currency(base_currency):
+                continue
+            if status != "TRADING" or not is_spot_allowed:
+                continue
+
+            filtered_products.append(
+                {
+                    "product_id": f"{base_currency}-{quote_currency}",
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "exchange_symbol": exchange_symbol,
+                }
+            )
+
+        quote_volume_by_symbol = self._fetch_quote_volume_by_symbol()
+        filtered_products = sorted(
+            filtered_products,
+            key=lambda product: (
+                -quote_volume_by_symbol.get(product["exchange_symbol"], 0.0),
+                product["exchange_symbol"],
+            ),
+        )
+
+        if self.max_products is not None:
+            filtered_products = filtered_products[: self.max_products]
+
+        if not filtered_products:
+            raise ValueError("No Binance products matched the configured multi-coin filters.")
+
+        return filtered_products
+
+    def _fetch_quote_volume_by_symbol(self) -> Dict[str, float]:
+        """Fetch Binance 24h quote volumes for liquidity-first universe ordering."""
+
+        request = Request(
+            self.api_ticker_24hr_url,
+            headers={"User-Agent": "crypto-signal-ml/0.1", "Accept": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return {}
+
+        if not isinstance(response_payload, list):
+            return {}
+
+        quote_volume_by_symbol: Dict[str, float] = {}
+        for ticker_row in response_payload:
+            if not isinstance(ticker_row, dict):
+                continue
+            symbol = str(ticker_row.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            try:
+                quote_volume_by_symbol[symbol] = float(ticker_row.get("quoteVolume") or 0.0)
+            except (TypeError, ValueError):
+                quote_volume_by_symbol[symbol] = 0.0
+        return quote_volume_by_symbol
+
+    def get_available_products(self) -> List[Dict[str, str]]:
+        self._validate_download_settings()
+        return self._resolve_products_to_download()
+
+    def get_total_batches(self) -> int:
+        available_products = self.get_available_products()
+        if self.product_batch_size is None:
+            return 1
+        return max(1, math.ceil(len(available_products) / self.product_batch_size))
+
+    def _slice_products_for_batch(
+        self,
+        selected_products: List[Dict[str, str]],
+    ) -> tuple[List[Dict[str, str]], Dict[str, int]]:
+        if self.product_batch_size is None:
+            return selected_products, {
+                "batchSize": len(selected_products),
+                "batchNumber": 1,
+                "batchStartIndex": 1,
+                "batchEndIndex": len(selected_products),
+            }
+        total_products = len(selected_products)
+        total_batches = max(1, math.ceil(total_products / self.product_batch_size))
+        if self.product_batch_number > total_batches:
+            raise ValueError(
+                "Requested Binance product batch is out of range. "
+                f"Requested batch {self.product_batch_number}, available batches {total_batches}."
+            )
+        batch_start_index = (self.product_batch_number - 1) * self.product_batch_size
+        batch_end_index = min(batch_start_index + self.product_batch_size, total_products)
+        return selected_products[batch_start_index:batch_end_index], {
+            "batchSize": batch_end_index - batch_start_index,
+            "batchNumber": self.product_batch_number,
+            "batchStartIndex": batch_start_index + 1,
+            "batchEndIndex": batch_end_index,
+        }
+
+    def _resolve_months_to_download(self) -> List[str]:
+        candles_per_31_day_month = max(1, int((31 * 24 * 3600) / self.granularity_seconds))
+        month_count = max(
+            1,
+            min(
+                int(self.archive_lookback_months),
+                math.ceil(self.total_candles / candles_per_31_day_month) + 18,
+            ),
+        )
+        current_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        months = []
+        cursor = current_month
+        for _ in range(month_count):
+            months.append(cursor.strftime("%Y-%m"))
+            cursor = (cursor - timedelta(days=1)).replace(day=1)
+        return months
+
+    def _request_month_rows(self, product_details: Dict[str, str], year_month: str) -> List[Dict[str, object]]:
+        exchange_symbol = product_details["exchange_symbol"]
+        request_url = (
+            f"{self.api_base_url}/{exchange_symbol}/{self.interval}/"
+            f"{exchange_symbol}-{self.interval}-{year_month}.zip"
+        )
+        request = Request(request_url, headers={"User-Agent": "crypto-signal-ml/0.1"})
+        try:
+            with urlopen(request, timeout=60) as response:
+                zip_payload = response.read()
+        except HTTPError as error:
+            if error.code == 404:
+                self._log_progress(f"Missing Binance archive: {exchange_symbol} {self.interval} {year_month}")
+                return []
+            raise
+
+        with ZipFile(io.BytesIO(zip_payload)) as archive:
+            csv_names = [name for name in archive.namelist() if name.endswith(".csv")]
+            if not csv_names:
+                return []
+            with archive.open(csv_names[0]) as csv_file:
+                decoded_file = io.TextIOWrapper(csv_file, encoding="utf-8")
+                normalized_rows = []
+                for row in csv.reader(decoded_file):
+                    if len(row) < 6 or row[0].lower().startswith("open"):
+                        continue
+                    normalized_row = self._normalize_kline_row(product_details, row)
+                    if normalized_row is not None:
+                        normalized_rows.append(normalized_row)
+                return normalized_rows
+
+    def _normalize_kline_row(self, product_details: Dict[str, str], row: Sequence[str]) -> Dict[str, object] | None:
+        open_time_ms, open_price, high_price, low_price, close_price, volume = row[:6]
+        try:
+            timestamp_epoch = self._normalize_binance_timestamp(float(open_time_ms))
+            open_value = float(open_price)
+            high_value = float(high_price)
+            low_value = float(low_price)
+            close_value = float(close_price)
+            volume_value = float(volume)
+        except (TypeError, ValueError, OSError):
+            return None
+
+        return {
+            "timestamp": datetime.fromtimestamp(timestamp_epoch, tz=timezone.utc),
+            "open": open_value,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "volume": volume_value,
+            "product_id": product_details["product_id"],
+            "base_currency": product_details["base_currency"],
+            "quote_currency": product_details["quote_currency"],
+            "granularity_seconds": self.granularity_seconds,
+            "source": self.api_name,
+        }
+
+    @staticmethod
+    def _normalize_binance_timestamp(raw_timestamp: float) -> float:
+        """Normalize Binance timestamps that may arrive as seconds, ms, us, or ns."""
+
+        if raw_timestamp >= 1e17:
+            return raw_timestamp / 1_000_000_000.0
+        if raw_timestamp >= 1e14:
+            return raw_timestamp / 1_000_000.0
+        if raw_timestamp >= 1e11:
+            return raw_timestamp / 1_000.0
+        return raw_timestamp
+
+    def _maybe_save_partial_progress(self, all_candle_rows: Sequence[Dict[str, object]], completed_products: int) -> None:
+        if not self.should_save_downloaded_data or self.save_progress_every_products == 0:
+            return
+        if completed_products % self.save_progress_every_products != 0:
+            return
+        self._save_partial_download(self._build_price_frame(all_candle_rows))
+
+    def _merge_existing_rows(self, price_df: pd.DataFrame) -> pd.DataFrame:
+        final_df = price_df.copy()
+        final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], errors="coerce", utc=True)
+        if self.data_path.exists():
+            existing_df = pd.read_csv(self.data_path)
+            existing_df["timestamp"] = pd.to_datetime(existing_df["timestamp"], errors="coerce", utc=True)
+            final_df = pd.concat([existing_df, final_df], ignore_index=True)
+            final_df = final_df.drop_duplicates(subset=["timestamp", "product_id"], keep="last")
+        return self._sort_rows(final_df)
+
+    def _build_price_frame(self, normalized_rows: Sequence[Dict[str, object]]) -> pd.DataFrame:
+        price_df = pd.DataFrame(normalized_rows)
+        price_df = price_df.drop_duplicates(subset=["product_id", "timestamp"])
+        return price_df.sort_values(["timestamp", "product_id"]).reset_index(drop=True)
+
+    def _split_product_id(self, product_id: str) -> tuple[str, str]:
+        normalized_product_id = str(product_id).strip().upper()
+        if "-" in normalized_product_id:
+            base_currency, quote_currency = normalized_product_id.split("-", 1)
+        else:
+            base_currency, quote_currency = normalized_product_id, self.quote_currency
+        return normalize_base_currency(base_currency), quote_currency.upper()
+
+    def _log_progress(self, message: str) -> None:
+        if self.log_progress:
+            print(message)
+
+
 def create_market_data_loader(
     config: TrainingConfig,
     data_path: Path | None = None,
@@ -3245,9 +3882,98 @@ def create_market_data_loader(
             log_progress=log_progress if log_progress is not None else config.coinbase_log_progress,
         )
 
+    if market_data_source == "kraken":
+        return KrakenOhlcPriceDataLoader(
+            data_path=data_path or config.data_file,
+            product_id=product_id if product_id is not None else config.kraken_product_id,
+            product_ids=tuple(product_ids) if product_ids is not None else config.kraken_product_ids,
+            quote_currency=config.kraken_quote_currency,
+            product_batch_size=(
+                product_batch_size
+                if product_batch_size is not None
+                else config.kraken_product_batch_size
+            ),
+            product_batch_number=(
+                int(product_batch_number)
+                if product_batch_number is not None
+                else int(config.kraken_product_batch_number)
+            ),
+            granularity_seconds=int(
+                granularity_seconds
+                if granularity_seconds is not None
+                else config.kraken_granularity_seconds
+            ),
+            total_candles=int(
+                total_candles
+                if total_candles is not None
+                else config.kraken_total_candles
+            ),
+            request_pause_seconds=(
+                request_pause_seconds
+                if request_pause_seconds is not None
+                else config.kraken_request_pause_seconds
+            ),
+            should_save_downloaded_data=should_save_downloaded_data,
+            save_progress_every_products=(
+                int(save_progress_every_products)
+                if save_progress_every_products is not None
+                else int(config.kraken_save_progress_every_products)
+            ),
+            log_progress=log_progress if log_progress is not None else config.kraken_log_progress,
+        )
+
+    if market_data_source == "binancePublicData":
+        return BinancePublicDataPriceDataLoader(
+            data_path=data_path or config.data_file,
+            product_id=product_id if product_id is not None else config.binance_product_id,
+            product_ids=tuple(product_ids) if product_ids is not None else config.binance_product_ids,
+            fetch_all_quote_products=(
+                fetch_all_quote_products
+                if fetch_all_quote_products is not None
+                else config.binance_fetch_all_quote_products
+            ),
+            quote_currency=config.binance_quote_currency,
+            excluded_base_currencies=config.binance_excluded_base_currencies,
+            max_products=max_products if max_products is not None else config.binance_max_products,
+            interval=config.binance_interval,
+            product_batch_size=(
+                product_batch_size
+                if product_batch_size is not None
+                else config.binance_product_batch_size
+            ),
+            product_batch_number=(
+                int(product_batch_number)
+                if product_batch_number is not None
+                else int(config.binance_product_batch_number)
+            ),
+            granularity_seconds=int(
+                granularity_seconds
+                if granularity_seconds is not None
+                else config.binance_granularity_seconds
+            ),
+            total_candles=int(
+                total_candles
+                if total_candles is not None
+                else config.binance_total_candles
+            ),
+            archive_lookback_months=int(config.binance_archive_lookback_months),
+            request_pause_seconds=(
+                request_pause_seconds
+                if request_pause_seconds is not None
+                else config.binance_request_pause_seconds
+            ),
+            should_save_downloaded_data=should_save_downloaded_data,
+            save_progress_every_products=(
+                int(save_progress_every_products)
+                if save_progress_every_products is not None
+                else int(config.binance_save_progress_every_products)
+            ),
+            log_progress=log_progress if log_progress is not None else config.binance_log_progress,
+        )
+
     raise ValueError(
         "Unsupported market_data_source. "
-        "Currently supported: coinmarketcap, coinmarketcapLatestQuotes, coinbaseExchange"
+        "Currently supported: coinmarketcap, coinmarketcapLatestQuotes, coinbaseExchange, kraken, binancePublicData"
     )
 
 

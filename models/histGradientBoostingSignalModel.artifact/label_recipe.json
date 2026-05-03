@@ -1,0 +1,13 @@
+{
+  "version": "atr-triple-barrier-v1",
+  "strategy": "triple_barrier",
+  "prediction_horizon": 2,
+  "buy_threshold": 0.01,
+  "sell_threshold": -0.015,
+  "use_high_low": true,
+  "tie_break": "stop_loss",
+  "use_atr_barriers": true,
+  "atr_period": 14,
+  "buy_atr_multiplier": 1.25,
+  "sell_atr_multiplier": 1.0
+}

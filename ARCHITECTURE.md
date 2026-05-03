@@ -18,8 +18,10 @@ This service is still a trading engine first. The refactor in this repository do
   HTTP/service layer and long-running runtime process.
 - `src/crypto_signal_ml/data.py`, `src/crypto_signal_ml/features.py`, `src/crypto_signal_ml/labels.py`, `src/crypto_signal_ml/modeling.py`, `src/crypto_signal_ml/regime_modeling.py`, `src/crypto_signal_ml/pipeline.py`, `src/crypto_signal_ml/regimes.py`
   ML pipeline and market-data preparation modules.
+- `src/crypto_signal_ml/portfolio_core/`
+  Canonical portfolio-planning layer for trader-brain decisions, market stance, and action mapping.
 - `src/crypto_signal_ml/trading/`
-  Trading domain logic for policies, signal shaping, portfolio state, signal persistence, and trader-brain planning.
+  Trading domain logic for policies, signal shaping, portfolio state, signal persistence, and compatibility planner surfaces.
 - `src/crypto_signal_ml/storage/`
   Shared database adapter layer for SQLite/PostgreSQL-backed stores.
 - `src/crypto_signal_ml/chat/`, `src/crypto_signal_ml/retrieval/`

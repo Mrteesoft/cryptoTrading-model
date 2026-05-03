@@ -7,7 +7,10 @@ from typing import Any, Mapping
 import pandas as pd
 
 from ..config import TrainingConfig
-from ..labels import signal_to_text
+from ..labels_core import signal_to_text
+from ..signal_generation.candidate_generation import build_raw_signal_candidate
+from ..signal_generation.chart_confirmation import apply_chart_confirmation
+from ..signal_generation.risk_gate import apply_risk_gate
 
 
 ACTIONABLE_SIGNAL_NAMES = {"BUY", "TAKE_PROFIT"}
@@ -85,144 +88,59 @@ def evaluate_trading_decision(
     """Turn a raw model output into a risk-aware trading decision."""
 
     config = config or TrainingConfig()
-    raw_signal_name = _resolve_raw_signal_name(signal_row)
-    raw_predicted_signal = _safe_int(signal_row, "predicted_signal")
-    confidence = _safe_float(signal_row, "confidence")
-    minimum_action_confidence = max(float(minimum_action_confidence or 0.0), 0.0)
-    primary_probability, probability_margin, has_probability_columns = _resolve_probability_margin(
-        signal_row,
-        raw_signal_name,
+    market_state = signal_row.get("marketState") if isinstance(signal_row.get("marketState"), Mapping) else {
+        "label": str(signal_row.get("market_regime_label", "unknown")).strip().lower(),
+        "isHighVolatility": bool(_safe_int(signal_row, "regime_is_high_volatility")),
+    }
+    event_context = signal_row.get("eventContext") if isinstance(signal_row.get("eventContext"), Mapping) else {
+        "hasEventNext7d": bool(_safe_int(signal_row, "cmcal_has_event_next_7d")),
+    }
+    raw_candidate = build_raw_signal_candidate(
+        signal_row=signal_row,
+        minimum_action_confidence=minimum_action_confidence,
+        setup_score=_safe_float(signal_row, "setupScore"),
+        symbol=str(signal_row.get("symbol") or signal_row.get("base_currency") or "").strip().upper(),
+        pair_symbol=str(signal_row.get("product_id") or signal_row.get("pairSymbol") or "").strip().upper(),
+        base_currency=str(signal_row.get("base_currency") or signal_row.get("baseCurrency") or "").strip().upper() or None,
+        quote_currency=str(signal_row.get("quote_currency") or signal_row.get("quoteCurrency") or "").strip().upper() or None,
+        chart_context=dict(signal_row.get("chartContext") or {}) if isinstance(signal_row.get("chartContext"), Mapping) else {},
+        execution_context=dict(signal_row.get("executionContext") or {}) if isinstance(signal_row.get("executionContext"), Mapping) else {},
+        market_context=dict(signal_row.get("marketContext") or {}) if isinstance(signal_row.get("marketContext"), Mapping) else {},
+        market_state=dict(market_state),
+        event_context=dict(event_context),
     )
-    market_regime_label = str(signal_row.get("market_regime_label", "unknown")).strip().lower()
-    is_high_volatility = bool(_safe_int(signal_row, "regime_is_high_volatility"))
-    has_event_next_7d = bool(_safe_int(signal_row, "cmcal_has_event_next_7d"))
-
-    confidence_gate_applied = (
-        raw_signal_name in ACTIONABLE_SIGNAL_NAMES
-        and confidence < minimum_action_confidence
-    )
-    required_action_confidence = minimum_action_confidence
-    gate_reasons: list[str] = []
-    policy_notes: list[str] = []
-
-    if config.decision_policy_enabled and raw_signal_name in ACTIONABLE_SIGNAL_NAMES:
-        if has_probability_columns and probability_margin < float(config.decision_min_probability_margin):
-            gate_reasons.append(
-                f"Probability edge over the runner-up class is only {probability_margin:.1%}, "
-                "which is too thin for a fresh action."
-            )
-
-        if raw_signal_name == "BUY":
-            if (
-                config.decision_block_downtrend_buys
-                and market_regime_label in {"trend_down", "trend_down_high_volatility"}
-            ):
-                gate_reasons.append(
-                    "Fresh spot buys are blocked while the detected regime is still in a downtrend."
-                )
-
-            if market_regime_label in {"trend_up", "trend_up_high_volatility"}:
-                policy_notes.append("Trend regime is aligned with the long setup.")
-
-            if is_high_volatility:
-                required_action_confidence = max(
-                    required_action_confidence,
-                    minimum_action_confidence + float(config.decision_high_volatility_confidence_buffer),
-                )
-                policy_notes.append(
-                    f"High volatility raises the required confidence to {required_action_confidence:.1%}."
-                )
-
-            if has_event_next_7d:
-                required_action_confidence = max(
-                    required_action_confidence,
-                    minimum_action_confidence + float(config.decision_event_risk_confidence_buffer),
-                )
-                policy_notes.append(
-                    f"Upcoming event risk raises the required confidence to {required_action_confidence:.1%}."
-                )
-
-            if confidence >= minimum_action_confidence and confidence < required_action_confidence:
-                gate_reasons.append(
-                    f"Confidence is {confidence:.1%}, below the risk-adjusted entry bar of "
-                    f"{required_action_confidence:.1%}."
-                )
-
-        elif raw_signal_name == "TAKE_PROFIT":
-            if market_regime_label in {"trend_down", "trend_down_high_volatility"}:
-                policy_notes.append("Downtrend regime supports reducing spot exposure.")
-            if is_high_volatility:
-                policy_notes.append("High volatility supports taking risk off faster.")
-
-    risk_gate_applied = bool(gate_reasons)
-    final_signal_name = (
-        "HOLD"
-        if confidence_gate_applied or risk_gate_applied
-        else raw_signal_name
-    )
-    final_predicted_signal = {
-        "TAKE_PROFIT": -1,
-        "HOLD": 0,
-        "BUY": 1,
-    }[final_signal_name]
-    spot_action = {
-        "TAKE_PROFIT": "take_profit",
-        "HOLD": "wait",
-        "BUY": "buy",
-    }[final_signal_name]
-
-    policy_score = confidence + probability_margin
-    if raw_signal_name == "BUY":
-        if market_regime_label in {"trend_up", "trend_up_high_volatility"}:
-            policy_score += 0.10
-        if market_regime_label in {"trend_down", "trend_down_high_volatility"}:
-            policy_score -= 0.15
-        if is_high_volatility:
-            policy_score -= 0.05
-        if has_event_next_7d:
-            policy_score -= 0.03
-    elif raw_signal_name == "TAKE_PROFIT":
-        if market_regime_label in {"trend_down", "trend_down_high_volatility"}:
-            policy_score += 0.05
-        if is_high_volatility:
-            policy_score += 0.03
-
-    if final_signal_name != raw_signal_name:
-        policy_score -= 0.25
-
-    if final_signal_name not in ACTIONABLE_SIGNAL_NAMES:
-        trade_readiness = (
-            "blocked"
-            if raw_signal_name in ACTIONABLE_SIGNAL_NAMES and (confidence_gate_applied or risk_gate_applied)
-            else "standby"
-        )
-    elif (
-        confidence >= (required_action_confidence + 0.10)
-        and probability_margin >= (float(config.decision_min_probability_margin) + 0.05)
-        and not is_high_volatility
-    ):
-        trade_readiness = "high"
-    else:
-        trade_readiness = "medium"
+    chart_confirmed_candidate = apply_chart_confirmation(raw_candidate, config=config)
+    gated_candidate = apply_risk_gate(chart_confirmed_candidate, config=config)
 
     return {
-        "signalName": final_signal_name,
-        "predictedSignal": final_predicted_signal,
-        "spotAction": spot_action,
-        "actionable": final_signal_name in ACTIONABLE_SIGNAL_NAMES,
-        "modelSignalName": raw_signal_name,
-        "modelPredictedSignal": raw_predicted_signal,
-        "confidence": confidence,
-        "primaryProbability": primary_probability,
-        "hasProbabilityColumns": has_probability_columns,
-        "probabilityColumn": _resolve_probability_column(raw_signal_name),
-        "probabilityMargin": probability_margin,
-        "minimumActionConfidence": minimum_action_confidence,
-        "requiredActionConfidence": required_action_confidence,
-        "confidenceGateApplied": confidence_gate_applied,
-        "riskGateApplied": risk_gate_applied,
-        "tradeReadiness": trade_readiness,
-        "policyScore": float(policy_score),
-        "policyNotes": policy_notes,
-        "gateReasons": gate_reasons,
+        "signalName": gated_candidate.signalName,
+        "predictedSignal": gated_candidate.predictedSignal,
+        "spotAction": gated_candidate.spotAction,
+        "actionable": gated_candidate.actionable,
+        "modelSignalName": gated_candidate.rawSignalName,
+        "modelPredictedSignal": gated_candidate.rawPredictedSignal,
+        "confidence": float(gated_candidate.calibratedConfidence),
+        "rawConfidence": float(gated_candidate.rawConfidence),
+        "primaryProbability": float(gated_candidate.primaryProbability),
+        "hasProbabilityColumns": gated_candidate.hasProbabilityColumns,
+        "probabilityColumn": _resolve_probability_column(gated_candidate.rawSignalName),
+        "probabilityMargin": float(gated_candidate.probabilityMargin),
+        "minimumActionConfidence": float(gated_candidate.minimumActionConfidence),
+        "requiredActionConfidence": float(gated_candidate.requiredActionConfidence),
+        "confidenceGateApplied": gated_candidate.confidenceGateApplied,
+        "riskGateApplied": gated_candidate.riskGateApplied,
+        "tradeReadiness": str(gated_candidate.tradeReadiness),
+        "policyScore": float(gated_candidate.policyScore),
+        "policyNotes": list(gated_candidate.policyNotes),
+        "gateReasons": list(gated_candidate.gateReasons),
+        "ledger": gated_candidate.ledger.to_dict(),
+        "rawProbabilities": dict(gated_candidate.rawProbabilities),
+        "calibratedProbabilities": dict(gated_candidate.calibratedProbabilities),
+        "chartConfirmationScore": float(gated_candidate.chartConfirmationScore),
+        "chartSetupType": str(gated_candidate.chartSetupType),
+        "chartConfirmationStatus": str(gated_candidate.chartConfirmationStatus),
+        "chartConfirmationNotes": list(gated_candidate.chartConfirmationNotes),
+        "chartPatternLabel": str(gated_candidate.chartPatternLabel),
+        "chartPatternReasons": list(gated_candidate.chartPatternReasons),
+        "chartDecision": str(gated_candidate.chartDecision),
     }

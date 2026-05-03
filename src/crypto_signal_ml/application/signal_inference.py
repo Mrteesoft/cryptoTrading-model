@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Sequence
 
 import pandas as pd
 
 from ..config import TrainingConfig
-from ..trading.signals import build_latest_signal_summaries
+from ..signal_generation.summaries import build_latest_signal_summaries
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,6 +29,44 @@ class SignalInferenceStage:
 
     def __init__(self, config: TrainingConfig) -> None:
         self.config = config
+
+    def _log_signal_candidates(
+        self,
+        signal_candidates: list[dict[str, Any]],
+        summary: dict[str, Any],
+    ) -> None:
+        """Write compact per-symbol inference output to the console."""
+
+        if not bool(getattr(self.config, "signal_log_symbol_details", True)):
+            return
+
+        max_logged_symbols = max(int(getattr(self.config, "signal_log_symbol_limit", 25) or 0), 0)
+        logged_candidates = signal_candidates if max_logged_symbols == 0 else signal_candidates[:max_logged_symbols]
+
+        LOGGER.info(
+            "Candidates | mode=%s | rows=%s | products=%s | requested=%s | kept=%s",
+            summary.get("mode", "unknown"),
+            int(summary.get("rowsScored", 0) or 0),
+            int(summary.get("productsScored", len(signal_candidates)) or 0),
+            int(summary.get("productsRequested", 0) or 0),
+            len(signal_candidates),
+        )
+        for signal_candidate in logged_candidates:
+            LOGGER.info(
+                "%s | public=%s | model=%s | chart=%s | pattern=%s | action=%s | conf=%.2f | ready=%s",
+                str(signal_candidate.get("productId", "")).strip().upper() or "UNKNOWN",
+                str(signal_candidate.get("signal_name", "HOLD")).strip().upper(),
+                str(signal_candidate.get("modelSignalName", "HOLD")).strip().upper(),
+                str(signal_candidate.get("chartDecision", signal_candidate.get("chartConfirmationStatus", "early"))).strip().lower(),
+                str(signal_candidate.get("chartPatternLabel", signal_candidate.get("chartSetupType", "no_clean_setup"))).strip().lower(),
+                str(signal_candidate.get("spotAction", "wait")).strip().lower(),
+                float(signal_candidate.get("confidence", 0.0) or 0.0),
+                str(signal_candidate.get("tradeReadiness", "standby")).strip().lower(),
+            )
+
+        remaining_symbols = len(signal_candidates) - len(logged_candidates)
+        if remaining_symbols > 0:
+            LOGGER.info("... %s more symbol(s) not shown", remaining_symbols)
 
     @staticmethod
     def combine_prediction_frames(prediction_frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
@@ -62,6 +104,7 @@ class SignalInferenceStage:
         raise_on_empty: bool = True,
         empty_message: str | None = None,
         protected_product_ids: Sequence[str] | None = None,
+        log_candidates: bool = True,
     ) -> SignalInferenceArtifacts:
         """Build one inference artifact bundle from a prediction frame."""
 
@@ -96,6 +139,9 @@ class SignalInferenceStage:
             summary = dict(summary)
             summary.setdefault("mode", mode)
             summary.setdefault("warning", warning)
+
+        if log_candidates:
+            self._log_signal_candidates(signal_candidates, summary)
 
         return SignalInferenceArtifacts(
             prediction_df=prediction_df,

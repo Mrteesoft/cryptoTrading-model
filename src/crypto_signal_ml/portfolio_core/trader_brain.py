@@ -1,0 +1,1170 @@
+"""Canonical portfolio-core owner of trader-brain planning."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Mapping, Sequence
+
+from ..config import TrainingConfig
+from ..trading.decision_intelligence import TradingDecisionDeliberator
+from ..trading.signal_quality import build_signal_quality_context
+from ..trading.watchlist_state import WatchlistStateStore
+from .chart_confirmation import review_chart_confirmation
+from .market_stance import DOWNTREND_LABELS, UPTREND_LABELS, build_market_context
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    """Clamp one numeric value between an inclusive minimum and maximum."""
+
+    return max(min(float(value), maximum), minimum)
+
+
+def _safe_float(payload: Mapping[str, Any], key: str, default_value: float = 0.0) -> float:
+    """Read a numeric field from a mapping without raising."""
+
+    raw_value = payload.get(key, default_value)
+    if raw_value is None:
+        return default_value
+
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return default_value
+
+
+def _safe_bool(payload: Mapping[str, Any], key: str, default_value: bool = False) -> bool:
+    """Read a boolean-like field from a mapping without raising."""
+
+    raw_value = payload.get(key, default_value)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if raw_value is None:
+        return default_value
+
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_iso_timestamp(timestamp_value: Any) -> datetime | None:
+    """Parse one optional ISO timestamp into a timezone-aware datetime."""
+
+    if timestamp_value in {None, ""}:
+        return None
+
+    normalized_value = str(timestamp_value).replace("Z", "+00:00")
+    try:
+        parsed_value = datetime.fromisoformat(normalized_value)
+    except ValueError:
+        return None
+
+    if parsed_value.tzinfo is None:
+        return parsed_value.replace(tzinfo=timezone.utc)
+
+    return parsed_value.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class PositionState:
+    """Simple spot-position state used by the trader brain."""
+
+    product_id: str
+    quantity: float = 0.0
+    entry_price: float | None = None
+    current_price: float | None = None
+    position_fraction: float = 0.0
+    age_hours: float | None = None
+
+    def unrealized_return(self) -> float | None:
+        """Return the current unrealized return when both prices exist."""
+
+        if self.entry_price is not None and self.current_price is not None and self.entry_price > 0:
+            return (self.current_price / self.entry_price) - 1.0
+
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the normalized position into a JSON-friendly dictionary."""
+
+        return {
+            "productId": self.product_id,
+            "quantity": float(self.quantity),
+            "entryPrice": float(self.entry_price) if self.entry_price is not None else None,
+            "currentPrice": float(self.current_price) if self.current_price is not None else None,
+            "positionFraction": float(self.position_fraction),
+            "ageHours": float(self.age_hours) if self.age_hours is not None else None,
+            "unrealizedReturn": self.unrealized_return(),
+        }
+
+
+class TraderBrain:
+    """Build a portfolio-minded action plan from ranked signal summaries."""
+
+    def __init__(self, config: TrainingConfig | None = None) -> None:
+        self.config = config or TrainingConfig()
+        self.deliberator = TradingDecisionDeliberator(config=self.config)
+
+    def build_plan(
+        self,
+        signal_summaries: Sequence[Dict[str, Any]],
+        positions: Sequence[Mapping[str, Any]] | None = None,
+        capital: float | None = None,
+        trade_memory_by_product: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        """Return enriched signals plus a portfolio action plan."""
+
+        copied_signals = [dict(signal_summary) for signal_summary in signal_summaries]
+        if not copied_signals:
+            return {
+                "version": "trader-brain-v1",
+                "generatedAt": datetime.now(timezone.utc).isoformat(),
+                "enabled": bool(self.config.brain_enabled),
+                "marketStance": "balanced",
+                "summary": "No signals were available for the trader brain.",
+                "portfolio": {
+                    "capital": capital,
+                    "openPositions": [],
+                    "openPositionCount": 0,
+                    "currentExposureFraction": 0.0,
+                    "remainingRiskBudgetFraction": float(self.config.brain_max_portfolio_risk_fraction),
+                    "maxPortfolioRiskFraction": float(self.config.brain_max_portfolio_risk_fraction),
+                    "maxEntryPositions": int(self.config.brain_max_entry_positions),
+                    "availableEntrySlots": int(self.config.brain_max_entry_positions),
+                },
+                "plan": {
+                    "entries": [],
+                    "addOns": [],
+                    "reductions": [],
+                    "exits": [],
+                    "holds": [],
+                    "watchlist": [],
+                    "newEntryCount": 0,
+                    "addOnCount": 0,
+                    "reduceCount": 0,
+                    "exitCount": 0,
+                    "watchlistCount": 0,
+                },
+                "watchlistPromotion": {},
+                "signals": copied_signals,
+            }
+
+        positions_by_product = self._normalize_positions(
+            positions=positions or [],
+            signals=copied_signals,
+            capital=capital,
+        )
+        market_context = build_market_context(copied_signals)
+        open_position_rows = list(positions_by_product.values())
+        current_exposure_fraction = sum(position.position_fraction for position in open_position_rows)
+        remaining_risk_budget_fraction = max(
+            float(self.config.brain_max_portfolio_risk_fraction) - current_exposure_fraction,
+            0.0,
+        )
+        available_entry_slots = max(
+            int(self.config.brain_max_entry_positions) - len(open_position_rows),
+            0,
+        )
+
+        preliminary_rows = []
+        new_entry_candidates = []
+        add_on_candidates = []
+        reductions = []
+        exits = []
+        holds = []
+
+        watchlist_store = WatchlistStateStore(self.config)
+        for signal_summary in copied_signals:
+            preliminary_row = self._build_preliminary_signal_plan(
+                signal_summary=signal_summary,
+                position=positions_by_product.get(str(signal_summary.get("productId", "")).upper()),
+                market_context=market_context,
+                capital=capital,
+                trade_memory=(
+                    (trade_memory_by_product or {}).get(str(signal_summary.get("productId", "")).upper())
+                    or {}
+                ),
+                watchlist_store=watchlist_store,
+            )
+            preliminary_rows.append(preliminary_row)
+
+            proposed_decision = preliminary_row["brain"]["proposedDecision"]
+            if proposed_decision == "enter_long_candidate":
+                new_entry_candidates.append(preliminary_row)
+            elif proposed_decision == "add_to_winner_candidate":
+                add_on_candidates.append(preliminary_row)
+            elif proposed_decision == "reduce_position":
+                reductions.append(preliminary_row)
+            elif proposed_decision == "exit_position":
+                exits.append(preliminary_row)
+            elif proposed_decision.startswith("hold"):
+                holds.append(preliminary_row)
+
+        selected_entries = sorted(
+            new_entry_candidates,
+            key=lambda row: (
+                -float(row["brain"]["decisionScore"]),
+                str(row.get("productId", "")),
+            ),
+        )[:available_entry_slots]
+        selected_add_ons = sorted(
+            add_on_candidates,
+            key=lambda row: (
+                -float(row["brain"]["decisionScore"]),
+                str(row.get("productId", "")),
+            ),
+        )
+
+        scaled_allocations = self._allocate_exposure(
+            exposure_candidates=selected_entries + selected_add_ons,
+            remaining_risk_budget_fraction=remaining_risk_budget_fraction,
+            capital=capital,
+        )
+
+        entries = []
+        add_ons = []
+        finalized_signals = []
+
+        for preliminary_row in preliminary_rows:
+            enriched_signal = dict(preliminary_row)
+            product_id = str(enriched_signal.get("productId", "")).upper()
+            brain = dict(enriched_signal["brain"])
+
+            if product_id in scaled_allocations:
+                allocation_row = scaled_allocations[product_id]
+                brain["decision"] = allocation_row["decision"]
+                brain["allocationFraction"] = allocation_row["allocationFraction"]
+                brain["capitalAllocation"] = allocation_row["capitalAllocation"]
+                brain["reasonSummary"] = allocation_row["reasonSummary"]
+                brain["planRank"] = allocation_row["planRank"]
+                brain["summaryLine"] = allocation_row["summaryLine"]
+                if allocation_row["decision"] == "enter_long":
+                    entries.append(allocation_row)
+                else:
+                    add_ons.append(allocation_row)
+            else:
+                proposed_decision = str(brain["proposedDecision"])
+                if proposed_decision == "enter_long_candidate":
+                    brain["decision"] = "watchlist"
+                    brain["allocationFraction"] = 0.0
+                    brain["capitalAllocation"] = 0.0 if capital is not None else None
+                    brain["summaryLine"] = (
+                        "Entry candidate stayed on the watchlist because the current plan ran out of slots or risk budget."
+                    )
+                elif proposed_decision == "add_to_winner_candidate":
+                    brain["decision"] = "hold_position"
+                    brain["allocationFraction"] = 0.0
+                    brain["capitalAllocation"] = 0.0 if capital is not None else None
+                    brain["summaryLine"] = (
+                        "Existing position remains a hold because the current plan reserved no extra risk budget for adding."
+                    )
+
+            enriched_signal["brain"] = brain
+            finalized_signals.append(enriched_signal)
+
+        plan_summary = {
+            "entries": entries,
+            "addOns": add_ons,
+            "reductions": [row["brain"] for row in reductions],
+            "exits": [row["brain"] for row in exits],
+            "holds": [row["brain"] for row in holds],
+            "watchlist": [
+                row["brain"]
+                for row in finalized_signals
+                if row["brain"]["decision"] in {"watchlist", "avoid_long"}
+            ],
+            "newEntryCount": len(entries),
+            "addOnCount": len(add_ons),
+            "reduceCount": len(reductions),
+            "exitCount": len(exits),
+            "watchlistCount": int(
+                sum(
+                    row["brain"]["decision"] in {"watchlist", "avoid_long"}
+                    for row in finalized_signals
+                )
+            ),
+        }
+
+        watchlist_store.save()
+        watchlist_promotion_summary = watchlist_store.last_cycle_summary()
+
+        return {
+            "version": "trader-brain-v1",
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "enabled": bool(self.config.brain_enabled),
+            "marketStance": market_context["marketStance"],
+            "summary": self._build_summary_text(
+                market_context=market_context,
+                entries=entries,
+                add_ons=add_ons,
+                reductions=reductions,
+                exits=exits,
+            ),
+            "portfolio": {
+                "capital": float(capital) if capital is not None else None,
+                "openPositions": [position.to_dict() for position in open_position_rows],
+                "openPositionCount": len(open_position_rows),
+                "currentExposureFraction": float(current_exposure_fraction),
+                "remainingRiskBudgetFraction": float(remaining_risk_budget_fraction),
+                "maxPortfolioRiskFraction": float(self.config.brain_max_portfolio_risk_fraction),
+                "maxEntryPositions": int(self.config.brain_max_entry_positions),
+                "availableEntrySlots": int(available_entry_slots),
+            },
+            "plan": plan_summary,
+            "watchlistPromotion": watchlist_promotion_summary,
+            "signals": finalized_signals,
+        }
+
+    def _normalize_positions(
+        self,
+        positions: Sequence[Mapping[str, Any]],
+        signals: Sequence[Dict[str, Any]],
+        capital: float | None,
+    ) -> dict[str, PositionState]:
+        """Normalize optional user positions into a product-keyed dictionary."""
+
+        signal_lookup = {
+            str(signal_summary.get("productId", "")).upper(): signal_summary
+            for signal_summary in signals
+            if signal_summary.get("productId")
+        }
+        normalized_positions: dict[str, PositionState] = {}
+
+        for raw_position in positions:
+            product_id = str(
+                raw_position.get("productId")
+                or raw_position.get("product_id")
+                or ""
+            ).strip().upper()
+            if not product_id:
+                continue
+
+            reference_signal = signal_lookup.get(product_id, {})
+            current_price = _safe_float(raw_position, "currentPrice", default_value=0.0) or _safe_float(
+                raw_position,
+                "current_price",
+                default_value=0.0,
+            )
+            if current_price <= 0:
+                current_price = _safe_float(reference_signal, "close", default_value=0.0)
+
+            quantity = _safe_float(raw_position, "quantity")
+            entry_price = _safe_float(raw_position, "entryPrice", default_value=0.0) or _safe_float(
+                raw_position,
+                "entry_price",
+                default_value=0.0,
+            )
+            position_fraction = _safe_float(raw_position, "positionFraction", default_value=0.0) or _safe_float(
+                raw_position,
+                "position_fraction",
+                default_value=0.0,
+            )
+            if position_fraction <= 0 and capital and capital > 0 and quantity > 0 and current_price > 0:
+                position_fraction = (quantity * current_price) / capital
+
+            if not (position_fraction > 0 or quantity > 0):
+                continue
+
+            age_hours = None
+            raw_age_hours = raw_position.get("ageHours", raw_position.get("age_hours"))
+            if raw_age_hours not in {None, ""}:
+                try:
+                    age_hours = float(raw_age_hours)
+                except (TypeError, ValueError):
+                    age_hours = None
+            if age_hours is None:
+                opened_at = raw_position.get("openedAt", raw_position.get("opened_at"))
+                opened_timestamp = _parse_iso_timestamp(opened_at)
+                if opened_timestamp is not None:
+                    age_hours = max(
+                        (datetime.now(timezone.utc) - opened_timestamp).total_seconds() / 3600,
+                        0.0,
+                    )
+
+            normalized_positions[product_id] = PositionState(
+                product_id=product_id,
+                quantity=quantity,
+                entry_price=entry_price if entry_price > 0 else None,
+                current_price=current_price if current_price > 0 else None,
+                position_fraction=max(position_fraction, 0.0),
+                age_hours=age_hours,
+            )
+
+        return normalized_positions
+
+    def _build_preliminary_signal_plan(
+        self,
+        signal_summary: Dict[str, Any],
+        position: PositionState | None,
+        market_context: Mapping[str, Any],
+        capital: float | None,
+        trade_memory: Mapping[str, Any] | None = None,
+        watchlist_store: WatchlistStateStore | None = None,
+    ) -> Dict[str, Any]:
+        """Build a preliminary action for one signal before portfolio allocation."""
+
+        enriched_signal = dict(signal_summary)
+        market_state = signal_summary.get("marketState") or {}
+        event_context = signal_summary.get("eventContext") or {}
+        news_context = signal_summary.get("newsContext") or {}
+        trend_context = signal_summary.get("trendContext") or {}
+        product_id = str(signal_summary.get("productId", signal_summary.get("pairSymbol", ""))).upper()
+        signal_name = str(signal_summary.get("signal_name", "HOLD")).upper()
+        trade_readiness = str(signal_summary.get("tradeReadiness", "standby")).lower()
+        raw_confidence = _safe_float(signal_summary, "confidence")
+        probability_margin = _safe_float(signal_summary, "probabilityMargin")
+        setup_score = _safe_float(signal_summary, "setupScore")
+        policy_score = _safe_float(signal_summary, "policyScore")
+        volatility_ratio = _safe_float(market_state, "volatilityRatio", default_value=1.0)
+        regime_label = str(market_state.get("label", "unknown")).strip().lower()
+        is_high_volatility = _safe_bool(market_state, "isHighVolatility")
+        has_event_next_7d = _safe_bool(event_context, "hasEventNext7d")
+        event_window_active = _safe_bool(event_context, "eventWindowActive")
+        post_event_cooldown_active = _safe_bool(event_context, "postEventCooldownActive")
+        macro_event_risk = _safe_bool(event_context, "macroEventRiskFlag")
+        news_sentiment = _safe_float(news_context, "newsSentiment1h")
+        news_relevance = _safe_float(news_context, "newsRelevanceScore")
+        trend_score = _safe_float(trend_context, "topicTrendScore")
+        macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
+        quality_context = {
+            "confidenceCalibration": (
+                dict(enriched_signal.get("confidenceCalibration"))
+                if isinstance(enriched_signal.get("confidenceCalibration"), Mapping)
+                else {}
+            ),
+            "executionContext": (
+                dict(enriched_signal.get("executionContext"))
+                if isinstance(enriched_signal.get("executionContext"), Mapping)
+                else {}
+            ),
+            "adaptiveContext": (
+                dict(enriched_signal.get("adaptiveContext"))
+                if isinstance(enriched_signal.get("adaptiveContext"), Mapping)
+                else {}
+            ),
+        }
+        if not all(quality_context.values()):
+            computed_quality_context = build_signal_quality_context(
+                signal_summary=enriched_signal,
+                market_context=market_context,
+                trade_memory=trade_memory,
+                config=self.config,
+            )
+            for key, value in computed_quality_context.items():
+                if not quality_context[key]:
+                    quality_context[key] = value
+        enriched_signal.update(quality_context)
+        confidence_calibration = enriched_signal["confidenceCalibration"]
+        execution_context = enriched_signal["executionContext"]
+        adaptive_context = enriched_signal["adaptiveContext"]
+        confidence = _safe_float(
+            confidence_calibration,
+            "calibratedConfidence",
+            default_value=raw_confidence,
+        )
+        chart_alignment_score = _safe_float(confidence_calibration, "chartAlignmentScore")
+        news_alignment_score = _safe_float(confidence_calibration, "newsAlignmentScore")
+        trend_alignment_score = _safe_float(confidence_calibration, "trendAlignmentScore")
+        context_alignment_score = _safe_float(confidence_calibration, "contextAlignmentScore")
+        confidence_quality = str(confidence_calibration.get("confidenceQuality", "balanced"))
+        chart_review = review_chart_confirmation(
+            signal_summary=enriched_signal,
+            confidence_calibration=confidence_calibration,
+        )
+        breakout_confirmed = bool(chart_review.breakout_confirmed)
+        retest_hold_confirmed = bool(chart_review.retest_hold_confirmed)
+        near_resistance = bool(chart_review.near_resistance)
+        weak_structure = bool(chart_review.weak_structure)
+        chart_confirmation_score = float(chart_review.score)
+        chart_decision = str(chart_review.decision)
+        chart_pattern_label = str(chart_review.pattern_label)
+        chart_pattern_reasons = list(chart_review.pattern_reasons)
+        chart_confirmed = bool(chart_review.confirmed)
+        chart_early = bool(chart_review.early)
+        chart_blocked = bool(chart_review.blocked)
+        chart_needs_confirmation = bool(chart_review.needs_confirmation)
+        execution_quality_score = _safe_float(execution_context, "executionQualityScore", default_value=0.5)
+        execution_penalty = _safe_float(execution_context, "decisionPenalty")
+        execution_blocked = _safe_bool(execution_context, "isExecutionBlocked")
+        thin_liquidity = _safe_bool(execution_context, "isThinLiquidity")
+        elevated_execution_cost = _safe_bool(execution_context, "hasElevatedCost")
+        adaptive_size_multiplier = _safe_float(adaptive_context, "sizeMultiplier", default_value=1.0)
+        adaptive_bias = str(adaptive_context.get("bias", "neutral"))
+
+        decision_score = self._build_decision_score(
+            confidence=confidence,
+            probability_margin=probability_margin,
+            setup_score=setup_score,
+            policy_score=policy_score,
+            trade_readiness=trade_readiness,
+            market_stance=str(market_context["marketStance"]),
+            macro_risk_mode=macro_risk_mode,
+            regime_label=regime_label,
+            is_high_volatility=is_high_volatility,
+            has_event_next_7d=has_event_next_7d,
+            context_alignment_score=context_alignment_score,
+            execution_penalty=execution_penalty,
+            adaptive_decision_adjustment=_safe_float(adaptive_context, "decisionAdjustment"),
+        )
+
+        positive_news = (
+            news_relevance > 0
+            and news_sentiment >= float(self.config.news_positive_sentiment_threshold)
+        ) or news_alignment_score >= 0.15
+        negative_news = (
+            news_relevance > 0
+            and news_sentiment <= float(self.config.news_negative_sentiment_threshold)
+        ) or news_alignment_score <= -0.15
+        trend_supportive = (
+            trend_score >= float(self.config.trend_support_threshold)
+            or trend_alignment_score >= 0.12
+        )
+        chart_supportive = bool(chart_review.supportive)
+
+        if event_window_active or macro_event_risk:
+            decision_score -= float(self.config.event_risk_decision_penalty)
+        decision_score += max(news_alignment_score, 0.0) * float(self.config.news_positive_decision_boost)
+        decision_score -= max(-news_alignment_score, 0.0) * float(self.config.news_negative_decision_penalty)
+        decision_score += max(trend_alignment_score, 0.0) * min(float(self.config.news_positive_decision_boost), 0.04)
+        decision_score += max(chart_alignment_score, 0.0) * float(self.config.chart_positive_decision_boost)
+        decision_score -= max(-chart_alignment_score, 0.0) * float(self.config.chart_negative_decision_penalty)
+        if elevated_execution_cost:
+            decision_score -= 0.03
+        if execution_blocked:
+            decision_score -= 0.08
+        decision_score = _clamp(decision_score, 0.0, 1.25)
+
+        watchlist_state = None
+        watchlist_promotion = None
+        if watchlist_store is not None and position is None:
+            watchlist_state, watchlist_promotion = watchlist_store.update_from_signal(
+                signal_summary=enriched_signal,
+                decision_score=decision_score,
+                market_context=dict(market_context),
+                trade_memory=trade_memory,
+            )
+            enriched_signal["watchlistState"] = dict(watchlist_state)
+            enriched_signal["watchlistPromotion"] = {
+                "stage": watchlist_promotion.stage,
+                "priorStage": watchlist_promotion.prior_stage,
+                "promotionReady": watchlist_promotion.promotion_ready,
+                "blockedReason": watchlist_promotion.blocked_reason,
+                "blockedReasonDetail": watchlist_promotion.blocked_reason_detail,
+                "holdReason": watchlist_promotion.hold_reason,
+                "reviewOutcome": watchlist_promotion.review_outcome,
+                "reviewReason": watchlist_promotion.review_reason,
+                "primaryVetoBucket": watchlist_promotion.primary_veto_bucket,
+                "vetoBuckets": list(watchlist_promotion.veto_buckets),
+                "hardBlocks": list(watchlist_promotion.hard_blocks),
+                "softPenalties": list(watchlist_promotion.soft_penalties),
+                "confirmationStrength": float(watchlist_promotion.confirmation_strength),
+                "exceptionalOverrideApplied": bool(watchlist_promotion.exceptional_override_applied),
+                "strongBlockedBuyPreserved": bool(watchlist_promotion.strong_blocked_buy_preserved),
+            }
+
+        desired_position_fraction = 0.0
+        allocation_fraction = 0.0
+        suggested_reduce_fraction = 0.0
+        proposed_decision = "watchlist"
+        reasons: list[str] = []
+        position_unrealized_return = position.unrealized_return() if position is not None else None
+        position_age_hours = position.age_hours if position is not None else None
+        stale_position = bool(
+            position_age_hours is not None
+            and position_age_hours >= float(self.config.brain_stale_position_age_hours)
+        )
+        loss_cut_triggered = bool(
+            position_unrealized_return is not None
+            and position_unrealized_return <= float(self.config.brain_loss_cut_threshold)
+        )
+        profit_lock_triggered = bool(
+            position_unrealized_return is not None
+            and position_unrealized_return >= float(self.config.brain_profit_lock_threshold)
+        )
+
+        additional_hold_reason = None
+        if event_window_active or macro_event_risk:
+            additional_hold_reason = "blocked_by_event_risk"
+        elif execution_blocked:
+            additional_hold_reason = "execution_risk_too_high"
+        elif post_event_cooldown_active:
+            additional_hold_reason = "await_post_event_confirmation"
+        elif negative_news:
+            additional_hold_reason = "negative_news_conflict"
+        elif chart_blocked and chart_pattern_label == "near_resistance":
+            additional_hold_reason = "near_resistance"
+        elif chart_blocked and chart_pattern_label in {"downtrend_structure", "weak_trend_structure"}:
+            additional_hold_reason = "weak_chart_structure"
+        elif chart_blocked and chart_pattern_label == "range_bound":
+            additional_hold_reason = "range_bound_setup"
+        elif chart_blocked and chart_pattern_label == "no_clean_setup":
+            additional_hold_reason = "no_clean_setup"
+        elif chart_blocked:
+            additional_hold_reason = "blocked_chart_pattern"
+        elif near_resistance:
+            additional_hold_reason = "near_resistance"
+        elif weak_structure:
+            additional_hold_reason = "weak_chart_structure"
+        elif chart_needs_confirmation:
+            additional_hold_reason = "needs_chart_confirmation"
+        elif positive_news or trend_supportive or chart_supportive:
+            additional_hold_reason = "supported_by_positive_news"
+
+        if position is None:
+            if signal_name == "BUY":
+                if not self.config.brain_enabled:
+                    proposed_decision = "watchlist"
+                    reasons.append("Trader brain is disabled, so the system only publishes the model signal.")
+                elif trade_readiness == "blocked":
+                    proposed_decision = "watchlist"
+                    reasons.append("The policy has already blocked this setup from opening fresh risk.")
+                elif chart_blocked:
+                    proposed_decision = "watchlist"
+                    reasons.append(
+                        "Candidate discovery found the coin, but the chart pattern is currently blocked for fresh entry."
+                    )
+                    reasons.append(
+                        f"The current chart pattern is {chart_pattern_label.replace('_', ' ')}, which is not actionable yet."
+                    )
+                elif chart_needs_confirmation:
+                    proposed_decision = "watchlist"
+                    reasons.append("Candidate discovery found the coin, but the chart still needs confirmation before a fresh entry.")
+                    if chart_pattern_label != "no_clean_setup":
+                        reasons.append(
+                            f"The current chart pattern is still {chart_pattern_label.replace('_', ' ')}."
+                        )
+                elif execution_blocked:
+                    proposed_decision = "watchlist"
+                    reasons.append("Execution quality is too weak for a clean fresh entry on this coin.")
+                elif (thin_liquidity or elevated_execution_cost) and trade_readiness != "high":
+                    proposed_decision = "watchlist"
+                    reasons.append("Liquidity and trading-cost conditions are still too soft for a normal fresh entry.")
+                elif str(market_context["marketStance"]) == "defensive" and trade_readiness != "high":
+                    proposed_decision = "watchlist"
+                    reasons.append("The wider market posture is defensive, so only the strongest long setups can open.")
+                elif event_window_active or macro_event_risk or post_event_cooldown_active or negative_news:
+                    proposed_decision = "watchlist"
+                    reasons.append("The setup is attractive but needs to wait for cleaner event or news context.")
+                    if event_window_active or macro_event_risk:
+                        reasons.append("Upcoming event risk is too close for a fresh entry.")
+                    if post_event_cooldown_active:
+                        reasons.append("Waiting for post-event confirmation before opening risk.")
+                    if negative_news:
+                        reasons.append("Coin-specific news tone is negative, so fresh entries are paused.")
+                elif near_resistance or weak_structure:
+                    proposed_decision = "watchlist"
+                    reasons.append("Chart structure is not strong enough for a fresh breakout entry.")
+                    if near_resistance:
+                        reasons.append("Price is pressing into resistance, so the setup needs a cleaner breakout.")
+                    if weak_structure:
+                        reasons.append("Structure remains weak, so the system waits for higher-high confirmation.")
+                else:
+                    proposed_decision = "enter_long_candidate"
+                    desired_position_fraction = self._build_position_fraction(
+                        confidence=confidence,
+                        probability_margin=probability_margin,
+                        setup_score=setup_score,
+                        trade_readiness=trade_readiness,
+                        market_stance=str(market_context["marketStance"]),
+                        macro_risk_mode=macro_risk_mode,
+                        regime_label=regime_label,
+                        is_high_volatility=is_high_volatility,
+                        has_event_next_7d=has_event_next_7d,
+                        execution_quality_score=execution_quality_score,
+                        adaptive_size_multiplier=adaptive_size_multiplier,
+                    )
+                    reasons.append("The setup qualifies as a fresh long candidate under the current market posture.")
+                    if positive_news or trend_supportive:
+                        reasons.append("News or trend context is supportive for follow-through.")
+                    if chart_confirmed:
+                        reasons.append("Chart confirmation is explicit, so the setup can graduate from discovery to entry.")
+                    elif breakout_confirmed or retest_hold_confirmed or chart_supportive:
+                        reasons.append("Chart structure confirms a breakout/retest, accelerating entry readiness.")
+            elif signal_name == "LOSS":
+                proposed_decision = "avoid_long"
+                reasons.append("The lifecycle signal is in loss-cut mode, so the system should avoid fresh long risk.")
+            elif signal_name == "TAKE_PROFIT":
+                proposed_decision = "avoid_long"
+                reasons.append("The model is in capital-preservation mode for this coin, not fresh entry mode.")
+            else:
+                proposed_decision = "watchlist"
+                reasons.append("The setup stays on the watchlist until a stronger directional edge appears.")
+
+            if (
+                proposed_decision == "watchlist"
+                and watchlist_promotion is not None
+                and watchlist_promotion.promotion_ready
+                and signal_name not in {"LOSS", "TAKE_PROFIT"}
+            ):
+                proposed_decision = "enter_long_candidate"
+                reasons.append(
+                    "Watchlist follow-up matured through repeated checks and confirmed structure, so it is promoted to an entry candidate."
+                )
+                if watchlist_promotion.exceptional_override_applied:
+                    reasons.append("Strong structural confirmation is overriding a mild defensive or risk-off backdrop.")
+            elif watchlist_promotion is not None:
+                if watchlist_promotion.hard_blocks:
+                    reasons.append("Hard watchlist blocks still prevent promotion on this cycle.")
+                elif watchlist_promotion.soft_penalties:
+                    reasons.append("Watchlist setup is improving, but soft market penalties still cap promotion for now.")
+        else:
+            if signal_name == "LOSS":
+                proposed_decision = "exit_position"
+                suggested_reduce_fraction = 1.0
+                reasons.append("The open position has failed the trade plan and should be exited as a loss cut.")
+            elif loss_cut_triggered and (
+                regime_label in DOWNTREND_LABELS
+                or str(market_context["marketStance"]) == "defensive"
+                or is_high_volatility
+                or signal_name != "BUY"
+            ):
+                proposed_decision = "exit_position"
+                suggested_reduce_fraction = 1.0
+                reasons.append(
+                    "The open position has breached the configured loss limit and should be cut before damage compounds."
+                )
+            elif signal_name == "TAKE_PROFIT":
+                if profit_lock_triggered:
+                    proposed_decision = "exit_position"
+                    suggested_reduce_fraction = 1.0
+                    reasons.append("The trade is already deep enough in profit to lock in gains on this take-profit signal.")
+                elif stale_position and confidence >= 0.70:
+                    proposed_decision = "exit_position"
+                    suggested_reduce_fraction = 1.0
+                    reasons.append("The thesis is aging and the model is now telling the system to distribute risk.")
+                elif is_high_volatility or regime_label in DOWNTREND_LABELS or confidence >= 0.78:
+                    proposed_decision = "exit_position"
+                    suggested_reduce_fraction = 1.0
+                    reasons.append("The open position should be exited because the model is now signaling risk reduction.")
+                else:
+                    proposed_decision = "reduce_position"
+                    suggested_reduce_fraction = float(self.config.brain_reduce_fraction)
+                    reasons.append("The open position should be trimmed while the model cools off.")
+            elif signal_name == "BUY":
+                if profit_lock_triggered and (is_high_volatility or regime_label in DOWNTREND_LABELS or has_event_next_7d):
+                    proposed_decision = "reduce_position"
+                    suggested_reduce_fraction = float(self.config.brain_reduce_fraction)
+                    reasons.append("The position is already well in profit, so the brain prefers to bank some gains into fresh uncertainty.")
+                elif stale_position and trade_readiness != "high" and str(market_context["marketStance"]) != "offensive":
+                    proposed_decision = "hold_and_tighten_risk"
+                    reasons.append("The position is aging, so it can only stay open with tighter risk control.")
+                elif (
+                    trade_readiness == "high"
+                    and str(market_context["marketStance"]) != "defensive"
+                    and not execution_blocked
+                    and position.position_fraction < float(self.config.brain_base_position_fraction)
+                ):
+                    proposed_decision = "add_to_winner_candidate"
+                    desired_position_fraction = min(
+                        float(self.config.brain_scale_in_fraction),
+                        max(
+                            float(self.config.brain_base_position_fraction) - position.position_fraction,
+                            0.0,
+                        ),
+                    )
+                    desired_position_fraction *= 0.82 + (_clamp(execution_quality_score, 0.0, 1.0) * 0.36)
+                    desired_position_fraction *= _clamp(adaptive_size_multiplier, 0.88, 1.10)
+                    desired_position_fraction = _clamp(
+                        desired_position_fraction,
+                        0.0,
+                        float(self.config.brain_scale_in_fraction),
+                    )
+                    reasons.append("The position can be added to because the trend and confidence are still aligned.")
+                else:
+                    proposed_decision = "hold_position"
+                    reasons.append("The open position remains a hold under the current signal state.")
+            elif stale_position and str(market_context["marketStance"]) != "offensive":
+                proposed_decision = "reduce_position"
+                suggested_reduce_fraction = float(self.config.brain_reduce_fraction)
+                reasons.append("The thesis has gone stale without a fresh BUY signal, so exposure should be reduced.")
+            else:
+                proposed_decision = "hold_and_tighten_risk" if (is_high_volatility or has_event_next_7d) else "hold_position"
+                if proposed_decision == "hold_and_tighten_risk":
+                    reasons.append("The position stays open, but the risk leash should tighten because volatility or event risk is elevated.")
+                else:
+                    reasons.append("The position remains a patient hold while the model waits for a clearer edge.")
+
+        if loss_cut_triggered:
+            reasons.append("Unrealized drawdown is beyond the configured loss-cut threshold.")
+        elif profit_lock_triggered:
+            reasons.append("Unrealized return is above the configured profit-lock threshold.")
+        if stale_position:
+            reasons.append("The position has outlived the configured thesis age without a strong reset signal.")
+
+        if regime_label in UPTREND_LABELS:
+            reasons.append("Trend regime is constructive for long exposure.")
+        elif regime_label in DOWNTREND_LABELS:
+            reasons.append("Trend regime is working against fresh long risk.")
+        if macro_risk_mode == "risk_off":
+            reasons.append("CoinMarketCap market intelligence is currently risk-off for fresh altcoin exposure.")
+        elif macro_risk_mode == "risk_on" and signal_name == "BUY":
+            reasons.append("CoinMarketCap market intelligence is supportive for taking selective risk.")
+        if is_high_volatility:
+            reasons.append("High volatility argues for smaller size and faster risk control.")
+        if has_event_next_7d:
+            reasons.append("Upcoming event risk reduces the quality of a fresh entry.")
+        if event_window_active or macro_event_risk:
+            reasons.append("The next high-impact event is too close to justify new risk.")
+        if negative_news:
+            reasons.append("News sentiment around this coin is negative, reducing conviction.")
+        if positive_news or trend_supportive:
+            reasons.append("Recent news flow is supportive, improving setup confidence.")
+        if near_resistance:
+            reasons.append("Price is too close to resistance, so the chart needs a clearer breakout.")
+        if weak_structure:
+            reasons.append("Chart structure is weak, which reduces confidence in follow-through.")
+        if chart_blocked:
+            reasons.append(
+                f"Chart confirmation is blocked because the current pattern is {chart_pattern_label.replace('_', ' ')}."
+            )
+        elif chart_early:
+            reasons.append("Chart confirmation is still early, so the setup stays in review instead of immediate entry mode.")
+        elif chart_confirmed:
+            reasons.append("Chart confirmation has passed and the setup is structurally clean enough to trade when risk allows.")
+        if breakout_confirmed or retest_hold_confirmed:
+            reasons.append("Chart structure confirms a breakout/retest hold that supports the entry thesis.")
+        if confidence_quality == "strong":
+            reasons.append("Context-calibrated confidence remains strong after factoring news, chart, and market conditions.")
+        elif confidence_quality == "fragile":
+            reasons.append("Context-calibrated confidence is fragile once chart, news, and market risks are applied.")
+        if execution_blocked:
+            reasons.append("Estimated execution quality is too weak because liquidity is thin relative to volatility.")
+        elif elevated_execution_cost:
+            reasons.append("Estimated round-trip trading cost is elevated, so the setup needs extra edge.")
+        elif thin_liquidity:
+            reasons.append("Liquidity is thinner than ideal, which argues for more patience or smaller size.")
+        if adaptive_bias == "supportive":
+            reasons.append("Recent realized trade outcomes for this coin have been supportive enough to slightly trust the setup more.")
+        elif adaptive_bias == "cautious":
+            reasons.append("Recent realized trade outcomes for this coin have been weak, so the setup is treated more cautiously.")
+
+        stop_loss_pct, take_profit_pct = self._build_exit_levels(
+            signal_name=signal_name,
+            trade_readiness=trade_readiness,
+            volatility_ratio=volatility_ratio,
+        )
+        current_price = _safe_float(signal_summary, "close")
+        stop_loss_price = (current_price * (1.0 - stop_loss_pct)) if current_price > 0 else None
+        take_profit_price = (current_price * (1.0 + take_profit_pct)) if current_price > 0 else None
+
+        deliberation = self.deliberator.deliberate(
+            signal_summary=enriched_signal,
+            base_decision=proposed_decision,
+            base_decision_score=decision_score,
+            base_reasons=reasons[:],
+            position=position.to_dict() if position is not None else None,
+            market_context=market_context,
+            trade_memory=trade_memory or {},
+            desired_position_fraction=desired_position_fraction,
+            suggested_reduce_fraction=suggested_reduce_fraction,
+            stale_position=stale_position,
+            loss_cut_triggered=loss_cut_triggered,
+            profit_lock_triggered=profit_lock_triggered,
+        )
+        decision_memo = deliberation["decisionMemo"]
+        critic_review = deliberation["criticReview"]
+        final_proposed_decision = str(critic_review.get("approvedDecision") or proposed_decision)
+        size_multiplier = _clamp(float(critic_review.get("sizeMultiplier", 1.0) or 1.0), 0.0, 1.15)
+        score_multiplier = _clamp(float(critic_review.get("scoreMultiplier", 1.0) or 1.0), 0.0, 1.0)
+
+        if final_proposed_decision in {"enter_long_candidate", "add_to_winner_candidate"}:
+            desired_position_fraction *= size_multiplier
+            desired_position_fraction = _clamp(
+                desired_position_fraction,
+                float(self.config.brain_min_position_fraction),
+                float(self.config.brain_max_position_fraction),
+            )
+        else:
+            desired_position_fraction = 0.0
+
+        if final_proposed_decision not in {"reduce_position", "exit_position"}:
+            suggested_reduce_fraction = 0.0
+
+        decision_score = _clamp(
+            (decision_score * score_multiplier)
+            + (_safe_float(decision_memo, "decisionConfidence") * 0.08),
+            0.0,
+            1.25,
+        )
+
+        reviewed_reasons: list[str] = []
+        for reason in (
+            *reasons,
+            str(critic_review.get("summary") or "").strip(),
+            str(decision_memo.get("thesis") or "").strip(),
+        ):
+            if not reason or reason in reviewed_reasons:
+                continue
+            reviewed_reasons.append(reason)
+        reasons = reviewed_reasons
+
+        enriched_signal["brain"] = {
+            "productId": product_id,
+            "decision": final_proposed_decision.replace("_candidate", ""),
+            "proposedDecision": final_proposed_decision,
+            "decisionScore": float(decision_score),
+            "rawConfidence": float(raw_confidence),
+            "calibratedConfidence": float(confidence),
+            "confidenceQuality": confidence_quality,
+            "contextAlignmentScore": float(context_alignment_score),
+            "chartAlignmentScore": float(chart_alignment_score),
+            "chartConfirmationScore": float(chart_confirmation_score),
+            "chartConfirmationStatus": chart_decision,
+            "chartSetupType": chart_pattern_label,
+            "chartDecision": chart_decision,
+            "chartPatternLabel": chart_pattern_label,
+            "chartPatternReasons": list(chart_pattern_reasons),
+            "chartConfirmationReasons": list(chart_review.reasons),
+            "newsAlignmentScore": float(news_alignment_score),
+            "trendAlignmentScore": float(trend_alignment_score),
+            "marketStance": str(market_context["marketStance"]),
+            "macroRiskMode": macro_risk_mode,
+            "desiredPositionFraction": float(desired_position_fraction),
+            "allocationFraction": float(allocation_fraction),
+            "capitalAllocation": (float(allocation_fraction * capital) if capital is not None else None),
+            "suggestedReduceFraction": float(suggested_reduce_fraction),
+            "stopLossPct": float(stop_loss_pct),
+            "takeProfitPct": float(take_profit_pct),
+            "stopLossPrice": float(stop_loss_price) if stop_loss_price is not None else None,
+            "takeProfitPrice": float(take_profit_price) if take_profit_price is not None else None,
+            "positionAgeHours": float(position_age_hours) if position_age_hours is not None else None,
+            "positionUnrealizedReturn": position_unrealized_return,
+            "thesisAgeIsStale": stale_position,
+            "lossCutTriggered": loss_cut_triggered,
+            "profitLockTriggered": profit_lock_triggered,
+            "reasons": reasons[:4],
+            "reasonSummary": reasons[0],
+            "summaryLine": reasons[0],
+            "watchlistStage": watchlist_state.get("stage") if watchlist_state is not None else None,
+            "holdReason": (
+                watchlist_promotion.hold_reason
+                if watchlist_promotion is not None and watchlist_promotion.hold_reason
+                else additional_hold_reason
+            ),
+            "executionQualityScore": float(execution_quality_score),
+            "liquidityScore": float(_safe_float(execution_context, "liquidityScore")),
+            "estimatedRoundTripCostRate": float(_safe_float(execution_context, "estimatedRoundTripCostRate")),
+            "executionBlocked": bool(execution_blocked),
+            "adaptiveBias": adaptive_bias,
+            "position": position.to_dict() if position is not None else None,
+            "evidence": deliberation["evidence"],
+            "decisionMemo": decision_memo,
+            "criticReview": critic_review,
+        }
+
+        return enriched_signal
+
+    def _build_decision_score(
+        self,
+        confidence: float,
+        probability_margin: float,
+        setup_score: float,
+        policy_score: float,
+        trade_readiness: str,
+        market_stance: str,
+        macro_risk_mode: str,
+        regime_label: str,
+        is_high_volatility: bool,
+        has_event_next_7d: bool,
+        context_alignment_score: float,
+        execution_penalty: float,
+        adaptive_decision_adjustment: float,
+    ) -> float:
+        """Score one candidate for portfolio planning."""
+
+        normalized_setup_score = _clamp(setup_score / 6.0, 0.0, 1.0)
+        normalized_policy_score = _clamp(policy_score / 1.5, 0.0, 1.0)
+        decision_score = (
+            (confidence * 0.45)
+            + (probability_margin * 0.20)
+            + (normalized_setup_score * 0.15)
+            + (normalized_policy_score * 0.20)
+        )
+
+        if trade_readiness == "high":
+            decision_score += 0.08
+        elif trade_readiness == "blocked":
+            decision_score -= 0.12
+
+        if market_stance == "offensive":
+            decision_score += 0.05
+        elif market_stance == "defensive":
+            decision_score -= 0.08
+        if macro_risk_mode == "risk_on":
+            decision_score += 0.03
+        elif macro_risk_mode == "risk_off":
+            decision_score -= 0.07
+
+        if regime_label in UPTREND_LABELS:
+            decision_score += 0.04
+        elif regime_label in DOWNTREND_LABELS:
+            decision_score -= 0.10
+
+        if is_high_volatility:
+            decision_score -= 0.04
+        if has_event_next_7d:
+            decision_score -= 0.03
+        decision_score += _clamp(context_alignment_score, -1.0, 1.0) * 0.10
+        decision_score -= _clamp(execution_penalty, 0.0, 0.18)
+        decision_score += _clamp(adaptive_decision_adjustment, -0.08, 0.08)
+
+        return _clamp(decision_score, 0.0, 1.25)
+
+    def _build_position_fraction(
+        self,
+        confidence: float,
+        probability_margin: float,
+        setup_score: float,
+        trade_readiness: str,
+        market_stance: str,
+        macro_risk_mode: str,
+        regime_label: str,
+        is_high_volatility: bool,
+        has_event_next_7d: bool,
+        execution_quality_score: float,
+        adaptive_size_multiplier: float,
+    ) -> float:
+        """Size one new position from signal quality and current market posture."""
+
+        size_fraction = float(self.config.brain_base_position_fraction)
+        size_fraction *= 0.80 + (confidence * 0.55)
+        size_fraction *= 0.90 + min(probability_margin * 1.20, 0.25)
+        size_fraction *= 0.90 + min((setup_score / 6.0) * 0.25, 0.25)
+
+        if trade_readiness == "high":
+            size_fraction *= 1.10
+        elif trade_readiness == "medium":
+            size_fraction *= 1.00
+        else:
+            size_fraction *= 0.75
+
+        if market_stance == "offensive":
+            size_fraction *= 1.05
+        elif market_stance == "defensive":
+            size_fraction *= 0.72
+        if macro_risk_mode == "risk_on":
+            size_fraction *= 1.04
+        elif macro_risk_mode == "risk_off":
+            size_fraction *= 0.80
+
+        if regime_label in UPTREND_LABELS:
+            size_fraction *= 1.05
+        elif regime_label in DOWNTREND_LABELS:
+            size_fraction *= 0.55
+
+        if is_high_volatility:
+            size_fraction *= 0.78
+        if has_event_next_7d:
+            size_fraction *= 0.85
+        size_fraction *= 0.82 + (_clamp(execution_quality_score, 0.0, 1.0) * 0.36)
+        size_fraction *= _clamp(adaptive_size_multiplier, 0.88, 1.10)
+
+        return _clamp(
+            size_fraction,
+            float(self.config.brain_min_position_fraction),
+            float(self.config.brain_max_position_fraction),
+        )
+
+    def _build_exit_levels(
+        self,
+        signal_name: str,
+        trade_readiness: str,
+        volatility_ratio: float,
+    ) -> tuple[float, float]:
+        """Build simple stop-loss and take-profit percentages for the plan."""
+
+        normalized_volatility_ratio = _clamp(volatility_ratio, 0.8, 2.0)
+        stop_loss_pct = _clamp(0.022 * normalized_volatility_ratio, 0.02, 0.06)
+        take_profit_pct = stop_loss_pct * 2.0
+
+        if signal_name == "TAKE_PROFIT":
+            take_profit_pct = stop_loss_pct * 1.1
+        elif trade_readiness == "high":
+            take_profit_pct *= 1.15
+
+        return stop_loss_pct, _clamp(take_profit_pct, 0.035, 0.12)
+
+    def _allocate_exposure(
+        self,
+        exposure_candidates: Sequence[Dict[str, Any]],
+        remaining_risk_budget_fraction: float,
+        capital: float | None,
+    ) -> dict[str, dict[str, Any]]:
+        """Allocate remaining risk budget across entry and add-on candidates."""
+
+        if not exposure_candidates or remaining_risk_budget_fraction <= 0:
+            return {}
+
+        total_requested_fraction = sum(
+            float(candidate["brain"]["desiredPositionFraction"])
+            for candidate in exposure_candidates
+        )
+        if total_requested_fraction <= 0:
+            return {}
+
+        scale_factor = min(remaining_risk_budget_fraction / total_requested_fraction, 1.0)
+        allocations: dict[str, dict[str, Any]] = {}
+
+        for plan_rank, candidate in enumerate(
+            sorted(
+                exposure_candidates,
+                key=lambda row: (
+                    -float(row["brain"]["decisionScore"]),
+                    str(row.get("productId", "")),
+                ),
+            ),
+            start=1,
+        ):
+            product_id = str(candidate.get("productId", "")).upper()
+            desired_fraction = float(candidate["brain"]["desiredPositionFraction"])
+            allocated_fraction = desired_fraction * scale_factor
+            decision = (
+                "add_to_winner"
+                if candidate["brain"]["proposedDecision"] == "add_to_winner_candidate"
+                else "enter_long"
+            )
+            reason_summary = (
+                "Budget approved for adding to the existing winner."
+                if decision == "add_to_winner"
+                else "Budget approved for a fresh long entry."
+            )
+            allocations[product_id] = {
+                "productId": product_id,
+                "decision": decision,
+                "decisionScore": float(candidate["brain"]["decisionScore"]),
+                "allocationFraction": float(allocated_fraction),
+                "capitalAllocation": (float(allocated_fraction * capital) if capital is not None else None),
+                "stopLossPct": float(candidate["brain"]["stopLossPct"]),
+                "takeProfitPct": float(candidate["brain"]["takeProfitPct"]),
+                "stopLossPrice": candidate["brain"]["stopLossPrice"],
+                "takeProfitPrice": candidate["brain"]["takeProfitPrice"],
+                "reasonSummary": reason_summary,
+                "reasons": list(candidate["brain"]["reasons"]),
+                "planRank": int(plan_rank),
+                "summaryLine": (
+                    f"{product_id} {decision.replace('_', ' ')} with {allocated_fraction:.1%} portfolio allocation."
+                ),
+            }
+
+        return allocations
+
+    @staticmethod
+    def _build_summary_text(
+        market_context: Mapping[str, Any],
+        entries: Sequence[Mapping[str, Any]],
+        add_ons: Sequence[Mapping[str, Any]],
+        reductions: Sequence[Mapping[str, Any]],
+        exits: Sequence[Mapping[str, Any]],
+    ) -> str:
+        """Build one operator-facing summary sentence for the current plan."""
+
+        market_stance = str(market_context.get("marketStance", "balanced"))
+        dominant_regime = str(market_context.get("dominantRegime", "unknown"))
+        macro_risk_mode = str(market_context.get("macroRiskMode", "neutral"))
+        return (
+            f"Trader brain is {market_stance} with dominant regime {dominant_regime} "
+            f"and macro risk mode {macro_risk_mode}. "
+            f"Plan: {len(entries)} new entries, {len(add_ons)} add-ons, "
+            f"{len(reductions)} reductions, and {len(exits)} full exits."
+        )
+
+
+__all__ = ["PositionState", "TraderBrain"]

@@ -163,6 +163,41 @@ def _build_execution_context(
         Mapping,
     ) else {}
     market_state = signal_summary.get("marketState") if isinstance(signal_summary.get("marketState"), Mapping) else {}
+    base_round_trip_cost_rate = 2.0 * (
+        float(config.backtest_trading_fee_rate)
+        + float(config.backtest_slippage_rate)
+    )
+    volatility_ratio = _safe_float(market_state, "volatilityRatio", default_value=1.0)
+    is_high_volatility = _safe_bool(market_state, "isHighVolatility")
+
+    # Lightweight signal summaries often do not carry execution features yet. Treat
+    # that absence as "unknown / neutral" instead of silently penalizing the setup.
+    if not raw_execution_context:
+        neutral_slippage_risk_score = _clamp(
+            0.18
+            + (0.10 if is_high_volatility else 0.0)
+            + max(volatility_ratio - 1.0, 0.0) * 0.10,
+            0.0,
+            1.0,
+        )
+        estimated_round_trip_cost_rate = base_round_trip_cost_rate * (1.0 + (neutral_slippage_risk_score * 0.30))
+        execution_quality_score = _clamp(
+            0.58
+            - (neutral_slippage_risk_score * 0.18),
+            0.0,
+            1.0,
+        )
+        return {
+            "liquidityScore": 0.56,
+            "slippageRiskScore": float(neutral_slippage_risk_score),
+            "executionQualityScore": float(execution_quality_score),
+            "baseRoundTripCostRate": float(base_round_trip_cost_rate),
+            "estimatedRoundTripCostRate": float(estimated_round_trip_cost_rate),
+            "decisionPenalty": 0.0,
+            "isThinLiquidity": False,
+            "hasElevatedCost": False,
+            "isExecutionBlocked": False,
+        }
 
     atr_pct_14 = _safe_float(raw_execution_context, "atrPct14", default_value=0.018)
     volume_vs_sma_20 = _safe_float(raw_execution_context, "volumeVsSma20", default_value=1.0)
@@ -170,8 +205,6 @@ def _build_execution_context(
     cmc_volume_24h_log = _safe_float(raw_execution_context, "cmcVolume24hLog", default_value=10.5)
     cmc_num_market_pairs_log = _safe_float(raw_execution_context, "cmcNumMarketPairsLog", default_value=2.5)
     cmc_rank_score = _safe_float(raw_execution_context, "cmcRankScore", default_value=0.45)
-    volatility_ratio = _safe_float(market_state, "volatilityRatio", default_value=1.0)
-    is_high_volatility = _safe_bool(market_state, "isHighVolatility")
 
     liquidity_components = [
         _clamp((cmc_volume_24h_log - 10.0) / 8.0, 0.0, 1.0),
@@ -199,10 +232,6 @@ def _build_execution_context(
         1.0,
     )
 
-    base_round_trip_cost_rate = 2.0 * (
-        float(config.backtest_trading_fee_rate)
-        + float(config.backtest_slippage_rate)
-    )
     estimated_round_trip_cost_rate = base_round_trip_cost_rate * (1.0 + (slippage_risk_score * 1.40))
     execution_quality_score = _clamp(
         (liquidity_score * 0.72)
@@ -436,4 +465,3 @@ def build_signal_quality_context(
         "executionContext": execution_context,
         "adaptiveContext": adaptive_context,
     }
-

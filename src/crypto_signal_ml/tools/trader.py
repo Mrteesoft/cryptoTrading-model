@@ -7,8 +7,8 @@ from typing import Any
 
 from ..config import TrainingConfig
 from ..application import PublishedSignalViewService
+from ..portfolio_core import TraderBrain
 from ..trading.portfolio import TradingPortfolioStore
-from ..trading.trader_brain import TraderBrain
 from .signals import SignalToolService
 
 

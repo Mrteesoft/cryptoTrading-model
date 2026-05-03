@@ -1,4 +1,4 @@
-"""Trading-specific policy, signal, portfolio, and planner modules."""
+"""Trading-specific policy, signal, portfolio, and supporting domain modules."""
 
 from .decision_intelligence import TradingDecisionDeliberator
 from .policy import evaluate_trading_decision
@@ -13,11 +13,9 @@ from .signals import (
     select_primary_signal,
 )
 from .symbols import is_signal_eligible_base_currency, normalize_base_currency
-from .trader_brain import TraderBrain
 from .watchlist_state import WatchlistStateStore
 
 __all__ = [
-    "TraderBrain",
     "WatchlistStateStore",
     "TradingDecisionDeliberator",
     "TradingPortfolioStore",

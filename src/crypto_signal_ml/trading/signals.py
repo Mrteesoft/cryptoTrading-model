@@ -8,7 +8,11 @@ from ..chart import build_chart_context, render_chart_snapshot
 
 from ..config import TrainingConfig
 from .policy import evaluate_trading_decision
-from .symbols import is_signal_eligible_base_currency, normalize_base_currency
+from .symbols import (
+    is_signal_eligible_base_currency,
+    is_stablecoin_base_currency,
+    normalize_base_currency,
+)
 
 
 ACTION_PRIORITY = {
@@ -48,6 +52,14 @@ READINESS_HEADLINE_WEIGHT = {
     "blocked": 0.0,
 }
 
+CHART_CONFIRMATION_PRIORITY = {
+    "confirmed": 0,
+    "early": 1,
+    "blocked": 2,
+    "unclear": 3,
+    "invalid": 4,
+}
+
 
 def _resolve_excluded_signal_bases(config: TrainingConfig | None) -> set[str]:
     """Return the configured base currencies that should never surface as signals."""
@@ -75,6 +87,9 @@ def is_signal_product_excluded(
         normalized_base_currency = normalize_base_currency(str(product_id).split("-")[0])
 
     if not is_signal_eligible_base_currency(normalized_base_currency):
+        return True
+
+    if is_stablecoin_base_currency(normalized_base_currency):
         return True
 
     if not excluded_bases:
@@ -132,6 +147,9 @@ def _is_public_signal_candidate(signal_summary: Dict[str, Any]) -> bool:
         signal_summary.get("baseCurrency") or signal_summary.get("symbol")
     )
     if not is_signal_eligible_base_currency(base_currency):
+        return False
+
+    if is_stablecoin_base_currency(base_currency):
         return False
 
     if any(character.isdigit() for character in base_currency) and len(base_currency) <= 3:
@@ -829,6 +847,7 @@ def _row_to_signal_summary(
     signal_name = str(decision["signalName"])
     model_predicted_signal = int(decision["modelPredictedSignal"])
     confidence = float(decision["confidence"])
+    raw_confidence = float(decision.get("rawConfidence", confidence))
     minimum_action_confidence = float(decision["minimumActionConfidence"])
     required_action_confidence = float(decision["requiredActionConfidence"])
     confidence_gate_applied = bool(decision["confidenceGateApplied"])
@@ -852,6 +871,9 @@ def _row_to_signal_summary(
     pair_symbol = str(signal_row.get("product_id", "")) if "product_id" in signal_row.index else ""
     spot_action = str(decision["spotAction"])
     model_spot_action = SIGNAL_TO_ACTION.get(raw_signal_name, "wait")
+    raw_probabilities = dict(decision.get("rawProbabilities", {}))
+    calibrated_probabilities = dict(decision.get("calibratedProbabilities", {}))
+    contribution_ledger = dict(decision.get("ledger", {}))
 
     base_chart_context = {
         "breakoutUp20": _safe_float(signal_row, "breakout_up_20"),
@@ -876,6 +898,7 @@ def _row_to_signal_summary(
         "coinSymbol": coin_symbol,
         "pairSymbol": pair_symbol,
         "confidence": confidence,
+        "rawConfidence": raw_confidence,
         "minimumActionConfidence": minimum_action_confidence,
         "requiredActionConfidence": required_action_confidence,
         "confidenceGateApplied": confidence_gate_applied,
@@ -891,14 +914,32 @@ def _row_to_signal_summary(
         "gateReasons": gate_reasons,
         "setupScore": _calculate_setup_score(signal_row),
         "probabilities": {
-            "take_profit": float(signal_row["prob_take_profit"]),
-            "hold": float(signal_row["prob_hold"]),
-            "buy": float(signal_row["prob_buy"]),
+            "take_profit": float(calibrated_probabilities.get("TAKE_PROFIT", signal_row["prob_take_profit"])),
+            "hold": float(calibrated_probabilities.get("HOLD", signal_row["prob_hold"])),
+            "buy": float(calibrated_probabilities.get("BUY", signal_row["prob_buy"])),
         },
+        "rawProbabilities": {
+            "take_profit": float(raw_probabilities.get("TAKE_PROFIT", 0.0)),
+            "hold": float(raw_probabilities.get("HOLD", 0.0)),
+            "buy": float(raw_probabilities.get("BUY", 0.0)),
+        },
+        "contributionLedger": contribution_ledger,
+        "publicationReason": str(contribution_ledger.get("publicationReason", "candidate_only")),
         "reasonItems": reason_items,
         "reasonSummary": reason_items[0],
         "signalChat": _build_signal_chat(signal_row, reason_items, signal_name=signal_name),
         "chartContext": base_chart_context,
+        "chartConfirmationScore": float(decision.get("chartConfirmationScore", 0.0) or 0.0),
+        "chartSetupType": str(
+            decision.get("chartSetupType", decision.get("chartPatternLabel", "no_clean_setup")) or "no_clean_setup"
+        ),
+        "chartConfirmationStatus": str(
+            decision.get("chartConfirmationStatus", decision.get("chartDecision", "early")) or "early"
+        ),
+        "chartConfirmationNotes": list(decision.get("chartConfirmationNotes") or []),
+        "chartPatternLabel": str(decision.get("chartPatternLabel", decision.get("chartSetupType", "no_clean_setup")) or "no_clean_setup"),
+        "chartPatternReasons": list(decision.get("chartPatternReasons") or decision.get("chartConfirmationNotes") or []),
+        "chartDecision": str(decision.get("chartDecision", decision.get("chartConfirmationStatus", "early")) or "early"),
         "executionContext": {
             "atrPct14": _safe_float(signal_row, "atr_pct_14"),
             "volumeVsSma20": _safe_float(signal_row, "volume_vs_sma_20"),
@@ -1061,6 +1102,10 @@ def build_latest_signal_summaries(
         key=lambda signal_summary: (
             ACTION_PRIORITY.get(signal_summary.get("signal_name", "HOLD"), 99),
             READINESS_PRIORITY.get(signal_summary.get("tradeReadiness", "standby"), 99),
+            CHART_CONFIRMATION_PRIORITY.get(
+                signal_summary.get("chartDecision", signal_summary.get("chartConfirmationStatus", "early")),
+                99,
+            ),
             -float(signal_summary.get("policyScore", 0.0)),
             -float(signal_summary.get("setupScore", 0.0)),
             -float(signal_summary.get("confidence", 0.0)),

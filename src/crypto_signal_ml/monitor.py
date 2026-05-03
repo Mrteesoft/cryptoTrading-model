@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from threading import Event, Thread
+from time import perf_counter
 from typing import Any, Callable
 
 import uvicorn
@@ -12,6 +13,7 @@ import uvicorn
 from .app import SignalGenerationApp
 from .config import TrainingConfig
 from .engine_api import create_app
+from .logging_utils import CompactConsoleFormatter, format_bool_for_log, format_path_for_log
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,22 +41,25 @@ class SignalMonitorService:
         if root_logger.handlers:
             return
 
-        logging.basicConfig(
-            level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
+        handler = logging.StreamHandler()
+        handler.setFormatter(CompactConsoleFormatter())
+        root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+        root_logger.addHandler(handler)
 
     def _run_signal_generation(self, cycle_label: str) -> None:
         """Generate and publish the latest watchlist and signal snapshots."""
 
-        LOGGER.info("Starting %s signal refresh cycle.", cycle_label)
+        cycle_started_at = perf_counter()
+        LOGGER.info("Refresh start | cycle=%s", cycle_label)
         results = self.signal_generation_app_factory(config=self.config).run()
         LOGGER.info(
-            "%s signal refresh complete: %s signals, %s actionable, latest=%s.",
-            cycle_label.capitalize(),
+            "Refresh done | cycle=%s | %.2fs | signals=%s | actionable=%s | top=%s | source=%s",
+            cycle_label,
+            perf_counter() - cycle_started_at,
             int(results.get("signalsGenerated", 0)),
             int(results.get("actionableSignalsGenerated", 0)),
             results.get("signalName") or "none",
+            results.get("signalSource") or "unknown",
         )
 
     def _refresh_loop(self, interval_seconds: int) -> None:
@@ -71,7 +76,7 @@ class SignalMonitorService:
 
         interval_seconds = int(getattr(self.config, "signal_monitor_refresh_interval_seconds", 0) or 0)
         if interval_seconds <= 0:
-            LOGGER.info("Signal monitor background refresh is disabled.")
+            LOGGER.info("Refresh loop | disabled")
             return
 
         self._refresh_thread = Thread(
@@ -82,7 +87,7 @@ class SignalMonitorService:
         )
         self._refresh_thread.start()
         LOGGER.info(
-            "Signal monitor background refresh started with a %s-second interval.",
+            "Refresh loop | running every %ss",
             interval_seconds,
         )
 
@@ -90,6 +95,12 @@ class SignalMonitorService:
         """Run the full model-side service lifecycle in one process."""
 
         self._configure_logging()
+        LOGGER.info(
+            "Service start | initial=%s | refresh=%ss | data=%s",
+            format_bool_for_log(bool(getattr(self.config, "signal_monitor_run_initial_generation", True))),
+            int(getattr(self.config, "signal_monitor_refresh_interval_seconds", 0) or 0),
+            format_path_for_log(self.config.data_file),
+        )
 
         if bool(getattr(self.config, "signal_monitor_run_initial_generation", True)):
             try:
@@ -107,6 +118,12 @@ class SignalMonitorService:
             require_internal_api_key=bool(internal_api_key),
             internal_api_key=internal_api_key or None,
         )
+        LOGGER.info(
+            "API start | http://%s:%s | internal_key=%s",
+            host,
+            port,
+            format_bool_for_log(bool(internal_api_key)),
+        )
 
         try:
             uvicorn.run(
@@ -116,3 +133,4 @@ class SignalMonitorService:
             )
         finally:
             self._stop_event.set()
+            LOGGER.info("Service stop")

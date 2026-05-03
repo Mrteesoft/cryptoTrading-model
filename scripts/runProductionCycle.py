@@ -27,7 +27,9 @@ def main() -> None:
     print(f"Balanced accuracy: {training['balancedAccuracy']:.4f}")
     print(f"Frontend snapshot saved to: {signal_generation['frontendSignalSnapshotPath']}")
     print(f"Primary signal: {signal_generation['signalName']}")
-    print(f"Primary confidence: {signal_generation['confidence']:.4f}")
+    confidence = signal_generation.get("confidence")
+    formatted_confidence = f"{confidence:.4f}" if confidence is not None else "None"
+    print(f"Primary confidence: {formatted_confidence}")
 
 
 if __name__ == "__main__":

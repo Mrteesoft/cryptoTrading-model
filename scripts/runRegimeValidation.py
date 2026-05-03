@@ -17,6 +17,8 @@ def main() -> None:
     print("Regime walk-forward validation complete.")
     print(f"Model type: {results['modelType']}")
     print(f"Estimator type: {results['estimatorType']}")
+    print(f"Run label: {results['runLabel']}")
+    print(f"Run directory: {results['runDirectory']}")
     print(f"Prepared dataset saved to: {results['datasetPath']}")
     print(f"Fold metrics saved to: {results['walkForwardFoldMetricsPath']}")
     print(f"Predictions saved to: {results['walkForwardPredictionsPath']}")

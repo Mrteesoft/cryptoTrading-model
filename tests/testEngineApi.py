@@ -567,6 +567,121 @@ def test_engine_api_exposes_live_signal_endpoints(tmp_path: Path) -> None:
     assert detail_response.json()["signal_name"] == "BUY"
 
 
+def test_engine_api_can_run_live_signal_pipeline_and_return_one_signal(tmp_path: Path) -> None:
+    """The engine should expose a REST command that runs live signal generation and returns one signal."""
+
+    live_snapshot = _build_live_snapshot_payload()
+    live_engine_calls: list[dict[str, object]] = []
+
+    class FakeLiveSignalEngine:
+        def get_status(self) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "modelPath": "models/randomForestSignalModel.pkl",
+                "cacheAgeSeconds": 0,
+                "cacheTtlSeconds": 60,
+                "lastGeneratedAt": live_snapshot["generatedAt"],
+                "watchlistPoolCount": 0,
+            }
+
+        def get_live_snapshot(
+            self,
+            force_refresh: bool = False,
+            product_id: str | None = None,
+            product_ids: list[str] | None = None,
+        ) -> dict[str, object]:
+            live_engine_calls.append(
+                {
+                    "force_refresh": force_refresh,
+                    "product_id": product_id,
+                    "product_ids": list(product_ids or []),
+                }
+            )
+
+            if product_id is not None:
+                filtered_signal = live_snapshot["signalsByProduct"].get(product_id.upper())
+                if filtered_signal is None:
+                    return {
+                        **live_snapshot,
+                        "signals": [],
+                        "actionableSignals": [],
+                        "signalsByProduct": {},
+                        "primarySignal": None,
+                        "productsCovered": 0,
+                        "requestedProducts": [product_id.upper()],
+                    }
+
+                return {
+                    **live_snapshot,
+                    "signals": [filtered_signal],
+                    "actionableSignals": [filtered_signal] if filtered_signal["signal_name"] != "HOLD" else [],
+                    "signalsByProduct": {product_id.upper(): filtered_signal},
+                    "primarySignal": filtered_signal,
+                    "productsCovered": 1,
+                    "requestedProducts": [product_id.upper()],
+                }
+
+            if product_ids:
+                filtered_signals = [
+                    live_snapshot["signalsByProduct"][normalized_product_id]
+                    for normalized_product_id in [product.upper() for product in product_ids]
+                    if normalized_product_id in live_snapshot["signalsByProduct"]
+                ]
+                return {
+                    **live_snapshot,
+                    "signals": filtered_signals,
+                    "actionableSignals": [
+                        signal_summary
+                        for signal_summary in filtered_signals
+                        if signal_summary["signal_name"] != "HOLD"
+                    ],
+                    "signalsByProduct": {
+                        str(signal_summary["productId"]).upper(): signal_summary
+                        for signal_summary in filtered_signals
+                    },
+                    "primarySignal": filtered_signals[0] if filtered_signals else None,
+                    "productsCovered": len(filtered_signals),
+                    "requestedProducts": [product.upper() for product in product_ids],
+                }
+
+            return dict(live_snapshot)
+
+    client = TestClient(
+        create_app(
+            snapshot_path=tmp_path / "outputs" / "frontendSignalSnapshot.json",
+            model_dir=tmp_path / "models",
+            live_signal_engine=FakeLiveSignalEngine(),
+        )
+    )
+
+    primary_response = client.post("/api/live/signals/generate", json={})
+    requested_response = client.post(
+        "/api/live/signals/generate",
+        json={"productId": "ETH-USD"},
+    )
+    invalid_response = client.post(
+        "/api/live/signals/generate",
+        json={"productId": "BTC-USD", "productIds": ["ETH-USD"]},
+    )
+
+    assert primary_response.status_code == 200
+    assert primary_response.json()["status"] == "ok"
+    assert primary_response.json()["forceRefresh"] is True
+    assert primary_response.json()["signal"]["productId"] == "BTC-USD"
+    assert primary_response.json()["primarySignal"]["productId"] == "BTC-USD"
+
+    assert requested_response.status_code == 200
+    assert requested_response.json()["signal"]["productId"] == "ETH-USD"
+    assert requested_response.json()["productId"] == "ETH-USD"
+
+    assert invalid_response.status_code == 400
+    assert "either productId or productIds" in invalid_response.json()["detail"]
+
+    assert live_engine_calls[0]["force_refresh"] is True
+    assert live_engine_calls[0]["product_id"] is None
+    assert live_engine_calls[1]["product_id"] == "ETH-USD"
+
+
 def test_engine_api_supports_trader_portfolio_and_plan_endpoints(tmp_path: Path) -> None:
     """The engine should persist portfolio state and build a portfolio-aware trader plan."""
 

@@ -323,6 +323,27 @@ class TradingSignalStore:
             return 0.0
 
     @classmethod
+    def _json_safe_value(cls, value: Any) -> Any:
+        """Recursively coerce numpy-like scalars into plain JSON-serializable values."""
+
+        if isinstance(value, dict):
+            return {
+                str(key): cls._json_safe_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if hasattr(value, "item"):
+            try:
+                return cls._json_safe_value(value.item())
+            except (TypeError, ValueError):
+                return str(value)
+
+        return str(value)
+
+    @classmethod
     def _signal_identity(cls, signal_summary: Mapping[str, Any] | None) -> tuple[str, str, str]:
         """Return one stable identity tuple for selecting the primary current signal."""
 
@@ -351,7 +372,7 @@ class TradingSignalStore:
         signal_name = str(signal_summary.get("signal_name", "") or "").strip().upper() or "UNKNOWN"
         spot_action = str(signal_summary.get("spotAction", "") or "").strip().lower() or "wait"
         signal_timestamp = str(signal_summary.get("timestamp", "") or "").strip()
-        signal_payload = dict(signal_summary)
+        signal_payload = cls._json_safe_value(dict(signal_summary))
         signal_payload_json = json.dumps(signal_payload, ensure_ascii=True)
 
         return {

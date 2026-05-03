@@ -14,7 +14,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
-from crypto_signal_ml.trading.trader_brain import TraderBrain  # noqa: E402
+from crypto_signal_ml.portfolio_core import TraderBrain  # noqa: E402
 
 
 def _build_signal(
@@ -107,6 +107,10 @@ def test_watchlist_setup_promotes_to_entry_ready(tmp_path: Path) -> None:
     second_brain = second_plan["signals"][0]["brain"]
     assert second_brain["watchlistStage"] == "entry_ready"
     assert second_brain["decision"] in {"enter_long", "watchlist"} or second_brain["proposedDecision"] == "enter_long_candidate"
+    assert second_plan["watchlistPromotion"]["reviewedCount"] == 1
+    assert second_plan["watchlistPromotion"]["promotedThisCycle"] == 1
+    assert second_plan["watchlistPromotion"]["stageCounts"]["entry_ready"] == 1
+    assert second_plan["watchlistPromotion"]["transitions"][0]["toStage"] == "entry_ready"
 
 
 def test_watchlist_promotion_blocked_by_regime(tmp_path: Path) -> None:
@@ -148,4 +152,18 @@ def test_watchlist_promotion_blocked_by_regime(tmp_path: Path) -> None:
     blocked_plan = brain.build_plan(signal_summaries=[blocked_signal], positions=[], capital=10000.0)
     blocked_brain = blocked_plan["signals"][0]["brain"]
     assert blocked_brain["watchlistStage"] in {"setup_building", "setup_confirmed", "entry_ready"}
-    assert blocked_brain["holdReason"] in {"blocked_by_regime", "blocked_by_risk", "wait_for_setup_building"}
+    assert blocked_brain["holdReason"] in {
+        "wait_for_setup_building",
+        "wait_for_setup_confirmation",
+        "wait_for_breakout_confirmation",
+        "needs_regime_improvement",
+        "market_regime_veto",
+    }
+    assert blocked_plan["watchlistPromotion"]["reviewedCount"] == 1
+    assert blocked_plan["watchlistPromotion"]["transitions"][0]["reviewReason"] in {
+        "wait_for_setup_building",
+        "wait_for_setup_confirmation",
+        "wait_for_breakout_confirmation",
+        "needs_regime_improvement",
+        "market_regime_veto",
+    }

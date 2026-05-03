@@ -302,4 +302,5 @@ def test_regime_walk_forward_validation_app_builds_out_of_sample_summary(
     assert result["modelType"] == "marketRegimeModel"
     assert result["foldCount"] == 2
     assert result["outOfSampleRows"] > 0
+    assert Path(result["runDirectory"]).parent.name == "regimeWalkForwardRuns"
     assert result["walkForwardSummaryPath"].endswith("regimeWalkForwardSummary.json")

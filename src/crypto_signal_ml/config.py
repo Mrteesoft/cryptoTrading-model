@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from .asset_policy import STABLECOIN_BASE_CURRENCIES
 from .environment import load_env_file
 
 
@@ -115,6 +116,8 @@ def _env_float(env_var_name: str, default_value: float) -> float:
 
 COINMARKETCAP_MARKET_DATA_SOURCES = ("coinmarketcap", "coinmarketcapLatestQuotes")
 COINBASE_MARKET_DATA_SOURCES = ("coinbaseExchange",)
+KRAKEN_MARKET_DATA_SOURCES = ("kraken",)
+BINANCE_MARKET_DATA_SOURCES = ("binancePublicData",)
 
 
 def is_coinmarketcap_market_data_source(market_data_source: str) -> bool:
@@ -127,6 +130,18 @@ def is_coinbase_market_data_source(market_data_source: str) -> bool:
     """Return whether the configured source belongs to the Coinbase family."""
 
     return str(market_data_source).strip() in COINBASE_MARKET_DATA_SOURCES
+
+
+def is_kraken_market_data_source(market_data_source: str) -> bool:
+    """Return whether the configured source belongs to the Kraken family."""
+
+    return str(market_data_source).strip() in KRAKEN_MARKET_DATA_SOURCES
+
+
+def is_binance_market_data_source(market_data_source: str) -> bool:
+    """Return whether the configured source belongs to the Binance public-data family."""
+
+    return str(market_data_source).strip() in BINANCE_MARKET_DATA_SOURCES
 
 
 def apply_runtime_market_data_settings(
@@ -153,7 +168,15 @@ def apply_runtime_market_data_settings(
         field_name
         for field_name in TrainingConfig.__dataclass_fields__
         if field_name.startswith(
-            ("coinmarketcap_", "coinmarketcal_", "coinbase_", "live_", "signal_watchlist_")
+            (
+                "coinmarketcap_",
+                "coinmarketcal_",
+                "coinbase_",
+                "kraken_",
+                "binance_",
+                "live_",
+                "signal_watchlist_",
+            )
         )
     )
 
@@ -205,7 +228,7 @@ class TrainingConfig:
     coinmarketcap_log_progress: bool = _env_bool("COINMARKETCAP_LOG_PROGRESS", True)
     coinmarketcap_fetch_all_quote_products: bool = _env_bool("COINMARKETCAP_FETCH_ALL_QUOTE_PRODUCTS", True)
     coinmarketcap_product_ids: Tuple[str, ...] = ("BTC-USD",)
-    coinmarketcap_excluded_base_currencies: Tuple[str, ...] = ("USDT", "USDC")
+    coinmarketcap_excluded_base_currencies: Tuple[str, ...] = STABLECOIN_BASE_CURRENCIES
     coinmarketcap_max_products: Optional[int] = None
     coinmarketcap_product_id: str = "BTC-USD"
     coinmarketcap_product_batch_size: Optional[int] = 25
@@ -221,7 +244,7 @@ class TrainingConfig:
     coinmarketcap_market_fear_threshold: float = 30.0
     coinmarketcap_market_greed_threshold: float = 65.0
     coinmarketcap_market_btc_dominance_risk_off_threshold: float = 55.0
-    coinmarketcal_use_events: bool = True
+    coinmarketcal_use_events: bool = _env_bool("COINMARKETCAL_USE_EVENTS", False)
     coinmarketcal_events_file: Path = RAW_DATA_DIR / "coinMarketCalEvents.csv"
     coinmarketcal_api_base_url: str = "https://developers.coinmarketcal.com/v1"
     coinmarketcal_api_key_env_var: str = "COINMARKETCAL_API_KEY"
@@ -233,7 +256,7 @@ class TrainingConfig:
     coinbase_fetch_all_quote_products: bool = True
     coinbase_quote_currency: str = "USD"
     coinbase_product_ids: Tuple[str, ...] = ("BTC-USD",)
-    coinbase_excluded_base_currencies: Tuple[str, ...] = ("USDT", "USDC")
+    coinbase_excluded_base_currencies: Tuple[str, ...] = STABLECOIN_BASE_CURRENCIES
     coinbase_max_products: Optional[int] = None
     coinbase_product_id: str = "BTC-USD"
     coinbase_product_batch_size: Optional[int] = 25
@@ -243,6 +266,41 @@ class TrainingConfig:
     coinbase_request_pause_seconds: float = 0.2
     coinbase_save_progress_every_products: int = 5
     coinbase_log_progress: bool = True
+    kraken_product_ids: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple(
+            "KRAKEN_PRODUCT_IDS",
+            ("BTC-USD", "ETH-USD", "SOL-USD"),
+        )
+    )
+    kraken_product_id: str = _env_str("KRAKEN_PRODUCT_ID", "BTC-USD")
+    kraken_quote_currency: str = _env_str("KRAKEN_QUOTE_CURRENCY", "USD")
+    kraken_granularity_seconds: int = _env_optional_int("KRAKEN_GRANULARITY_SECONDS", 3600) or 3600
+    kraken_total_candles: int = _env_optional_int("KRAKEN_TOTAL_CANDLES", 720) or 720
+    kraken_request_pause_seconds: float = _env_float("KRAKEN_REQUEST_PAUSE_SECONDS", 0.2)
+    kraken_product_batch_size: Optional[int] = _env_optional_int("KRAKEN_PRODUCT_BATCH_SIZE", 25)
+    kraken_product_batch_number: int = _env_optional_int("KRAKEN_PRODUCT_BATCH_NUMBER", 1) or 1
+    kraken_save_progress_every_products: int = _env_optional_int("KRAKEN_SAVE_PROGRESS_EVERY_PRODUCTS", 5) or 5
+    kraken_log_progress: bool = _env_bool("KRAKEN_LOG_PROGRESS", True)
+    binance_product_ids: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple(
+            "BINANCE_PRODUCT_IDS",
+            ("BTC-USD", "ETH-USD", "SOL-USD"),
+        )
+    )
+    binance_product_id: str = _env_str("BINANCE_PRODUCT_ID", "BTC-USD")
+    binance_fetch_all_quote_products: bool = _env_bool("BINANCE_FETCH_ALL_QUOTE_PRODUCTS", True)
+    binance_quote_currency: str = _env_str("BINANCE_QUOTE_CURRENCY", "USDT")
+    binance_excluded_base_currencies: Tuple[str, ...] = STABLECOIN_BASE_CURRENCIES
+    binance_max_products: Optional[int] = _env_optional_int("BINANCE_MAX_PRODUCTS", 150)
+    binance_interval: str = _env_str("BINANCE_INTERVAL", "1h")
+    binance_granularity_seconds: int = _env_optional_int("BINANCE_GRANULARITY_SECONDS", 3600) or 3600
+    binance_total_candles: int = _env_optional_int("BINANCE_TOTAL_CANDLES", 4320) or 4320
+    binance_archive_lookback_months: int = _env_optional_int("BINANCE_ARCHIVE_LOOKBACK_MONTHS", 36) or 36
+    binance_request_pause_seconds: float = _env_float("BINANCE_REQUEST_PAUSE_SECONDS", 0.1)
+    binance_product_batch_size: Optional[int] = _env_optional_int("BINANCE_PRODUCT_BATCH_SIZE", 25)
+    binance_product_batch_number: int = _env_optional_int("BINANCE_PRODUCT_BATCH_NUMBER", 1) or 1
+    binance_save_progress_every_products: int = _env_optional_int("BINANCE_SAVE_PROGRESS_EVERY_PRODUCTS", 5) or 5
+    binance_log_progress: bool = _env_bool("BINANCE_LOG_PROGRESS", True)
     live_product_ids: Tuple[str, ...] = field(
         default_factory=lambda: _env_csv_tuple(
             "LIVE_PRODUCT_IDS",
@@ -279,11 +337,48 @@ class TrainingConfig:
     signal_watchlist_pool_enabled: bool = _env_bool("SIGNAL_WATCHLIST_POOL_ENABLED", True)
     signal_watchlist_pool_max_products: int = _env_optional_int("SIGNAL_WATCHLIST_POOL_MAX_PRODUCTS", 12) or 12
     signal_watchlist_pool_path: Path = OUTPUTS_DIR / "watchlistPool.json"
+    signal_log_symbol_details: bool = _env_bool("SIGNAL_LOG_SYMBOL_DETAILS", True)
+    signal_log_symbol_limit: int = _env_optional_int("SIGNAL_LOG_SYMBOL_LIMIT", 25) or 25
     signal_watchlist_state_path: Path = OUTPUTS_DIR / "watchlistState.json"
+    signal_watchlist_diagnostics_enabled: bool = _env_bool("SIGNAL_WATCHLIST_DIAGNOSTICS_ENABLED", True)
+    signal_watchlist_diagnostics_max_transitions: int = (
+        _env_optional_int("SIGNAL_WATCHLIST_DIAGNOSTICS_MAX_TRANSITIONS", 6) or 6
+    )
+    signal_watchlist_diagnostics_top_reasons: int = (
+        _env_optional_int("SIGNAL_WATCHLIST_DIAGNOSTICS_TOP_REASONS", 3) or 3
+    )
     signal_watchlist_history_max: int = _env_optional_int("SIGNAL_WATCHLIST_HISTORY_MAX", 6) or 6
     signal_watchlist_breakout_pct: float = _env_float("SIGNAL_WATCHLIST_BREAKOUT_PCT", 0.01)
     signal_watchlist_invalidation_pct: float = _env_float("SIGNAL_WATCHLIST_INVALIDATION_PCT", 0.02)
     signal_watchlist_invalidation_confidence: float = _env_float("SIGNAL_WATCHLIST_INVALIDATION_CONFIDENCE", 0.25)
+    signal_watchlist_invalidation_min_probability_margin: float = _env_float(
+        "SIGNAL_WATCHLIST_INVALIDATION_MIN_PROBABILITY_MARGIN",
+        0.08,
+    )
+    signal_watchlist_soft_review_confidence_buffer: float = _env_float(
+        "SIGNAL_WATCHLIST_SOFT_REVIEW_CONFIDENCE_BUFFER",
+        0.08,
+    )
+    signal_watchlist_soft_review_min_raw_confidence: float = _env_float(
+        "SIGNAL_WATCHLIST_SOFT_REVIEW_MIN_RAW_CONFIDENCE",
+        0.50,
+    )
+    signal_watchlist_soft_review_min_probability_margin: float = _env_float(
+        "SIGNAL_WATCHLIST_SOFT_REVIEW_MIN_PROBABILITY_MARGIN",
+        0.12,
+    )
+    signal_watchlist_preserve_strong_blocked_buys: bool = _env_bool(
+        "SIGNAL_WATCHLIST_PRESERVE_STRONG_BLOCKED_BUYS",
+        True,
+    )
+    signal_watchlist_strong_buy_min_raw_confidence: float = _env_float(
+        "SIGNAL_WATCHLIST_STRONG_BUY_MIN_RAW_CONFIDENCE",
+        0.72,
+    )
+    signal_watchlist_strong_buy_min_probability_margin: float = _env_float(
+        "SIGNAL_WATCHLIST_STRONG_BUY_MIN_PROBABILITY_MARGIN",
+        0.18,
+    )
     signal_watchlist_promotion_min_confidence: float = _env_float(
         "SIGNAL_WATCHLIST_PROMOTION_MIN_CONFIDENCE",
         0.58,
@@ -310,8 +405,8 @@ class TrainingConfig:
     ) or 2
     signal_watchlist_entry_ready_min_positive_checks: int = _env_optional_int(
         "SIGNAL_WATCHLIST_ENTRY_READY_MIN_POSITIVE_CHECKS",
-        3,
-    ) or 3
+        2,
+    ) or 2
     signal_watchlist_entry_ready_min_confidence: float = _env_float(
         "SIGNAL_WATCHLIST_ENTRY_READY_MIN_CONFIDENCE",
         0.62,
@@ -382,6 +477,18 @@ class TrainingConfig:
     chart_breakout_buffer_pct: float = _env_float("CHART_BREAKOUT_BUFFER_PCT", 0.005)
     chart_retest_tolerance_pct: float = _env_float("CHART_RETEST_TOLERANCE_PCT", 0.003)
     chart_near_resistance_pct: float = _env_float("CHART_NEAR_RESISTANCE_PCT", 0.01)
+    chart_confirmation_confirmed_min_score: float = _env_float(
+        "CHART_CONFIRMATION_CONFIRMED_MIN_SCORE",
+        0.30,
+    )
+    chart_confirmation_early_min_score: float = _env_float(
+        "CHART_CONFIRMATION_EARLY_MIN_SCORE",
+        0.12,
+    )
+    chart_confirmation_invalid_max_score: float = _env_float(
+        "CHART_CONFIRMATION_INVALID_MAX_SCORE",
+        -0.10,
+    )
     chart_positive_decision_boost: float = _env_float("CHART_POSITIVE_DECISION_BOOST", 0.05)
     chart_negative_decision_penalty: float = _env_float("CHART_NEGATIVE_DECISION_PENALTY", 0.08)
     chart_snapshot_enabled: bool = _env_bool("CHART_SNAPSHOT_ENABLED", False)
@@ -391,11 +498,17 @@ class TrainingConfig:
     signal_excluded_base_currencies: Tuple[str, ...] = field(
         default_factory=lambda: _env_csv_tuple(
             "SIGNAL_EXCLUDED_BASE_CURRENCIES",
-            ("BTC", "ETH", "USDT", "USDC"),
+            ("BTC", "ETH", *STABLECOIN_BASE_CURRENCIES),
         )
     )
     feature_context_timeframes: Tuple[str, ...] = ("4h", "1d")
     feature_pack: str = _env_str("FEATURE_PACK", "all")
+    feature_include_groups: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple("FEATURE_INCLUDE_GROUPS", ())
+    )
+    feature_exclude_groups: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple("FEATURE_EXCLUDE_GROUPS", ())
+    )
     feature_pack_candidates: Tuple[str, ...] = field(
         default_factory=lambda: _env_csv_str_tuple(
             "FEATURE_PACK_CANDIDATES",
@@ -413,6 +526,7 @@ class TrainingConfig:
     enable_watchlist_progression_model: bool = _env_bool("ENABLE_WATCHLIST_PROGRESSION_MODEL", False)
     enable_tft_experiments: bool = _env_bool("ENABLE_TFT_EXPERIMENTS", False)
     comparison_run_walk_forward: bool = _env_bool("COMPARISON_RUN_WALK_FORWARD", False)
+    comparison_min_trade_count: int = _env_optional_int("COMPARISON_MIN_TRADE_COUNT", 5) or 5
     model_type: str = "histGradientBoostingSignalModel"
     comparison_model_types: Tuple[str, ...] = (
         "histGradientBoostingSignalModel",
@@ -435,6 +549,12 @@ class TrainingConfig:
     sell_threshold: float = -0.015
     triple_barrier_use_high_low: bool = True
     triple_barrier_tie_break: str = "stop_loss"
+    triple_barrier_use_atr: bool = _env_bool("TRIPLE_BARRIER_USE_ATR", True)
+    triple_barrier_atr_period: int = _env_optional_int("TRIPLE_BARRIER_ATR_PERIOD", 14) or 14
+    triple_barrier_buy_atr_multiplier: float = _env_float("TRIPLE_BARRIER_BUY_ATR_MULTIPLIER", 1.25)
+    triple_barrier_sell_atr_multiplier: float = _env_float("TRIPLE_BARRIER_SELL_ATR_MULTIPLIER", 1.00)
+    calibration_enabled: bool = _env_bool("CALIBRATION_ENABLED", True)
+    calibration_holdout_fraction: float = _env_float("CALIBRATION_HOLDOUT_FRACTION", 0.15)
     recency_weighting_enabled: bool = True
     recency_weighting_halflife_hours: float = 336.0
     n_estimators: int = 300
@@ -539,6 +659,10 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
         restored_config["comparison_model_types"] = tuple(restored_config["comparison_model_types"])
     if "feature_context_timeframes" in restored_config:
         restored_config["feature_context_timeframes"] = tuple(restored_config["feature_context_timeframes"])
+    if "feature_include_groups" in restored_config:
+        restored_config["feature_include_groups"] = tuple(restored_config["feature_include_groups"])
+    if "feature_exclude_groups" in restored_config:
+        restored_config["feature_exclude_groups"] = tuple(restored_config["feature_exclude_groups"])
     if "feature_pack_candidates" in restored_config:
         restored_config["feature_pack_candidates"] = tuple(restored_config["feature_pack_candidates"])
     if "signal_excluded_base_currencies" in restored_config:

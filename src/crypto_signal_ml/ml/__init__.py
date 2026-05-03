@@ -9,6 +9,7 @@ from ..data import (
     BaseApiPriceDataLoader,
     BasePriceDataEnricher,
     BasePriceDataLoader,
+    BinancePublicDataPriceDataLoader,
     CoinbaseExchangePriceDataLoader,
     CoinMarketCalEventEnricher,
     CoinMarketCapContextEnricher,
@@ -19,10 +20,11 @@ from ..data import (
     CsvPriceDataLoader,
     EnrichedCsvPriceDataLoader,
     EnrichedPriceDataLoader,
+    KrakenOhlcPriceDataLoader,
     create_market_data_loader,
 )
 from ..features import TechnicalFeatureEngineer, build_features, calculate_rsi
-from ..labels import (
+from ..labels_core import (
     BaseSignalLabeler,
     FutureReturnSignalLabeler,
     MarketRegimeLabeler,
@@ -61,6 +63,7 @@ __all__ = [
     "BasePriceDataLoader",
     "BaseSignalLabeler",
     "BaseSignalModel",
+    "BinancePublicDataPriceDataLoader",
     "CoinbaseExchangePriceDataLoader",
     "CoinMarketCalEventEnricher",
     "CoinMarketCapContextEnricher",
@@ -74,6 +77,7 @@ __all__ = [
     "EnrichedPriceDataLoader",
     "FutureReturnSignalLabeler",
     "HistGradientBoostingSignalModel",
+    "KrakenOhlcPriceDataLoader",
     "LogisticRegressionSignalModel",
     "MarketRegimeDetector",
     "MarketRegimeLabeler",

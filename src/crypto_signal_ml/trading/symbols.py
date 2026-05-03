@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from ..asset_policy import STABLECOIN_BASE_CURRENCIES
+
 
 _ALPHANUMERIC_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+$")
 _ALPHABETIC_CHARACTER_PATTERN = re.compile(r"[A-Z]")
@@ -33,3 +35,9 @@ def is_signal_eligible_base_currency(base_currency: str | None) -> bool:
         return False
 
     return _ALPHABETIC_CHARACTER_PATTERN.search(normalized_base_currency) is not None
+
+
+def is_stablecoin_base_currency(base_currency: str | None) -> bool:
+    """Return whether one base symbol belongs to the stablecoin bucket."""
+
+    return normalize_base_currency(base_currency) in STABLECOIN_BASE_CURRENCIES

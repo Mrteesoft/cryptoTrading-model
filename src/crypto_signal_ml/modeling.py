@@ -21,7 +21,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from .config import TrainingConfig, config_to_dict, dict_to_config
-from .labels import signal_to_text
+from .labels_core import signal_to_text
+from .modeling_core import fit_sigmoid_calibrator
 
 
 CLASS_ORDER = [-1, 0, 1]
@@ -76,6 +77,8 @@ class BaseSignalModel(ABC):
         self.config = config
         self.feature_columns = feature_columns or []
         self.estimator = None
+        self.calibrator = None
+        self.calibration_summary: Dict[str, Any] = {"enabled": False}
 
     @staticmethod
     def split_train_test_by_time(
@@ -256,7 +259,11 @@ class BaseSignalModel(ABC):
     def _build_estimator(self) -> Any:
         """Create the underlying scikit-learn estimator for the subclass."""
 
-    def fit(self, train_df: pd.DataFrame) -> "BaseSignalModel":
+    def fit(
+        self,
+        train_df: pd.DataFrame,
+        valid_frame: pd.DataFrame | None = None,
+    ) -> "BaseSignalModel":
         """
         Train the estimator using the configured feature columns.
 
@@ -274,6 +281,14 @@ class BaseSignalModel(ABC):
             target_series=target_series,
             sample_weight=sample_weight,
         )
+        self.calibrator = None
+        self.calibration_summary = {"enabled": False}
+        if bool(getattr(self.config, "calibration_enabled", True)):
+            self.calibrator, self.calibration_summary = fit_sigmoid_calibrator(
+                estimator=self.estimator,
+                calibration_df=valid_frame if valid_frame is not None else pd.DataFrame(),
+                feature_columns=self.feature_columns,
+            )
         return self
 
     def evaluate(
@@ -290,15 +305,7 @@ class BaseSignalModel(ABC):
 
         self._validate_trained_model()
 
-        predictions = self.estimator.predict(test_df[self.feature_columns])
-        probabilities = self.estimator.predict_proba(test_df[self.feature_columns])
-
-        prediction_df = test_df.copy()
-        prediction_df = self._attach_prediction_columns(
-            base_df=prediction_df,
-            predictions=predictions,
-            probabilities=probabilities,
-        )
+        prediction_df = self.predict(test_df)
         prediction_df["prediction_correct"] = (
             prediction_df["predicted_signal"] == prediction_df["target_signal"]
         )
@@ -309,11 +316,12 @@ class BaseSignalModel(ABC):
             "test_rows": int(len(test_df)),
             **self.build_classification_metrics(
                 actual_signals=test_df["target_signal"],
-                predicted_signals=predictions,
+                predicted_signals=prediction_df["predicted_signal"],
             ),
             "feature_importance": self.get_feature_importance(),
             "train_class_distribution": self.build_signal_distribution(train_df["target_signal"]),
             "test_class_distribution": self.build_signal_distribution(test_df["target_signal"]),
+            "calibration": dict(self.calibration_summary),
         }
 
         return prediction_df, metrics
@@ -329,13 +337,16 @@ class BaseSignalModel(ABC):
         self._validate_trained_model()
 
         usable_rows = feature_df.dropna(subset=self.feature_columns).copy()
-        predictions = self.estimator.predict(usable_rows[self.feature_columns])
-        probabilities = self.estimator.predict_proba(usable_rows[self.feature_columns])
+        raw_probabilities, calibrated_probabilities = self._predict_probability_values(
+            usable_rows[self.feature_columns]
+        )
+        predictions = self._probabilities_to_predictions(calibrated_probabilities)
 
         usable_rows = self._attach_prediction_columns(
             base_df=usable_rows,
             predictions=predictions,
-            probabilities=probabilities,
+            raw_probabilities=raw_probabilities,
+            calibrated_probabilities=calibrated_probabilities,
         )
 
         return usable_rows
@@ -345,13 +356,23 @@ class BaseSignalModel(ABC):
 
         self._validate_trained_model()
         usable_rows = feature_df.dropna(subset=self.feature_columns).copy()
-        probabilities = self.estimator.predict_proba(usable_rows[self.feature_columns])
+        raw_probabilities, calibrated_probabilities = self._predict_probability_values(
+            usable_rows[self.feature_columns]
+        )
         output_df = self._add_probability_columns(
             base_df=usable_rows,
             class_labels=list(self.estimator.classes_),
-            probability_values=probabilities,
+            probability_values=calibrated_probabilities,
         )
+        output_df = self._add_probability_columns(
+            base_df=output_df,
+            class_labels=list(self.estimator.classes_),
+            probability_values=raw_probabilities,
+            prefix="raw_",
+        )
+        output_df["raw_confidence"] = output_df[["raw_prob_take_profit", "raw_prob_hold", "raw_prob_buy"]].max(axis=1)
         output_df["confidence"] = output_df[["prob_take_profit", "prob_hold", "prob_buy"]].max(axis=1)
+        output_df["calibrationApplied"] = bool(self.calibrator is not None)
         return output_df
 
     def rank(self, feature_df: pd.DataFrame) -> pd.DataFrame:
@@ -375,6 +396,7 @@ class BaseSignalModel(ABC):
             "featurePreview": list(self.feature_columns[:10]),
             "supportsRank": True,
             "supportsProba": True,
+            "calibration": dict(self.calibration_summary),
         }
 
     def get_feature_importance(self) -> Dict[str, float]:
@@ -422,12 +444,7 @@ class BaseSignalModel(ABC):
 
         self._validate_trained_model()
 
-        model_bundle = {
-            "model_type": self.model_type,
-            "model": self.estimator,
-            "feature_columns": self.feature_columns,
-            "config": config_to_dict(self.config),
-        }
+        model_bundle = self._serialize_bundle()
 
         model_path.parent.mkdir(parents=True, exist_ok=True)
         temp_file_descriptor, temp_file_name = tempfile.mkstemp(
@@ -465,6 +482,8 @@ class BaseSignalModel(ABC):
 
         model_instance = model_class(config=config, feature_columns=feature_columns)
         model_instance.estimator = model_bundle["model"]
+        model_instance.calibrator = model_bundle.get("calibrator")
+        model_instance.calibration_summary = dict(model_bundle.get("calibration_summary", {"enabled": False}))
 
         return model_instance
 
@@ -472,7 +491,8 @@ class BaseSignalModel(ABC):
         self,
         base_df: pd.DataFrame,
         predictions: Any,
-        probabilities: Any,
+        raw_probabilities: Any,
+        calibrated_probabilities: Any,
     ) -> pd.DataFrame:
         """
         Add predicted class names and probability columns to a DataFrame.
@@ -488,9 +508,17 @@ class BaseSignalModel(ABC):
         output_df = self._add_probability_columns(
             base_df=output_df,
             class_labels=list(self.estimator.classes_),
-            probability_values=probabilities,
+            probability_values=calibrated_probabilities,
         )
+        output_df = self._add_probability_columns(
+            base_df=output_df,
+            class_labels=list(self.estimator.classes_),
+            probability_values=raw_probabilities,
+            prefix="raw_",
+        )
+        output_df["raw_confidence"] = output_df[["raw_prob_take_profit", "raw_prob_hold", "raw_prob_buy"]].max(axis=1)
         output_df["confidence"] = output_df[["prob_take_profit", "prob_hold", "prob_buy"]].max(axis=1)
+        output_df["calibrationApplied"] = bool(self.calibrator is not None)
 
         return output_df
 
@@ -499,6 +527,7 @@ class BaseSignalModel(ABC):
         base_df: pd.DataFrame,
         class_labels: List[int],
         probability_values: Any,
+        prefix: str = "",
     ) -> pd.DataFrame:
         """
         Add probability columns in a stable order.
@@ -508,19 +537,51 @@ class BaseSignalModel(ABC):
         """
 
         output_df = base_df.copy()
-        output_df["prob_take_profit"] = 0.0
-        output_df["prob_hold"] = 0.0
-        output_df["prob_buy"] = 0.0
+        output_df[f"{prefix}prob_take_profit"] = 0.0
+        output_df[f"{prefix}prob_hold"] = 0.0
+        output_df[f"{prefix}prob_buy"] = 0.0
 
         for class_label, class_probability in zip(class_labels, probability_values.T):
             if class_label == -1:
-                output_df["prob_take_profit"] = class_probability
+                output_df[f"{prefix}prob_take_profit"] = class_probability
             elif class_label == 0:
-                output_df["prob_hold"] = class_probability
+                output_df[f"{prefix}prob_hold"] = class_probability
             elif class_label == 1:
-                output_df["prob_buy"] = class_probability
+                output_df[f"{prefix}prob_buy"] = class_probability
 
         return output_df
+
+    def _predict_probability_values(
+        self,
+        feature_frame: pd.DataFrame,
+    ) -> tuple[Any, Any]:
+        """Return raw and calibrated probability arrays for one feature frame."""
+
+        raw_probabilities = self.estimator.predict_proba(feature_frame)
+        if self.calibrator is None:
+            return raw_probabilities, raw_probabilities
+
+        calibrated_probabilities = self.calibrator.predict_proba(feature_frame)
+        return raw_probabilities, calibrated_probabilities
+
+    def _probabilities_to_predictions(self, probability_values: Any) -> np.ndarray:
+        """Convert ordered probabilities into class-label predictions."""
+
+        class_labels = np.asarray(list(self.estimator.classes_))
+        prediction_indices = np.argmax(probability_values, axis=1)
+        return class_labels[prediction_indices]
+
+    def _serialize_bundle(self) -> Dict[str, Any]:
+        """Build the persisted model bundle used by both save and artifact export."""
+
+        return {
+            "model_type": self.model_type,
+            "model": self.estimator,
+            "feature_columns": self.feature_columns,
+            "config": config_to_dict(self.config),
+            "calibrator": self.calibrator,
+            "calibration_summary": dict(self.calibration_summary),
+        }
 
     def _validate_feature_columns(self) -> None:
         """Make sure training knows which columns to read."""

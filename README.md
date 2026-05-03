@@ -147,7 +147,8 @@ Config switches to focus on:
 - `src/crypto_signal_ml/tools/`: stable structured tool layer for LLM-callable signal, trader, model, and retrieval access
 - `src/crypto_signal_ml/llm/`: provider-specific adapters that consume tool schemas instead of trading logic
 - `src/crypto_signal_ml/memory/`: session-memory facade
-- `src/crypto_signal_ml/trading/`: trading, signal, portfolio, policy, and trader-brain modules
+- `src/crypto_signal_ml/portfolio_core/`: canonical portfolio-planning and trader-brain ownership layer
+- `src/crypto_signal_ml/trading/`: trading, signal, portfolio, policy, and compatibility planner modules
 - `src/crypto_signal_ml/storage/`: storage adapters
 - `scripts/`: command-line entrypoints
 - `tests/`: pytest coverage
