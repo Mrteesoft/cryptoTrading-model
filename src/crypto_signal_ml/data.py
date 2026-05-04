@@ -36,7 +36,7 @@ def read_market_price_csv(data_path: Path) -> pd.DataFrame:
     """
 
     try:
-        return pd.read_csv(data_path)
+        return pd.read_csv(data_path, low_memory=False)
     except pd.errors.ParserError as error:
         header: list[str] | None = None
         repaired_rows: list[list[str]] = []
@@ -70,6 +70,31 @@ def read_market_price_csv(data_path: Path) -> pd.DataFrame:
             raise error
 
         return repaired_df
+
+
+def drop_invalid_market_price_rows(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce OHLCV columns and remove rows that cannot be used for training."""
+
+    cleaned_df = price_df.copy()
+    numeric_columns = [column for column in REQUIRED_PRICE_COLUMNS if column in cleaned_df.columns]
+    for column in numeric_columns:
+        cleaned_df[column] = pd.to_numeric(cleaned_df[column], errors="coerce")
+
+    if numeric_columns:
+        cleaned_df = cleaned_df.replace([np.inf, -np.inf], np.nan)
+        cleaned_df = cleaned_df.dropna(subset=numeric_columns)
+
+    if "timestamp" in cleaned_df.columns:
+        cleaned_df["timestamp"] = pd.to_datetime(cleaned_df["timestamp"], errors="coerce", utc=True)
+        cleaned_df = cleaned_df.dropna(subset=["timestamp"])
+
+    if "product_id" in cleaned_df.columns:
+        cleaned_df = cleaned_df.dropna(subset=["product_id"])
+        normalized_product_ids = cleaned_df["product_id"].astype(str).str.strip()
+        cleaned_df["product_id"] = normalized_product_ids
+        cleaned_df = cleaned_df[~normalized_product_ids.str.lower().isin({"", "nan", "none"})]
+
+    return cleaned_df.reset_index(drop=True)
 
 
 class CoinMarketCapApiError(ValueError):
@@ -383,7 +408,7 @@ class BaseApiPriceDataLoader(BasePriceDataLoader):
         """Persist the downloaded candles so training can reuse them offline."""
 
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
-        prepared_df = price_df.copy()
+        prepared_df = drop_invalid_market_price_rows(price_df)
         if "time_step" in prepared_df.columns:
             prepared_df = prepared_df.drop(columns=["time_step"])
         prepared_df.to_csv(self.data_path, index=False)

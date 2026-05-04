@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from crypto_signal_ml.config import TrainingConfig, apply_runtime_market_data_settings  # noqa: E402
-from crypto_signal_ml.data import read_market_price_csv  # noqa: E402
+from crypto_signal_ml.data import drop_invalid_market_price_rows, read_market_price_csv  # noqa: E402
 from crypto_signal_ml.application import (  # noqa: E402
     MarketEventsRefreshApp,
     MarketDataRefreshApp,
@@ -1452,6 +1452,77 @@ def test_kraken_loader_normalizes_public_ohlc_rows(
     assert price_df.iloc[0]["open"] == pytest.approx(100.0)
     assert price_df.iloc[1]["close"] == pytest.approx(112.0)
     assert price_df.iloc[0]["source"] == "kraken"
+
+
+def test_kraken_loader_drops_invalid_existing_rows_before_saving(tmp_path: Path) -> None:
+    """A stale malformed raw row should not poison the next Kraken refresh."""
+
+    data_path = tmp_path / "marketPrices.csv"
+    pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "open": "bad",
+                "high": "110.0",
+                "low": "90.0",
+                "close": "105.0",
+                "volume": "12.5",
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "granularity_seconds": 3600,
+                "source": "kraken",
+            },
+            {
+                "timestamp": "2026-01-01T01:00:00+00:00",
+                "open": "105.0",
+                "high": "115.0",
+                "low": "95.0",
+                "close": "112.0",
+                "volume": "8.0",
+                "product_id": "ETH-USD",
+                "base_currency": "ETH",
+                "quote_currency": "USD",
+                "granularity_seconds": 3600,
+                "source": "kraken",
+            },
+        ]
+    ).to_csv(data_path, index=False)
+
+    loader = KrakenOhlcPriceDataLoader(
+        data_path=data_path,
+        product_ids=("BTC-USD",),
+        product_id="",
+        granularity_seconds=3600,
+        total_candles=2,
+        log_progress=False,
+    )
+    new_batch_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2026-01-01T02:00:00+00:00",
+                "open": 120.0,
+                "high": 130.0,
+                "low": 119.0,
+                "close": 125.0,
+                "volume": 7.0,
+                "product_id": "BTC-USD",
+                "base_currency": "BTC",
+                "quote_currency": "USD",
+                "granularity_seconds": 3600,
+                "source": "kraken",
+            }
+        ]
+    )
+
+    loader._save_downloaded_data(new_batch_df)
+    saved_df = pd.read_csv(data_path)
+    cleaned_df = drop_invalid_market_price_rows(saved_df)
+
+    assert len(saved_df) == 2
+    assert len(cleaned_df) == len(saved_df)
+    assert set(saved_df["product_id"]) == {"ETH-USD", "BTC-USD"}
+    assert saved_df["open"].isna().sum() == 0
 
 
 def test_binance_public_data_loader_normalizes_archive_rows(
