@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -25,10 +27,10 @@ from crypto_signal_ml.features_core import (  # noqa: E402
     resolve_feature_group,
 )
 from crypto_signal_ml.labels_core import FutureReturnSignalLabeler, TripleBarrierSignalLabeler  # noqa: E402
-from crypto_signal_ml.modeling import LogisticRegressionSignalModel  # noqa: E402
+from crypto_signal_ml.modeling import HistGradientBoostingSignalModel, LogisticRegressionSignalModel  # noqa: E402
 from crypto_signal_ml.modeling_core.artifacts import save_model_artifact_bundle  # noqa: E402
 from crypto_signal_ml.pipeline import CryptoDatasetBuilder  # noqa: E402
-from crypto_signal_ml.signal_generation import SignalContributionLedger  # noqa: E402
+from crypto_signal_ml.signal_generation import SignalContributionLedger, build_raw_signal_candidate  # noqa: E402
 from crypto_signal_ml.trading.policy import evaluate_trading_decision  # noqa: E402
 
 
@@ -194,6 +196,80 @@ def test_logistic_model_outputs_calibrated_and_raw_probabilities(tmp_path: Path)
     assert (artifact_dir / "manifest.json").exists()
     assert (artifact_dir / "feature_registry_snapshot.json").exists()
     assert (artifact_dir / "label_recipe.json").exists()
+
+
+def test_action_selector_uses_raw_edge_without_disabling_calibration() -> None:
+    """A raw action edge should override calibrated HOLD argmax only when it clears the action bar."""
+
+    model = HistGradientBoostingSignalModel(
+        config=TrainingConfig(
+            decision_action_selector_enabled=True,
+            decision_buy_raw_probability_threshold=0.34,
+            decision_take_profit_raw_probability_threshold=0.34,
+            decision_action_raw_hold_edge=0.02,
+        ),
+        feature_columns=["return_1"],
+    )
+    model.estimator = SimpleNamespace(classes_=np.array([-1, 0, 1]))
+
+    calibrated_probabilities = np.array(
+        [
+            [0.06, 0.82, 0.12],
+            [0.72, 0.18, 0.10],
+            [0.10, 0.55, 0.35],
+        ]
+    )
+    raw_probabilities = np.array(
+        [
+            [0.10, 0.30, 0.60],
+            [0.56, 0.28, 0.16],
+            [0.10, 0.36, 0.54],
+        ]
+    )
+
+    predictions = model._probabilities_to_predictions(
+        calibrated_probabilities,
+        raw_probability_values=raw_probabilities,
+    )
+
+    assert predictions.tolist() == [1, -1, 1]
+
+
+def test_raw_action_candidate_uses_raw_confidence_when_calibration_prefers_hold() -> None:
+    """The signal gate should see the raw action edge instead of only the calibrated HOLD argmax."""
+
+    candidate = build_raw_signal_candidate(
+        signal_row={
+            "product_id": "TRX-USD",
+            "timestamp": "2026-05-04T07:00:00Z",
+            "close": 0.33,
+            "time_step": 10,
+            "predicted_signal": 1,
+            "predicted_name": "BUY",
+            "prob_buy": 0.20,
+            "prob_hold": 0.70,
+            "prob_take_profit": 0.10,
+            "raw_prob_buy": 0.68,
+            "raw_prob_hold": 0.30,
+            "raw_prob_take_profit": 0.02,
+        },
+        minimum_action_confidence=0.65,
+        setup_score=0.0,
+        symbol="TRX",
+        pair_symbol="TRX-USD",
+        base_currency="TRX",
+        quote_currency="USD",
+        chart_context={},
+        execution_context={},
+        market_context={},
+        market_state={"label": "trend_up", "isHighVolatility": False},
+        event_context={"hasEventNext7d": False},
+    )
+
+    assert candidate.rawSignalName == "BUY"
+    assert candidate.rawConfidence == pytest.approx(0.68)
+    assert candidate.calibratedConfidence == pytest.approx(0.68)
+    assert candidate.probabilityMargin == pytest.approx(0.38)
 
 
 def test_signal_contribution_ledger_is_frozen_and_exposed() -> None:

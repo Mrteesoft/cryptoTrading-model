@@ -340,7 +340,10 @@ class BaseSignalModel(ABC):
         raw_probabilities, calibrated_probabilities = self._predict_probability_values(
             usable_rows[self.feature_columns]
         )
-        predictions = self._probabilities_to_predictions(calibrated_probabilities)
+        predictions = self._probabilities_to_predictions(
+            calibrated_probabilities,
+            raw_probability_values=raw_probabilities,
+        )
 
         usable_rows = self._attach_prediction_columns(
             base_df=usable_rows,
@@ -564,12 +567,62 @@ class BaseSignalModel(ABC):
         calibrated_probabilities = self.calibrator.predict_proba(feature_frame)
         return raw_probabilities, calibrated_probabilities
 
-    def _probabilities_to_predictions(self, probability_values: Any) -> np.ndarray:
-        """Convert ordered probabilities into class-label predictions."""
+    def _probabilities_to_predictions(
+        self,
+        probability_values: Any,
+        raw_probability_values: Any | None = None,
+    ) -> np.ndarray:
+        """Convert probabilities into class-label predictions.
+
+        Calibrated probabilities are useful for risk sizing, but they can make
+        HOLD dominate the argmax even when the raw model sees a tradable edge.
+        The action-aware selector lets BUY/TAKE_PROFIT win only when the raw
+        action probability clears a floor and an edge over HOLD.
+        """
 
         class_labels = np.asarray(list(self.estimator.classes_))
-        prediction_indices = np.argmax(probability_values, axis=1)
-        return class_labels[prediction_indices]
+        calibrated_predictions = class_labels[np.argmax(probability_values, axis=1)]
+        if (
+            raw_probability_values is None
+            or not bool(getattr(self.config, "decision_action_selector_enabled", True))
+        ):
+            return calibrated_predictions
+
+        label_to_index = {
+            int(class_label): index
+            for index, class_label in enumerate(class_labels.tolist())
+        }
+        if not {-1, 0, 1}.issubset(label_to_index):
+            return calibrated_predictions
+
+        raw_probabilities = np.asarray(raw_probability_values, dtype=float)
+        selected_predictions = np.asarray(calibrated_predictions).copy()
+        hold_probabilities = raw_probabilities[:, label_to_index[0]]
+        action_candidates = (
+            (
+                1,
+                float(getattr(self.config, "decision_buy_raw_probability_threshold", 0.34)),
+            ),
+            (
+                -1,
+                float(getattr(self.config, "decision_take_profit_raw_probability_threshold", 0.34)),
+            ),
+        )
+        minimum_hold_edge = float(getattr(self.config, "decision_action_raw_hold_edge", 0.02))
+
+        for row_index, row_probabilities in enumerate(raw_probabilities):
+            qualified_actions: list[tuple[float, float, int]] = []
+            for action_label, probability_threshold in action_candidates:
+                action_probability = float(row_probabilities[label_to_index[action_label]])
+                hold_edge = action_probability - float(hold_probabilities[row_index])
+                if action_probability >= probability_threshold and hold_edge >= minimum_hold_edge:
+                    qualified_actions.append((action_probability, hold_edge, action_label))
+
+            if qualified_actions:
+                _, _, selected_label = max(qualified_actions, key=lambda item: (item[0], item[1]))
+                selected_predictions[row_index] = selected_label
+
+        return selected_predictions
 
     def _serialize_bundle(self) -> Dict[str, Any]:
         """Build the persisted model bundle used by both save and artifact export."""

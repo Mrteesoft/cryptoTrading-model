@@ -96,12 +96,24 @@ def build_raw_signal_candidate(
         "BUY": 1,
     }.get(raw_signal_name, int(round(_safe_float(signal_row, "predicted_signal"))))
     primary_probability = float(calibrated_probabilities.get(raw_signal_name, 0.0))
-    raw_confidence = max(raw_probabilities.values()) if raw_probabilities else _safe_float(signal_row, "raw_confidence")
-    calibrated_confidence = (
-        max(calibrated_probabilities.values())
-        if calibrated_probabilities
-        else _safe_float(signal_row, "confidence")
+    raw_primary_probability = float(raw_probabilities.get(raw_signal_name, 0.0))
+    raw_confidence = raw_primary_probability or (
+        max(raw_probabilities.values()) if raw_probabilities else _safe_float(signal_row, "raw_confidence")
     )
+    if raw_signal_name in {"BUY", "TAKE_PROFIT"}:
+        calibrated_confidence = max(primary_probability, raw_primary_probability)
+    else:
+        calibrated_confidence = primary_probability or (
+            max(calibrated_probabilities.values())
+            if calibrated_probabilities
+            else _safe_float(signal_row, "confidence")
+        )
+    selected_probability_margin = probability_margin(calibrated_probabilities, raw_signal_name)
+    if raw_signal_name in {"BUY", "TAKE_PROFIT"}:
+        selected_probability_margin = max(
+            selected_probability_margin,
+            probability_margin(raw_probabilities, raw_signal_name),
+        )
 
     return RawSignalCandidate(
         productId=_safe_text(signal_row, "product_id"),
@@ -122,7 +134,7 @@ def build_raw_signal_candidate(
         rawConfidence=float(raw_confidence),
         calibratedConfidence=float(calibrated_confidence),
         primaryProbability=primary_probability,
-        probabilityMargin=probability_margin(calibrated_probabilities, raw_signal_name),
+        probabilityMargin=selected_probability_margin,
         hasProbabilityColumns=all(
             column_name in signal_row
             for column_name in ("prob_take_profit", "prob_hold", "prob_buy")

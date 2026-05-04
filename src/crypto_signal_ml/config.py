@@ -602,6 +602,13 @@ class TrainingConfig:
     backtest_max_positions_per_timestamp: int = 3
     decision_policy_enabled: bool = True
     decision_block_downtrend_buys: bool = True
+    decision_action_selector_enabled: bool = _env_bool("DECISION_ACTION_SELECTOR_ENABLED", True)
+    decision_buy_raw_probability_threshold: float = _env_float("DECISION_BUY_RAW_PROBABILITY_THRESHOLD", 0.34)
+    decision_take_profit_raw_probability_threshold: float = _env_float(
+        "DECISION_TAKE_PROFIT_RAW_PROBABILITY_THRESHOLD",
+        0.34,
+    )
+    decision_action_raw_hold_edge: float = _env_float("DECISION_ACTION_RAW_HOLD_EDGE", 0.02)
     decision_min_probability_margin: float = 0.08
     decision_high_volatility_confidence_buffer: float = 0.07
     decision_event_risk_confidence_buffer: float = 0.05
