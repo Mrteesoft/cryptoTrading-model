@@ -273,7 +273,15 @@ class TrainingConfig:
         )
     )
     kraken_product_id: str = _env_str("KRAKEN_PRODUCT_ID", "BTC-USD")
+    kraken_fetch_all_quote_products: bool = _env_bool("KRAKEN_FETCH_ALL_QUOTE_PRODUCTS", False)
     kraken_quote_currency: str = _env_str("KRAKEN_QUOTE_CURRENCY", "USD")
+    kraken_excluded_base_currencies: Tuple[str, ...] = field(
+        default_factory=lambda: _env_csv_str_tuple(
+            "KRAKEN_EXCLUDED_BASE_CURRENCIES",
+            STABLECOIN_BASE_CURRENCIES,
+        )
+    )
+    kraken_max_products: Optional[int] = _env_optional_int("KRAKEN_MAX_PRODUCTS", None)
     kraken_granularity_seconds: int = _env_optional_int("KRAKEN_GRANULARITY_SECONDS", 3600) or 3600
     kraken_total_candles: int = _env_optional_int("KRAKEN_TOTAL_CANDLES", 720) or 720
     kraken_request_pause_seconds: float = _env_float("KRAKEN_REQUEST_PAUSE_SECONDS", 0.2)
@@ -682,6 +690,10 @@ def dict_to_config(config_dict: Dict[str, Any]) -> TrainingConfig:
     if "coinbase_excluded_base_currencies" in restored_config:
         restored_config["coinbase_excluded_base_currencies"] = tuple(
             restored_config["coinbase_excluded_base_currencies"]
+        )
+    if "kraken_excluded_base_currencies" in restored_config:
+        restored_config["kraken_excluded_base_currencies"] = tuple(
+            restored_config["kraken_excluded_base_currencies"]
         )
     if "tuning_prediction_horizon_candidates" in restored_config:
         restored_config["tuning_prediction_horizon_candidates"] = tuple(

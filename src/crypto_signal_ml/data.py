@@ -3148,6 +3148,8 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
 
     api_name = "kraken"
     api_base_url = "https://api.kraken.com/0/public/OHLC"
+    api_asset_pairs_url = "https://api.kraken.com/0/public/AssetPairs"
+    api_ticker_url = "https://api.kraken.com/0/public/Ticker"
     valid_granularities = {60: 1, 300: 5, 900: 15, 1800: 30, 3600: 60, 14400: 240, 86400: 1440}
 
     def __init__(
@@ -3155,7 +3157,10 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
         data_path: Path,
         product_id: Optional[str] = None,
         product_ids: Sequence[str] = None,
+        fetch_all_quote_products: bool = False,
         quote_currency: str = "USD",
+        excluded_base_currencies: Sequence[str] = None,
+        max_products: Optional[int] = None,
         granularity_seconds: int = 3600,
         total_candles: int = 720,
         request_pause_seconds: float = 0.2,
@@ -3168,7 +3173,10 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
         super().__init__(data_path=data_path, should_save_downloaded_data=should_save_downloaded_data)
         self.product_id = product_id
         self.product_ids = tuple(product_ids or ())
+        self.fetch_all_quote_products = fetch_all_quote_products
         self.quote_currency = quote_currency
+        self.excluded_base_currencies = tuple(excluded_base_currencies or ())
+        self.max_products = max_products
         self.granularity_seconds = granularity_seconds
         self.total_candles = total_candles
         self.request_pause_seconds = request_pause_seconds
@@ -3189,9 +3197,15 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
             "Starting Kraken market refresh: "
             f"{len(selected_products)} products, up to {self.total_candles} candles each."
         )
+        skipped_products: List[str] = []
         for product_index, product_details in enumerate(selected_products):
             self._log_progress(f"[{product_index + 1}/{len(selected_products)}] Downloading {product_details['product_id']}")
-            raw_rows = self._request_ohlc_rows(product_details["exchange_pair"])
+            try:
+                raw_rows = self._request_ohlc_rows(product_details["exchange_pair"])
+            except ValueError as error:
+                skipped_products.append(product_details["product_id"])
+                self._log_progress(f"Skipping {product_details['product_id']}: {error}")
+                continue
             normalized_rows = self._normalize_candle_rows(product_details, raw_rows[-self.total_candles :])
             all_candle_rows.extend(normalized_rows)
             self._maybe_save_partial_progress(all_candle_rows, product_index + 1)
@@ -3204,7 +3218,9 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
         price_df = self._build_price_frame(all_candle_rows)
         self.last_refresh_summary = {
             "totalAvailableProducts": len(available_products),
-            "productsDownloaded": len(selected_products),
+            "productsDownloaded": len(selected_products) - len(skipped_products),
+            "productsSkipped": len(skipped_products),
+            "skippedProducts": skipped_products,
             "requestWindowsPerProduct": 1,
             "batchSize": batch_summary["batchSize"],
             "batchNumber": batch_summary["batchNumber"],
@@ -3233,6 +3249,9 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
             raise ValueError("kraken_product_batch_number must be greater than zero.")
 
     def _resolve_products_to_download(self) -> List[Dict[str, str]]:
+        if self.fetch_all_quote_products:
+            return self._fetch_filtered_products()
+
         explicit_product_ids = list(self.product_ids)
         if self.product_id:
             explicit_product_ids.append(self.product_id)
@@ -3256,6 +3275,118 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
                 }
             )
         return products
+
+    def _fetch_filtered_products(self) -> List[Dict[str, str]]:
+        """Fetch Kraken tradable pairs and keep eligible quote-currency products."""
+
+        request = Request(
+            self.api_asset_pairs_url,
+            headers={"User-Agent": "crypto-signal-ml/0.1", "Accept": "application/json"},
+        )
+        with urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+
+        errors = response_payload.get("error", []) if isinstance(response_payload, dict) else []
+        if errors:
+            raise ValueError(f"Kraken AssetPairs request failed: {errors}")
+
+        raw_pairs = response_payload.get("result", {}) if isinstance(response_payload, dict) else {}
+        if not isinstance(raw_pairs, dict):
+            raise ValueError(
+                "Unexpected response received from Kraken AssetPairs endpoint. "
+                f"Response type: {type(raw_pairs)}"
+            )
+
+        excluded_bases = {currency.upper() for currency in self.excluded_base_currencies}
+        quote_currency_filter = self.quote_currency.upper()
+        filtered_products: List[Dict[str, str]] = []
+        seen_ids: set[str] = set()
+
+        for exchange_pair, pair_details in raw_pairs.items():
+            if not isinstance(pair_details, dict):
+                continue
+
+            status = str(pair_details.get("status", "online")).strip().lower()
+            if status not in {"", "online"}:
+                continue
+
+            base_currency, quote_currency = self._split_kraken_pair_details(pair_details)
+            if quote_currency != quote_currency_filter:
+                continue
+            if base_currency in excluded_bases:
+                continue
+            if not is_signal_eligible_base_currency(base_currency):
+                continue
+
+            product_id = f"{base_currency}-{quote_currency}"
+            if product_id in seen_ids:
+                continue
+            seen_ids.add(product_id)
+            filtered_products.append(
+                {
+                    "product_id": product_id,
+                    "base_currency": base_currency,
+                    "quote_currency": quote_currency,
+                    "exchange_pair": str(exchange_pair),
+                }
+            )
+
+        quote_volume_by_pair = self._fetch_quote_volume_by_pair()
+        filtered_products = sorted(
+            filtered_products,
+            key=lambda product: (
+                -quote_volume_by_pair.get(product["exchange_pair"], 0.0),
+                product["product_id"],
+            ),
+        )
+
+        if self.max_products is not None:
+            filtered_products = filtered_products[: self.max_products]
+
+        if not filtered_products:
+            raise ValueError("No Kraken products matched the configured multi-coin filters.")
+
+        return filtered_products
+
+    def _fetch_quote_volume_by_pair(self) -> Dict[str, float]:
+        """Fetch Kraken 24h ticker volume for liquidity-first universe ordering."""
+
+        request = Request(
+            self.api_ticker_url,
+            headers={"User-Agent": "crypto-signal-ml/0.1", "Accept": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return {}
+
+        result_payload = response_payload.get("result", {}) if isinstance(response_payload, dict) else {}
+        if not isinstance(result_payload, dict):
+            return {}
+
+        quote_volume_by_pair: Dict[str, float] = {}
+        for exchange_pair, ticker_details in result_payload.items():
+            if not isinstance(ticker_details, dict):
+                continue
+            try:
+                close_price = float((ticker_details.get("c") or [0.0])[0])
+                base_volume = float((ticker_details.get("v") or [0.0, 0.0])[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            quote_volume_by_pair[str(exchange_pair)] = close_price * base_volume
+
+        return quote_volume_by_pair
+
+    def _split_kraken_pair_details(self, pair_details: Dict[str, object]) -> tuple[str, str]:
+        wsname = str(pair_details.get("wsname", "")).strip().upper()
+        if "/" in wsname:
+            base_currency, quote_currency = wsname.split("/", 1)
+            return self._normalize_kraken_asset_symbol(base_currency), self._normalize_kraken_asset_symbol(quote_currency)
+
+        base_currency = self._normalize_kraken_asset_symbol(pair_details.get("base"))
+        quote_currency = self._normalize_kraken_asset_symbol(pair_details.get("quote"))
+        return base_currency, quote_currency
 
     def get_available_products(self) -> List[Dict[str, str]]:
         self._validate_download_settings()
@@ -3378,6 +3509,27 @@ class KrakenOhlcPriceDataLoader(BaseApiPriceDataLoader):
         else:
             base_currency, quote_currency = normalized_product_id, self.quote_currency
         return normalize_base_currency(base_currency), quote_currency.upper()
+
+    @staticmethod
+    def _normalize_kraken_asset_symbol(raw_symbol: object) -> str:
+        normalized_symbol = normalize_base_currency(str(raw_symbol).split(".", 1)[0])
+        symbol_aliases = {
+            "XBT": "BTC",
+            "XXBT": "BTC",
+            "XDG": "DOGE",
+            "XXDG": "DOGE",
+            "ZUSD": "USD",
+            "ZEUR": "EUR",
+            "ZGBP": "GBP",
+            "ZJPY": "JPY",
+            "XETH": "ETH",
+            "XLTC": "LTC",
+            "XETC": "ETC",
+            "XMLN": "MLN",
+            "XXMR": "XMR",
+            "XXRP": "XRP",
+        }
+        return symbol_aliases.get(normalized_symbol, normalized_symbol)
 
     @staticmethod
     def _to_kraken_pair(base_currency: str, quote_currency: str) -> str:
@@ -3959,7 +4111,14 @@ def create_market_data_loader(
             data_path=data_path or config.data_file,
             product_id=product_id if product_id is not None else config.kraken_product_id,
             product_ids=tuple(product_ids) if product_ids is not None else config.kraken_product_ids,
+            fetch_all_quote_products=(
+                fetch_all_quote_products
+                if fetch_all_quote_products is not None
+                else config.kraken_fetch_all_quote_products
+            ),
             quote_currency=config.kraken_quote_currency,
+            excluded_base_currencies=config.kraken_excluded_base_currencies,
+            max_products=max_products if max_products is not None else config.kraken_max_products,
             product_batch_size=(
                 product_batch_size
                 if product_batch_size is not None

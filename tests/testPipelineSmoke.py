@@ -16,6 +16,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import crypto_signal_ml.data as market_data_module  # noqa: E402
 from crypto_signal_ml.config import TrainingConfig, apply_runtime_market_data_settings  # noqa: E402
 from crypto_signal_ml.data import drop_invalid_market_price_rows, read_market_price_csv  # noqa: E402
 from crypto_signal_ml.application import (  # noqa: E402
@@ -1523,6 +1524,85 @@ def test_kraken_loader_drops_invalid_existing_rows_before_saving(tmp_path: Path)
     assert len(cleaned_df) == len(saved_df)
     assert set(saved_df["product_id"]) == {"ETH-USD", "BTC-USD"}
     assert saved_df["open"].isna().sum() == 0
+
+
+def test_kraken_loader_skips_unsupported_pairs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One unsupported Kraken pair should not fail the entire refresh batch."""
+
+    loader = KrakenOhlcPriceDataLoader(
+        data_path=tmp_path / "marketPrices.csv",
+        product_ids=("BTC-USD", "MISSING-USD"),
+        product_id="",
+        granularity_seconds=3600,
+        total_candles=1,
+        log_progress=False,
+    )
+
+    def fake_request_ohlc_rows(exchange_pair: str) -> list[list[object]]:
+        if exchange_pair == "MISSINGUSD":
+            raise ValueError("Kraken OHLC request failed for MISSINGUSD: ['EQuery:Unknown asset pair']")
+        return [
+            [1767225600, "100.0", "110.0", "90.0", "105.0", "101.0", "12.5", 20],
+            [1767229200, "105.0", "115.0", "95.0", "112.0", "108.0", "8.0", 18],
+        ]
+
+    monkeypatch.setattr(loader, "_request_ohlc_rows", fake_request_ohlc_rows)
+
+    price_df = loader.refresh_data()
+
+    assert list(price_df["product_id"].unique()) == ["BTC-USD"]
+    assert loader.last_refresh_summary["productsDownloaded"] == 1
+    assert loader.last_refresh_summary["productsSkipped"] == 1
+    assert loader.last_refresh_summary["skippedProducts"] == ["MISSING-USD"]
+
+
+def test_kraken_loader_fetches_altcoin_usd_universe_without_stables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kraken auto-discovery should keep liquid non-stable USD pairs."""
+
+    loader = KrakenOhlcPriceDataLoader(
+        data_path=tmp_path / "marketPrices.csv",
+        fetch_all_quote_products=True,
+        quote_currency="USD",
+        excluded_base_currencies=("BTC", "USDT", "USDC"),
+        max_products=2,
+        log_progress=False,
+    )
+    asset_pairs_payload = {
+        "error": [],
+        "result": {
+            "XXBTZUSD": {"wsname": "XBT/USD", "status": "online"},
+            "XETHZUSD": {"wsname": "ETH/USD", "status": "online"},
+            "USDTZUSD": {"wsname": "USDT/USD", "status": "online"},
+            "ADAZEUR": {"wsname": "ADA/EUR", "status": "online"},
+            "SOLZUSD": {"wsname": "SOL/USD", "status": "cancel_only"},
+            "XRPZUSD": {"wsname": "XRP/USD", "status": "online"},
+        },
+    }
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(asset_pairs_payload).encode("utf-8")
+
+    monkeypatch.setattr(market_data_module, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(
+        loader,
+        "_fetch_quote_volume_by_pair",
+        lambda: {"XETHZUSD": 20_000.0, "XXBTZUSD": 10_000.0, "XRPZUSD": 5_000.0},
+    )
+
+    products = loader.get_available_products()
+
+    assert [product["product_id"] for product in products] == ["ETH-USD", "XRP-USD"]
+    assert all(product["quote_currency"] == "USD" for product in products)
 
 
 def test_binance_public_data_loader_normalizes_archive_rows(
