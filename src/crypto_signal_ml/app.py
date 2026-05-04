@@ -126,9 +126,19 @@ class BaseSignalApp:
     def save_json(self, payload: Dict[str, Any], file_path: Path) -> None:
         """Save a dictionary to JSON with readable indentation."""
 
+        def normalize_json_value(value: Any) -> Any:
+            if hasattr(value, "item"):
+                try:
+                    return value.item()
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(value, Path):
+                return str(value)
+            return str(value)
+
         def write_json(temp_path: Path) -> None:
             with temp_path.open("w", encoding="utf-8") as output_file:
-                json.dump(payload, output_file, indent=2)
+                json.dump(payload, output_file, indent=2, default=normalize_json_value)
 
         self._write_file_atomically(file_path=file_path, writer=write_json)
 
