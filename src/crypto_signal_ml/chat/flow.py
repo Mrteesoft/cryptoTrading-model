@@ -163,6 +163,36 @@ FORCE_REFRESH_KEYWORDS = (
     "currently",
     "enter now",
 )
+GREETING_KEYWORDS = (
+    "hi",
+    "hii",
+    "hiii",
+    "hello",
+    "hey",
+    "yo",
+    "gm",
+    "good morning",
+    "good afternoon",
+    "good evening",
+)
+HELP_REQUEST_KEYWORDS = (
+    "help",
+    "what can you do",
+    "how can you help",
+    "commands",
+    "examples",
+    "how do i use",
+)
+THANKS_KEYWORDS = (
+    "thanks",
+    "thank you",
+    "appreciate it",
+)
+GOODBYE_KEYWORDS = (
+    "bye",
+    "goodbye",
+    "see you",
+)
 
 
 class SessionStoreProtocol(Protocol):
@@ -378,7 +408,9 @@ class AssistantIntentRouter:
                 )
             )
 
-        if self.retrieval_enabled and "research_context" in intents:
+        if self.retrieval_enabled and (
+            "research_context" in intents or "general_knowledge" in intents
+        ):
             planned_calls.append(
                 PlannedToolCall(
                     name="search_knowledge",
@@ -386,11 +418,14 @@ class AssistantIntentRouter:
                         "query": self._build_knowledge_query(normalized_question, resolved_product_ids),
                         "limit": 3,
                     },
-                    reason="The question asks for supporting context, sources, or explanatory background.",
+                    reason=(
+                        "The question asks for supporting context, sources, explanatory background, "
+                        "or off-topic knowledge outside the trading tools."
+                    ),
                 )
             )
 
-        if not planned_calls:
+        if not planned_calls and "conversation" not in intents:
             planned_calls.append(
                 PlannedToolCall(
                     name="get_market_overview",
@@ -430,6 +465,7 @@ class AssistantIntentRouter:
         asks_for_research = self._contains_any_keyword(lowered_question, KNOWLEDGE_REQUEST_KEYWORDS)
         asks_for_market_overview = self._contains_any_keyword(lowered_question, MARKET_OVERVIEW_KEYWORDS)
         asks_for_comparison = self._contains_any_keyword(lowered_question, COMPARISON_KEYWORDS)
+        is_conversation = self._is_conversational_turn(lowered_question)
 
         if resolved_product_ids:
             intents.append("multi_asset_signal" if len(resolved_product_ids) > 1 else "single_asset_signal")
@@ -442,7 +478,7 @@ class AssistantIntentRouter:
         if self.retrieval_enabled and asks_for_research:
             intents.append("research_context")
         if not intents:
-            intents.append("market_overview")
+            intents.append("conversation" if is_conversation else "general_knowledge")
         if asks_for_comparison and "market_overview" not in intents and len(resolved_product_ids) >= 2:
             intents.append("market_overview")
 
@@ -463,17 +499,39 @@ class AssistantIntentRouter:
     ) -> str:
         """Classify the answer style needed for the question."""
 
+        if not resolved_product_ids and AssistantIntentRouter._is_conversational_turn(lowered_question):
+            return "conversation"
         if len(resolved_product_ids) >= 2 and any(keyword in lowered_question for keyword in COMPARISON_KEYWORDS):
             return "compare"
         if any(keyword in lowered_question for keyword in KNOWLEDGE_REQUEST_KEYWORDS):
             return "explain"
         if any(keyword in lowered_question for keyword in ADVISORY_KEYWORDS):
             return "advice"
+        if not resolved_product_ids:
+            return "general"
         return "direct"
 
     @staticmethod
     def _contains_any_keyword(text: str, keywords: Sequence[str]) -> bool:
         return any(keyword in text for keyword in keywords)
+
+    @staticmethod
+    def _is_conversational_turn(lowered_question: str) -> bool:
+        """Return whether the prompt is chat/help text instead of a market request."""
+
+        normalized_question = re.sub(r"[^a-z0-9\s]", " ", str(lowered_question).lower())
+        normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
+        if not normalized_question:
+            return True
+
+        if any(keyword in normalized_question for keyword in HELP_REQUEST_KEYWORDS):
+            return True
+        if any(keyword in normalized_question for keyword in THANKS_KEYWORDS):
+            return True
+        if any(keyword in normalized_question for keyword in GOODBYE_KEYWORDS):
+            return True
+
+        return normalized_question in GREETING_KEYWORDS
 
     @staticmethod
     def _should_force_refresh(lowered_question: str) -> bool:
@@ -653,7 +711,12 @@ class AssistantResponseComposer:
     ) -> str:
         """Turn tool results into one concise answer."""
 
-        del question
+        if route_plan.response_style == "conversation" or "conversation" in route_plan.intents:
+            return self._compose_conversation_reply(
+                question=question,
+                recalled_messages=recalled_messages,
+            )
+
         results_by_name: dict[str, list[dict[str, Any]]] = {}
         for tool_result in tool_results:
             tool_name = str(tool_result.get("name") or "")
@@ -692,8 +755,18 @@ class AssistantResponseComposer:
             model_paragraphs.extend(self._compose_model_paragraphs(model_results[0]))
 
         retrieval_paragraphs = []
-        if retrieval_results:
+        if retrieval_results and "general_knowledge" not in route_plan.intents:
             retrieval_paragraphs.extend(self._compose_retrieval_paragraphs(retrieval_results[0]))
+
+        general_paragraphs = []
+        if "general_knowledge" in route_plan.intents:
+            general_paragraphs.extend(
+                self._compose_general_knowledge_paragraphs(
+                    question=question,
+                    retrieval_result=retrieval_results[0] if retrieval_results else None,
+                    recalled_messages=recalled_messages,
+                )
+            )
 
         conflict_paragraphs = self._compose_conflict_paragraphs(
             signal_results=signal_results,
@@ -738,6 +811,9 @@ class AssistantResponseComposer:
                 "conflicts",
                 "memory",
             ),
+            "general": (
+                "general",
+            ),
         }.get(
             route_plan.response_style,
             (
@@ -759,6 +835,7 @@ class AssistantResponseComposer:
             "trader": trader_paragraphs,
             "model": model_paragraphs,
             "retrieval": retrieval_paragraphs,
+            "general": general_paragraphs,
             "conflicts": conflict_paragraphs,
             "memory": memory_paragraphs,
         }
@@ -776,6 +853,98 @@ class AssistantResponseComposer:
             )
 
         return "\n\n".join(paragraph for paragraph in paragraphs if paragraph.strip())
+
+    def _compose_conversation_reply(
+        self,
+        *,
+        question: str,
+        recalled_messages: Sequence[dict[str, Any]],
+    ) -> str:
+        """Answer non-market chat without pretending a tool result was requested."""
+
+        lowered_question = str(question).strip().lower()
+        if any(keyword in lowered_question for keyword in THANKS_KEYWORDS):
+            return "You are welcome. Send a coin, pair, or market question when you want the model read."
+
+        if any(keyword in lowered_question for keyword in GOODBYE_KEYWORDS):
+            return "See you. I will keep the chat ready for the next market check."
+
+        if any(keyword in lowered_question for keyword in HELP_REQUEST_KEYWORDS):
+            return (
+                "I can read the current signal for a coin, compare pairs, summarize the market overview, "
+                "check model freshness, build a portfolio-aware risk plan, or answer off-topic questions "
+                "from the RAG knowledge store. Try prompts like `Should I buy BTC now?`, "
+                "`Compare ETH and SOL`, `What is the model status?`, or ask about an indexed document."
+            )
+
+        if recalled_messages:
+            last_message = str(recalled_messages[-1].get("content") or "").strip()
+            if last_message:
+                return (
+                    "Hi. I am here and I still have the session context. "
+                    "Ask me about a coin, the market overview, model status, or a risk plan."
+                )
+
+        return (
+            "Hi. I am ready. Ask me about a coin, the market overview, model status, "
+            "whether a setup is worth acting on, or anything you have added to the knowledge base."
+        )
+
+    def _compose_general_knowledge_paragraphs(
+        self,
+        *,
+        question: str,
+        retrieval_result: dict[str, Any] | None,
+        recalled_messages: Sequence[dict[str, Any]],
+    ) -> list[str]:
+        """Compose an off-topic answer from RAG context when available."""
+
+        if retrieval_result is None:
+            return [
+                "I can handle off-topic questions through the RAG knowledge store, but retrieval is not available for this turn."
+            ]
+
+        status = str(retrieval_result.get("status") or "")
+        if status == "disabled":
+            return [
+                "I can handle off-topic questions when RAG is enabled, but the knowledge store is disabled in this runtime."
+            ]
+        if status == "error":
+            return [f"I could not search the knowledge store: {retrieval_result.get('error')}"]
+
+        results = list(retrieval_result.get("results", []))
+        if not results:
+            memory_note = ""
+            if recalled_messages:
+                memory_note = " I checked this chat's recent context too, but it did not contain enough matching detail."
+            return [
+                (
+                    "I do not have enough indexed knowledge to answer that off-topic question yet."
+                    f"{memory_note} Add a URL, file, or text note to the RAG store, then ask again."
+                )
+            ]
+
+        answer_lines = []
+        for result in results[:3]:
+            title = str(result.get("title") or "Knowledge source")
+            snippet = self._trim_text(
+                str(result.get("content") or result.get("snippet") or ""),
+                max_length=320,
+            )
+            source_uri = str(result.get("sourceUri") or "").strip()
+            source_label = title if not source_uri else f"{title} ({source_uri})"
+            if snippet:
+                answer_lines.append(f"{source_label}: {snippet}")
+
+        if not answer_lines:
+            return [
+                "I found matching knowledge records, but they did not contain enough readable text to answer clearly."
+            ]
+
+        normalized_question = self._trim_text(str(question), max_length=160)
+        return [
+            f"Based on the indexed knowledge base for `{normalized_question}`: " + " ".join(answer_lines)
+        ]
 
     def _compose_opening_paragraphs(
         self,

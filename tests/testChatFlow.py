@@ -207,6 +207,69 @@ def test_router_resolves_aliases_and_generic_symbols() -> None:
     assert router.resolve_product_id("Should I buy $BONK now?") == "BONK-USD"
 
 
+def test_router_keeps_greetings_conversational() -> None:
+    """A greeting should not be upgraded into a market-overview tool call."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    route_plan = router.route("hii")
+
+    assert route_plan.response_style == "conversation"
+    assert route_plan.intents == ("conversation",)
+    assert route_plan.planned_calls == ()
+
+
+def test_chat_flow_answers_greeting_without_market_tools() -> None:
+    """Small talk should produce an interactive reply without hitting model tools."""
+
+    tool_registry = StubToolRegistry()
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+        ),
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="hii",
+    )
+
+    assert result["toolCalls"] == []
+    assert result["routing"]["responseStyle"] == "conversation"
+    assert "Hi. I am ready." in result["replyText"]
+    assert tool_registry.calls == []
+
+
+def test_chat_flow_routes_off_topic_questions_to_rag() -> None:
+    """General questions should use retrieval instead of crypto market overview."""
+
+    tool_registry = StubToolRegistry()
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+        ),
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="Tell me about liquidity fragmentation.",
+    )
+
+    assert [tool_call["name"] for tool_call in result["toolCalls"]] == ["search_knowledge"]
+    assert result["routing"]["responseStyle"] == "general"
+    assert "Based on the indexed knowledge base" in result["replyText"]
+    assert "Liquidity and trend support remain constructive." in result["replyText"]
+    assert [tool_name for tool_name, _ in tool_registry.calls] == ["search_knowledge"]
+
+
 def test_chat_flow_adds_trader_plan_follow_up_for_actionable_advice_questions() -> None:
     """Advisory asset questions should chain into trader planning when the signal is actionable."""
 

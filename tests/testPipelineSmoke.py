@@ -1969,6 +1969,7 @@ def test_rag_knowledge_store_can_ingest_and_search_text_sources(tmp_path: Path) 
     assert source["title"] == "Bitcoin ETF research note"
     assert store.get_status()["sourceCount"] == 1
     assert store.get_status()["storageBackend"] == "sqlite"
+    assert store.get_status()["searchMode"] in {"sqlite_fts5_hybrid", "token_overlap"}
     assert search_results
     assert search_results[0]["title"] == "Bitcoin ETF research note"
     assert "inflows" in search_results[0]["content"].lower()

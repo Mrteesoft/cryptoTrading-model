@@ -113,6 +113,7 @@ class RagKnowledgeStore:
         self.chunk_overlap_chars = max(min(int(chunk_overlap_chars), self.chunk_size_chars - 1), 0)
         self.fetch_timeout_seconds = max(float(fetch_timeout_seconds), 1.0)
         self.fetch_max_chars = max(int(fetch_max_chars), 1000)
+        self._fts_available = False
         self._initialize_schema()
 
     def get_status(self) -> Dict[str, Any]:
@@ -131,6 +132,8 @@ class RagKnowledgeStore:
             "dbPath": str(self.db_path) if self.db_path is not None else None,
             "storageBackend": self.database.storage_backend,
             "databaseTarget": self.database.database_target,
+            "searchMode": "sqlite_fts5_hybrid" if self._fts_available else "token_overlap",
+            "ftsEnabled": bool(self._fts_available),
             "sourceCount": source_count,
             "chunkCount": chunk_count,
         }
@@ -207,7 +210,7 @@ class RagKnowledgeStore:
             )
 
             for chunk_index, chunk_content in enumerate(content_chunks):
-                connection.execute(
+                chunk_cursor = connection.execute(
                     """
                     INSERT INTO rag_chunks (
                         source_id,
@@ -236,6 +239,17 @@ class RagKnowledgeStore:
                         created_at,
                     ),
                 )
+                chunk_id = getattr(chunk_cursor, "lastrowid", None)
+                if self._fts_available and chunk_id is not None:
+                    self._insert_fts_chunk(
+                        connection=connection,
+                        chunk_id=int(chunk_id),
+                        source_id=source_id,
+                        title=normalized_title,
+                        source_uri=normalized_source_uri or "",
+                        content=chunk_content,
+                        snippet=self._build_snippet(chunk_content),
+                    )
 
         return self.get_source(source_id) or {}
 
@@ -320,6 +334,95 @@ class RagKnowledgeStore:
         if not normalized_query or not query_tokens:
             return []
 
+        if self._fts_available:
+            fts_results = self._search_with_fts(
+                normalized_query=normalized_query,
+                query_tokens=query_tokens,
+                limit=limit,
+            )
+            if fts_results:
+                return fts_results
+
+        return self._search_with_token_overlap(
+            normalized_query=normalized_query,
+            query_tokens=query_tokens,
+            limit=limit,
+        )
+
+    def _search_with_fts(
+        self,
+        *,
+        normalized_query: str,
+        query_tokens: set[str],
+        limit: int,
+    ) -> list[Dict[str, Any]]:
+        """Search the SQLite FTS5 index and rerank candidates with lightweight lexical signals."""
+
+        fts_query = self._build_fts_query(normalized_query)
+        if not fts_query:
+            return []
+
+        candidate_limit = max(int(limit) * 8, 25)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        c.chunk_id,
+                        c.source_id,
+                        c.chunk_index,
+                        c.title,
+                        c.source_type,
+                        c.source_uri,
+                        c.content,
+                        c.snippet,
+                        c.metadata_json,
+                        c.token_json,
+                        c.created_at,
+                        bm25(rag_chunks_fts) AS fts_rank
+                    FROM rag_chunks_fts
+                    JOIN rag_chunks c ON c.chunk_id = rag_chunks_fts.rowid
+                    WHERE rag_chunks_fts MATCH ?
+                    ORDER BY fts_rank ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, candidate_limit),
+                ).fetchall()
+        except Exception:
+            return []
+
+        scored_rows = []
+        lowered_query = normalized_query.lower()
+        for rank_index, row in enumerate(rows):
+            lexical_score = self._score_chunk_row(
+                row=row,
+                query_tokens=query_tokens,
+                lowered_query=lowered_query,
+            )
+            fts_rank_boost = 5.0 * ((candidate_limit - rank_index) / candidate_limit)
+            scored_rows.append(
+                (
+                    lexical_score + fts_rank_boost,
+                    self._row_to_chunk_dict(row, score=lexical_score + fts_rank_boost),
+                )
+            )
+
+        ranked_rows = sorted(
+            scored_rows,
+            key=lambda item: (item[0], -item[1]["chunkIndex"]),
+            reverse=True,
+        )
+        return [row for _, row in ranked_rows[: max(int(limit), 1)]]
+
+    def _search_with_token_overlap(
+        self,
+        *,
+        normalized_query: str,
+        query_tokens: set[str],
+        limit: int,
+    ) -> list[Dict[str, Any]]:
+        """Return the most relevant chunks using the portable token-overlap scorer."""
+
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -342,14 +445,11 @@ class RagKnowledgeStore:
         scored_rows = []
         lowered_query = normalized_query.lower()
         for row in rows:
-            chunk_tokens = set(json.loads(str(row["token_json"]) or "[]"))
-            title_tokens = _tokenize(str(row["title"]))
-            source_uri_tokens = _tokenize(str(row["source_uri"] or ""))
-            overlap = len(query_tokens & chunk_tokens)
-            title_overlap = len(query_tokens & title_tokens)
-            uri_overlap = len(query_tokens & source_uri_tokens)
-            exact_phrase_bonus = 2 if lowered_query in str(row["content"]).lower() else 0
-            score = (overlap * 3) + (title_overlap * 4) + (uri_overlap * 2) + exact_phrase_bonus
+            score = self._score_chunk_row(
+                row=row,
+                query_tokens=query_tokens,
+                lowered_query=lowered_query,
+            )
 
             if score <= 0:
                 continue
@@ -357,19 +457,7 @@ class RagKnowledgeStore:
             scored_rows.append(
                 (
                     score,
-                    {
-                        "chunkId": int(row["chunk_id"]),
-                        "sourceId": str(row["source_id"]),
-                        "chunkIndex": int(row["chunk_index"]),
-                        "title": str(row["title"]),
-                        "sourceType": str(row["source_type"]),
-                        "sourceUri": str(row["source_uri"] or ""),
-                        "snippet": str(row["snippet"]),
-                        "content": str(row["content"]),
-                        "score": float(score),
-                        "createdAt": str(row["created_at"]),
-                        "metadata": json.loads(str(row["metadata_json"]) or "{}"),
-                    },
+                    self._row_to_chunk_dict(row, score=score),
                 )
             )
 
@@ -402,6 +490,13 @@ class RagKnowledgeStore:
         """Delete one source and all of its chunks."""
 
         with self._connect() as connection:
+            chunk_rows = connection.execute(
+                "SELECT chunk_id FROM rag_chunks WHERE source_id = ?",
+                (source_id,),
+            ).fetchall()
+            if self._fts_available:
+                for chunk_row in chunk_rows:
+                    self._delete_fts_chunk(connection, int(chunk_row["chunk_id"]))
             connection.execute("DELETE FROM rag_chunks WHERE source_id = ?", (source_id,))
             deleted_count = int(
                 connection.execute("DELETE FROM rag_sources WHERE source_id = ?", (source_id,)).rowcount
@@ -443,6 +538,101 @@ class RagKnowledgeStore:
             start_index += step_size
 
         return chunks
+
+    @staticmethod
+    def _score_chunk_row(
+        *,
+        row: Mapping[str, Any],
+        query_tokens: set[str],
+        lowered_query: str,
+    ) -> float:
+        """Score one candidate row with title, URI, body, and exact-phrase signals."""
+
+        chunk_tokens = set(json.loads(str(row["token_json"]) or "[]"))
+        title_tokens = _tokenize(str(row["title"]))
+        source_uri_tokens = _tokenize(str(row["source_uri"] or ""))
+        overlap = len(query_tokens & chunk_tokens)
+        title_overlap = len(query_tokens & title_tokens)
+        uri_overlap = len(query_tokens & source_uri_tokens)
+        exact_phrase_bonus = 2 if lowered_query in str(row["content"]).lower() else 0
+        return float((overlap * 3) + (title_overlap * 4) + (uri_overlap * 2) + exact_phrase_bonus)
+
+    @staticmethod
+    def _row_to_chunk_dict(row: Mapping[str, Any], *, score: float) -> Dict[str, Any]:
+        """Convert one chunk row into the public search-result shape."""
+
+        return {
+            "chunkId": int(row["chunk_id"]),
+            "sourceId": str(row["source_id"]),
+            "chunkIndex": int(row["chunk_index"]),
+            "title": str(row["title"]),
+            "sourceType": str(row["source_type"]),
+            "sourceUri": str(row["source_uri"] or ""),
+            "snippet": str(row["snippet"]),
+            "content": str(row["content"]),
+            "score": float(score),
+            "createdAt": str(row["created_at"]),
+            "metadata": json.loads(str(row["metadata_json"]) or "{}"),
+        }
+
+    @staticmethod
+    def _build_fts_query(query: str) -> str:
+        """Build a conservative FTS5 query from free text."""
+
+        fts_tokens = [
+            token.lower()
+            for token in re.findall(r"[a-zA-Z0-9]+", str(query))
+            if len(token) > 1 and token.lower() not in COMMON_STOP_WORDS
+        ]
+        return " OR ".join(f"{token}*" for token in fts_tokens[:12])
+
+    def _insert_fts_chunk(
+        self,
+        *,
+        connection: DatabaseConnection,
+        chunk_id: int,
+        source_id: str,
+        title: str,
+        source_uri: str,
+        content: str,
+        snippet: str,
+    ) -> None:
+        """Insert one chunk into the optional SQLite FTS index."""
+
+        try:
+            connection.execute(
+                """
+                INSERT INTO rag_chunks_fts (
+                    rowid,
+                    chunk_id,
+                    source_id,
+                    title,
+                    source_uri,
+                    content,
+                    snippet
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk_id,
+                    chunk_id,
+                    source_id,
+                    title,
+                    source_uri,
+                    content,
+                    snippet,
+                ),
+            )
+        except Exception:
+            self._fts_available = False
+
+    def _delete_fts_chunk(self, connection: DatabaseConnection, chunk_id: int) -> None:
+        """Delete one chunk from the optional SQLite FTS index."""
+
+        try:
+            connection.execute("DELETE FROM rag_chunks_fts WHERE rowid = ?", (chunk_id,))
+        except Exception:
+            self._fts_available = False
 
     @staticmethod
     def _build_snippet(text: str, max_length: int = 220) -> str:
@@ -545,6 +735,66 @@ class RagKnowledgeStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rag_chunks_source_id ON rag_chunks(source_id)"
             )
+            if self.database.storage_backend == "sqlite":
+                self._initialize_fts_index(connection)
+
+    def _initialize_fts_index(self, connection: DatabaseConnection) -> None:
+        """Create and backfill the optional SQLite FTS5 index."""
+
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    source_id UNINDEXED,
+                    title,
+                    source_uri,
+                    content,
+                    snippet
+                )
+                """
+            )
+            self._fts_available = True
+            if self._fts_index_needs_rebuild(connection):
+                self._rebuild_fts_index(connection)
+        except Exception:
+            self._fts_available = False
+
+    @staticmethod
+    def _fts_index_needs_rebuild(connection: DatabaseConnection) -> bool:
+        """Return whether the FTS row count has drifted from durable chunks."""
+
+        chunk_count = int(connection.execute("SELECT COUNT(*) AS row_count FROM rag_chunks").fetchone()["row_count"])
+        fts_count = int(connection.execute("SELECT COUNT(*) AS row_count FROM rag_chunks_fts").fetchone()["row_count"])
+        return chunk_count != fts_count
+
+    def _rebuild_fts_index(self, connection: DatabaseConnection) -> None:
+        """Rebuild the FTS index from durable chunk rows."""
+
+        if not self._fts_available:
+            return
+
+        try:
+            connection.execute("DELETE FROM rag_chunks_fts")
+            rows = connection.execute(
+                """
+                SELECT chunk_id, source_id, title, source_uri, content, snippet
+                FROM rag_chunks
+                ORDER BY chunk_id ASC
+                """
+            ).fetchall()
+            for row in rows:
+                self._insert_fts_chunk(
+                    connection=connection,
+                    chunk_id=int(row["chunk_id"]),
+                    source_id=str(row["source_id"]),
+                    title=str(row["title"]),
+                    source_uri=str(row["source_uri"] or ""),
+                    content=str(row["content"]),
+                    snippet=str(row["snippet"]),
+                )
+        except Exception:
+            self._fts_available = False
 
     def _connect(self) -> DatabaseConnection:
         """Open a backend-aware connection with dict-style row access."""
