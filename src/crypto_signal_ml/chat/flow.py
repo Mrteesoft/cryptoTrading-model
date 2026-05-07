@@ -133,6 +133,13 @@ MARKET_OVERVIEW_KEYWORDS = (
     "best setups",
     "market read",
     "market overview",
+    "buy signal",
+    "buy signals",
+    "next buy",
+    "what should i buy",
+    "what can i buy",
+    "which should i buy",
+    "best buy",
 )
 
 ADVISORY_KEYWORDS = (
@@ -966,11 +973,25 @@ class AssistantResponseComposer:
 
             if overview_results:
                 overview = dict(overview_results[0].get("overview") or {})
-                primary_signal = dict(overview.get("primarySignal") or {})
-                lead_product = str(primary_signal.get("productId") or "the lead pair")
-                lead_signal = str(primary_signal.get("signal_name") or "HOLD")
+                top_buys = [
+                    signal_summary
+                    for signal_summary in list(overview.get("topBuys", []))
+                    if self._is_buy_signal(signal_summary)
+                ]
+                if not top_buys:
+                    top_buys = [
+                        signal_summary
+                        for signal_summary in list(overview.get("topSignals", []))
+                        if self._is_buy_signal(signal_summary)
+                    ]
+                if top_buys:
+                    lead_buy = dict(top_buys[0])
+                    lead_product = str(lead_buy.get("productId") or "the lead BUY pair")
+                    return [
+                        f"The broad market read has a BUY candidate to review first: {lead_product}."
+                    ]
                 return [
-                    f"The broad market read currently points to {lead_product} as the lead setup, with a {lead_signal} signal."
+                    "The broad market read does not show a fresh BUY setup right now."
                 ]
 
         return []
@@ -1055,25 +1076,42 @@ class AssistantResponseComposer:
 
         overview = dict(overview_result.get("overview") or {})
         market_summary = dict(overview.get("marketSummary") or {})
-        primary_signal = dict(overview.get("primarySignal") or {})
+        signal_counts = dict(market_summary.get("signalCounts") or {})
         actionable_count = int(market_summary.get("actionableSignals") or 0)
         total_signals = int(market_summary.get("totalSignals") or 0)
-        lead_product = str(primary_signal.get("productId") or "the lead pair")
-        lead_signal = str(primary_signal.get("signal_name") or "HOLD")
-        lead_confidence = self._format_percent(primary_signal.get("confidence"))
-
-        paragraphs = [
-            f"Market overview: {actionable_count} actionable setups across {total_signals} tracked pairs. "
-            f"The lead signal is {lead_product} with a {lead_signal} call at {lead_confidence} confidence."
+        configured_buy_count = int(signal_counts.get("buy") or 0)
+        top_buys = [
+            signal_summary
+            for signal_summary in list(overview.get("topBuys", []))
+            if self._is_buy_signal(signal_summary)
         ]
-        top_signals = list(overview.get("topSignals", []))
-        if top_signals:
-            top_lines = [
-                f"{signal_summary.get('productId')} {signal_summary.get('signal_name')} "
-                f"({self._format_percent(signal_summary.get('confidence'))})"
-                for signal_summary in top_signals[:3]
+        if not top_buys:
+            top_buys = [
+                signal_summary
+                for signal_summary in list(overview.get("topSignals", []))
+                if self._is_buy_signal(signal_summary)
             ]
-            paragraphs.append("Top setups: " + ", ".join(top_lines) + ".")
+
+        buy_count = max(configured_buy_count, len(top_buys))
+        if top_buys:
+            lead_buy = dict(top_buys[0])
+            lead_product = str(lead_buy.get("productId") or "the lead BUY pair")
+            lead_confidence = self._format_percent(lead_buy.get("confidence"))
+            paragraphs = [
+                f"Buy overview: {buy_count} BUY setup{'s' if buy_count != 1 else ''} across {total_signals} tracked pairs. "
+                f"The lead BUY is {lead_product} at {lead_confidence} confidence."
+            ]
+            top_lines = [
+                f"{signal_summary.get('productId')} ({self._format_percent(signal_summary.get('confidence'))})"
+                for signal_summary in top_buys[:3]
+            ]
+            paragraphs.append("Next BUY candidates: " + ", ".join(top_lines) + ".")
+        else:
+            paragraphs = [
+                f"Market overview: no active BUY setup is published across {total_signals} tracked pairs right now. "
+                f"There are {actionable_count} non-buy management signal{'s' if actionable_count != 1 else ''}, "
+                "but I would wait for the next BUY before naming a new entry."
+            ]
 
         warning = str(overview_result.get("warning") or "").strip()
         if warning:
@@ -1244,6 +1282,16 @@ class AssistantResponseComposer:
         if normalized_source in {"cached", "snapshot"}:
             return "latest cached"
         return "current authoritative"
+
+    @staticmethod
+    def _is_buy_signal(signal_summary: Any) -> bool:
+        """Return whether one signal summary represents a BUY setup."""
+
+        return (
+            isinstance(signal_summary, dict)
+            and str(signal_summary.get("signal_name") or signal_summary.get("signalName") or "").strip().upper()
+            == "BUY"
+        )
 
     @staticmethod
     def _format_percent(value: Any) -> str:

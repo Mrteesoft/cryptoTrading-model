@@ -64,6 +64,15 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _is_buy_signal(signal_summary: Any) -> bool:
+    """Return whether one signal summary is a BUY setup."""
+
+    return (
+        isinstance(signal_summary, dict)
+        and str(signal_summary.get("signal_name") or signal_summary.get("signalName") or "").strip().upper() == "BUY"
+    )
+
+
 def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     """Trim a live or cached snapshot into a stable overview payload."""
 
@@ -72,7 +81,12 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
 
     signals = list(snapshot.get("signals", []))
     actionable_signals = list(snapshot.get("actionableSignals", []))
-    top_signals = actionable_signals[:3] if actionable_signals else signals[:3]
+    top_buys = [signal_summary for signal_summary in list(snapshot.get("topBuys", [])) if _is_buy_signal(signal_summary)]
+    if not top_buys:
+        top_buys = [signal_summary for signal_summary in actionable_signals if _is_buy_signal(signal_summary)]
+    if not top_buys:
+        top_buys = [signal_summary for signal_summary in signals if _is_buy_signal(signal_summary)]
+    top_signals = top_buys[:3] if top_buys else actionable_signals[:3] if actionable_signals else signals[:3]
 
     return {
         "generatedAt": snapshot.get("generatedAt"),
@@ -85,6 +99,7 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "marketSummary": snapshot.get("marketSummary", {}),
         "marketState": snapshot.get("marketState", {}),
         "traderBrain": snapshot.get("traderBrain", {}),
+        "topBuys": top_buys[:25],
         "topSignals": top_signals,
     }
 

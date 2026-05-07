@@ -220,6 +220,26 @@ def test_router_keeps_greetings_conversational() -> None:
     assert route_plan.intents == ("conversation",)
     assert route_plan.planned_calls == ()
 
+    plain_route_plan = router.route("hi")
+
+    assert plain_route_plan.response_style == "conversation"
+    assert plain_route_plan.intents == ("conversation",)
+    assert plain_route_plan.planned_calls == ()
+
+
+def test_router_routes_buy_discovery_to_market_overview() -> None:
+    """A broad buy request should ask for BUY candidates, not RAG."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    route_plan = router.route("what should I buy?")
+
+    assert route_plan.response_style == "advice"
+    assert route_plan.intents == ("market_overview",)
+    assert [planned_call.name for planned_call in route_plan.planned_calls] == ["get_market_overview"]
+
 
 def test_chat_flow_answers_greeting_without_market_tools() -> None:
     """Small talk should produce an interactive reply without hitting model tools."""
@@ -243,6 +263,70 @@ def test_chat_flow_answers_greeting_without_market_tools() -> None:
     assert result["routing"]["responseStyle"] == "conversation"
     assert "Hi. I am ready." in result["replyText"]
     assert tool_registry.calls == []
+
+
+def test_overview_reply_prioritizes_buy_candidates_over_loss_lead() -> None:
+    """Broad market replies should not present a LOSS call as the lead buy idea."""
+
+    router = AssistantIntentRouter(known_product_ids=("BTC-USD", "ETH-USD", "SOL-USD"))
+    route_plan = router.route("what should I buy?")
+    composer = AssistantResponseComposer(
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD", "SOL-USD"),
+        )
+    )
+
+    reply = composer.compose(
+        question="what should I buy?",
+        tool_results=[
+            {
+                "name": "get_market_overview",
+                "arguments": {"force_refresh": False},
+                "reason": "",
+                "result": {
+                    "status": "ok",
+                    "source": "published",
+                    "overview": {
+                        "marketSummary": {
+                            "actionableSignals": 3,
+                            "totalSignals": 88,
+                            "signalCounts": {
+                                "buy": 1,
+                                "loss": 1,
+                                "take_profit": 1,
+                                "wait": 85,
+                            },
+                        },
+                        "primarySignal": {
+                            "productId": "BIO-USD",
+                            "signal_name": "LOSS",
+                            "confidence": 0.702,
+                        },
+                        "topBuys": [
+                            {
+                                "productId": "SOL-USD",
+                                "signal_name": "BUY",
+                                "confidence": 0.81,
+                            }
+                        ],
+                        "topSignals": [
+                            {
+                                "productId": "BIO-USD",
+                                "signal_name": "LOSS",
+                                "confidence": 0.702,
+                            }
+                        ],
+                    },
+                },
+            }
+        ],
+        recalled_messages=[],
+        route_plan=route_plan,
+    )
+
+    assert "lead BUY is SOL-USD" in reply
+    assert "BIO-USD with a LOSS call" not in reply
 
 
 def test_chat_flow_routes_off_topic_questions_to_rag() -> None:

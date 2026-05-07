@@ -52,7 +52,24 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
 
     signals = list(snapshot.get("signals", []))
     actionable_signals = list(snapshot.get("actionableSignals", []))
-    top_signals = actionable_signals[:3] if actionable_signals else signals[:3]
+    top_buys = [
+        signal_summary
+        for signal_summary in list(snapshot.get("topBuys", []))
+        if str(signal_summary.get("signal_name", "")).strip().upper() == "BUY"
+    ]
+    if not top_buys:
+        top_buys = [
+            signal_summary
+            for signal_summary in actionable_signals
+            if str(signal_summary.get("signal_name", "")).strip().upper() == "BUY"
+        ]
+    if not top_buys:
+        top_buys = [
+            signal_summary
+            for signal_summary in signals
+            if str(signal_summary.get("signal_name", "")).strip().upper() == "BUY"
+        ]
+    top_signals = top_buys[:3] if top_buys else actionable_signals[:3] if actionable_signals else signals[:3]
 
     return {
         "generatedAt": snapshot.get("generatedAt"),
@@ -66,6 +83,7 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "marketState": snapshot.get("marketState", {}),
         "marketIntelligence": snapshot.get("marketIntelligence", {}),
         "traderBrain": snapshot.get("traderBrain", {}),
+        "topBuys": top_buys[:25],
         "topSignals": top_signals,
         "currentSignalStore": snapshot.get("currentSignalStore", {}),
     }
@@ -586,7 +604,12 @@ class PublishedSignalViewService:
             ),
         }
         store_status = self.signal_store.get_status()
-        top_signals = actionable_signals[:3] if actionable_signals else current_signals[:3]
+        top_buys = [
+            signal_summary
+            for signal_summary in actionable_signals
+            if str(signal_summary.get("signal_name", "")).strip().upper() == "BUY"
+        ]
+        top_signals = top_buys[:3] if top_buys else actionable_signals[:3] if actionable_signals else current_signals[:3]
 
         return {
             "generatedAt": store_status.get("generatedAt") or snapshot_overview.get("generatedAt"),
@@ -604,6 +627,7 @@ class PublishedSignalViewService:
             "marketState": snapshot_overview.get("marketState", {}),
             "marketIntelligence": snapshot_overview.get("marketIntelligence", {}),
             "traderBrain": snapshot_overview.get("traderBrain", {}),
+            "topBuys": top_buys[:25],
             "topSignals": top_signals,
             "currentSignalStore": {
                 "status": store_status.get("status"),
