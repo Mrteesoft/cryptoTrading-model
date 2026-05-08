@@ -377,6 +377,7 @@ class TradingAssistantService:
         tool_calls = list(flow_result["toolCalls"])
         tool_results = list(flow_result["toolResults"])
         routing = dict(flow_result.get("routing") or {})
+        response_layer = dict(flow_result.get("responseLayer") or {})
         tool_telemetry = dict(flow_result.get("toolTelemetry") or {})
         assistant_message = self.session_store.add_message(
             session_id=session_id,
@@ -390,6 +391,7 @@ class TradingAssistantService:
                 "toolCalls": tool_calls,
                 "toolNames": [tool_call["name"] for tool_call in tool_calls],
                 "routing": routing,
+                "responseLayer": response_layer,
                 "toolTelemetry": tool_telemetry,
                 "retrieval": {
                     "messageCount": len(retrieval.get("messages", [])),
@@ -409,6 +411,7 @@ class TradingAssistantService:
             "liveContext": live_context,
             "retrieval": retrieval,
             "routing": routing,
+            "responseLayer": response_layer,
             "toolCalls": tool_calls,
             "toolTelemetry": tool_telemetry,
             "toolResults": tool_results,

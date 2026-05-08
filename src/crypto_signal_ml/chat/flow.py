@@ -8,7 +8,9 @@ import re
 from typing import Any, Protocol, Sequence
 
 from ..config import TrainingConfig
+from ..llm import ChatModelAdapter
 from ..tools import ToolRegistry
+from .response_layer import AssistantChatResponseLayer
 
 
 COMMON_STOP_WORDS = {
@@ -1492,6 +1494,8 @@ class ToolDrivenChatFlow:
         tool_registry: ToolRegistry,
         session_store: SessionStoreProtocol,
         config: TrainingConfig | None = None,
+        response_layer: AssistantChatResponseLayer | None = None,
+        llm_adapter: ChatModelAdapter | None = None,
     ) -> None:
         self.config = config or TrainingConfig()
         self.tool_registry = tool_registry
@@ -1502,6 +1506,11 @@ class ToolDrivenChatFlow:
         )
         self.executor = AssistantToolExecutor(tool_registry)
         self.composer = AssistantResponseComposer(config=self.config)
+        self.response_layer = response_layer or AssistantChatResponseLayer(
+            config=self.config,
+            deterministic_composer=self.composer,
+            llm_adapter=llm_adapter,
+        )
 
     def run(
         self,
@@ -1530,12 +1539,13 @@ class ToolDrivenChatFlow:
             executed_calls.extend(self.executor.execute(follow_up_calls))
 
         all_planned_calls = [*initial_calls, *follow_up_calls]
-        reply_text = self.composer.compose(
+        response_layer_result = self.response_layer.compose(
             question=question,
             tool_results=executed_calls,
             recalled_messages=recalled_messages,
             route_plan=route_plan,
         )
+        reply_text = response_layer_result.text
 
         return {
             "resolvedProductId": route_plan.primary_product_id,
@@ -1551,6 +1561,7 @@ class ToolDrivenChatFlow:
                 "forceRefresh": bool(route_plan.force_refresh),
                 "capitalOverride": route_plan.capital_override,
             },
+            "responseLayer": response_layer_result.to_metadata(),
             "toolTelemetry": self._build_tool_telemetry(executed_calls),
             "retrieval": {
                 "signals": self._collect_signal_context(executed_calls),

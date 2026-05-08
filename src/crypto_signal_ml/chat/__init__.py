@@ -6,6 +6,7 @@ from typing import Any
 
 __all__ = [
     "AssistantIntentRouter",
+    "AssistantChatResponseLayer",
     "ConversationSessionStore",
     "PlannedToolCall",
     "ToolDrivenChatFlow",
@@ -24,6 +25,11 @@ def __getattr__(name: str) -> Any:
             "TradingAssistantService": TradingAssistantService,
         }
         return exported_values[name]
+
+    if name in {"AssistantChatResponseLayer"}:
+        from .response_layer import AssistantChatResponseLayer
+
+        return AssistantChatResponseLayer
 
     if name in {"AssistantIntentRouter", "PlannedToolCall", "ToolDrivenChatFlow"}:
         from .flow import AssistantIntentRouter, PlannedToolCall, ToolDrivenChatFlow

@@ -16,6 +16,7 @@ if str(SRC_DIR) not in sys.path:
 
 from crypto_signal_ml.chat.flow import AssistantIntentRouter, AssistantResponseComposer, ToolDrivenChatFlow  # noqa: E402
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
+from crypto_signal_ml.llm import ChatModelAdapter, LlmCompletionResponse, LlmMessage, LlmToolSpec  # noqa: E402
 
 
 class StubSessionStore:
@@ -155,6 +156,35 @@ class StubToolRegistry:
             }
 
         raise AssertionError(f"Unexpected tool call: {tool_name}")
+
+
+class StubChatModelAdapter(ChatModelAdapter):
+    """Fake chat model adapter for response-layer tests."""
+
+    provider_name = "stub"
+
+    def __init__(self, response_text: str = "LLM response") -> None:
+        self.response_text = response_text
+        self.calls: list[dict[str, object]] = []
+
+    def is_configured(self) -> bool:
+        return True
+
+    def complete(
+        self,
+        messages: list[LlmMessage] | tuple[LlmMessage, ...],
+        tools: list[LlmToolSpec] | tuple[LlmToolSpec, ...],
+        *,
+        system_prompt: str | None = None,
+    ) -> LlmCompletionResponse:
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": list(tools),
+                "systemPrompt": system_prompt,
+            }
+        )
+        return LlmCompletionResponse(message=self.response_text)
 
 
 def test_router_builds_mixed_intent_plan_for_entry_size_and_model_freshness() -> None:
@@ -304,6 +334,94 @@ def test_chat_flow_answers_greeting_without_market_tools() -> None:
     assert result["toolCalls"] == []
     assert result["routing"]["responseStyle"] == "conversation"
     assert "Hi. I am ready." in result["replyText"]
+    assert tool_registry.calls == []
+
+
+def test_chat_flow_can_use_separate_llm_response_layer() -> None:
+    """The final response can be LLM-written after routing without changing tool selection."""
+
+    tool_registry = StubToolRegistry()
+    llm_adapter = StubChatModelAdapter("Hi - I am here. Ask me about a coin or the market.")
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+            assistant_use_llm=True,
+            llm_provider="lunatrix",
+            assistant_response_model="stub-chat-model",
+        ),
+        llm_adapter=llm_adapter,
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="hi",
+    )
+
+    assert result["replyText"] == "Hi - I am here. Ask me about a coin or the market."
+    assert result["toolCalls"] == []
+    assert result["responseLayer"]["mode"] == "llm"
+    assert result["responseLayer"]["provider"] == "stub"
+    assert tool_registry.calls == []
+    assert len(llm_adapter.calls) == 1
+
+
+def test_chat_flow_can_use_first_party_lunatrix_response_layer() -> None:
+    """The built-in chat response layer should work without an external provider."""
+
+    tool_registry = StubToolRegistry()
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+            assistant_use_llm=True,
+            llm_provider="lunatrix",
+            assistant_response_model="lunatrix-grounded-chat-v1",
+        ),
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="hi",
+    )
+
+    assert result["toolCalls"] == []
+    assert result["replyText"].startswith("Hi. I am here.")
+    assert result["responseLayer"]["mode"] == "local_chat"
+    assert result["responseLayer"]["provider"] == "lunatrix"
+    assert result["responseLayer"]["model"] == "lunatrix-grounded-chat-v1"
+    assert tool_registry.calls == []
+
+
+def test_chat_flow_falls_back_when_llm_layer_is_not_configured() -> None:
+    """LLM mode should not break chat when provider credentials are missing."""
+
+    tool_registry = StubToolRegistry()
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+            assistant_use_llm=True,
+            llm_provider="unsupported",
+            assistant_response_model="unsupported-chat-model",
+        ),
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="hi",
+    )
+
+    assert "Hi. I am ready." in result["replyText"]
+    assert result["responseLayer"]["mode"] == "deterministic"
+    assert result["responseLayer"]["fallbackUsed"] is True
+    assert result["toolCalls"] == []
     assert tool_registry.calls == []
 
 

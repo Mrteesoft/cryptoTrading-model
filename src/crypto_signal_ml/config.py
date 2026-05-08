@@ -441,7 +441,8 @@ class TrainingConfig:
     assistant_use_llm: bool = _env_bool("ASSISTANT_USE_LLM", False)
     assistant_store_path: Path = OUTPUTS_DIR / "assistantSessions.sqlite3"
     assistant_store_url: Optional[str] = os.getenv("ASSISTANT_DATABASE_URL") or os.getenv("DATABASE_URL")
-    llm_provider: str = _env_str("LLM_PROVIDER", "deterministic")
+    llm_provider: str = _env_str("LLM_PROVIDER", "lunatrix")
+    assistant_response_model: str = _env_str("ASSISTANT_RESPONSE_MODEL", "lunatrix-grounded-chat-v1")
     openai_model: str = _env_str("OPENAI_MODEL", "")
     openai_api_key_env_var: str = _env_str("OPENAI_API_KEY_ENV_VAR", "OPENAI_API_KEY")
     portfolio_store_path: Path = OUTPUTS_DIR / "traderPortfolio.sqlite3"
