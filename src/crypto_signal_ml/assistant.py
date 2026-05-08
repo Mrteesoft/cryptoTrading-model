@@ -559,28 +559,52 @@ class TradingAssistantService:
         elif live_snapshot is not None:
             actionable_count = int(market_summary.get("actionableSignals") or 0)
             total_signals = int(market_summary.get("totalSignals") or 0)
+            buy_signals = [
+                signal_summary
+                for signal_summary in list((live_snapshot or {}).get("topBuys", []))
+                if str(signal_summary.get("signal_name") or signal_summary.get("signalName") or "").strip().upper()
+                == "BUY"
+            ]
             if total_signals <= 0:
                 paragraphs.append(
                     "Live market overview: there are no published trade-ready signals right now. "
                     "The engine is keeping candidates on the internal watchlist until a BUY appears "
                     "or an open trade needs HOLD, TAKE_PROFIT, or LOSS management."
                 )
-            else:
-                lead_pair = primary_signal.get("productId", "the lead pair")
-                lead_signal = primary_signal.get("signal_name", "HOLD")
-                lead_confidence = self._format_percent(primary_signal.get("confidence"))
+            elif buy_signals:
+                lead_buy = buy_signals[0]
                 paragraphs.append(
-                    f"Live market overview: {actionable_count} actionable setups across {total_signals} tracked pairs. "
-                    f"The lead signal is {lead_pair} with a {lead_signal} call at {lead_confidence} confidence."
+                    f"Live market overview: {len(buy_signals)} BUY setup"
+                    f"{'s' if len(buy_signals) != 1 else ''} across {total_signals} tracked pairs. "
+                    f"The lead BUY is {lead_buy.get('productId', 'the lead pair')} at "
+                    f"{self._format_percent(lead_buy.get('confidence'))} confidence."
                 )
-
-            if actionable_signals:
-                top_lines = [
-                    f"{signal_summary['productId']} {signal_summary['signal_name']} ({self._format_percent(signal_summary.get('confidence'))})"
-                    for signal_summary in actionable_signals[:3]
-                ]
-                paragraphs.append("Top live setups: " + ", ".join(top_lines) + ".")
             else:
+                paragraphs.append(
+                    f"Live market overview: no active BUY setup is published across {total_signals} tracked pairs right now. "
+                    f"There are {actionable_count} non-buy management signals, but I would wait for the next BUY "
+                    "before naming a new entry."
+                )
+                coin_of_the_day = (
+                    (live_snapshot or {}).get("coinOfTheDay")
+                    or market_summary.get("coinOfTheDay")
+                )
+                if isinstance(coin_of_the_day, dict):
+                    spotlight_score = coin_of_the_day.get("coinOfDayScore") or coin_of_the_day.get("spotlightScore")
+                    paragraphs.append(
+                        f"Watch-only coin of the day: {coin_of_the_day.get('productId', 'the spotlight coin')} "
+                        f"at {self._format_percent(coin_of_the_day.get('confidence'))} confidence"
+                        f"{f' with a {spotlight_score}/100 spotlight score' if spotlight_score is not None else ''}. "
+                        f"{coin_of_the_day.get('spotlightReason') or coin_of_the_day.get('reasonSummary') or ''}".strip()
+                    )
+
+            if buy_signals:
+                top_lines = [
+                    f"{signal_summary['productId']} ({self._format_percent(signal_summary.get('confidence'))})"
+                    for signal_summary in buy_signals[:3]
+                ]
+                paragraphs.append("Top BUY candidates: " + ", ".join(top_lines) + ".")
+            elif not actionable_signals:
                 paragraphs.append(
                     "The live engine is mostly neutral right now, so the model is not surfacing strong spot entries."
                 )

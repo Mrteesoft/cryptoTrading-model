@@ -227,6 +227,40 @@ def test_router_keeps_greetings_conversational() -> None:
     assert plain_route_plan.planned_calls == ()
 
 
+def test_router_ignores_selected_pair_for_plain_greetings() -> None:
+    """UI-selected pairs should not force asset analysis for a small-talk prompt."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    route_plan = router.route("hi", explicit_product_id="BTC-USD")
+
+    assert route_plan.primary_product_id is None
+    assert route_plan.response_style == "conversation"
+    assert route_plan.intents == ("conversation",)
+    assert route_plan.planned_calls == ()
+
+
+def test_router_keeps_market_intent_when_social_words_name_an_asset() -> None:
+    """Social words should not hide a real asset or trading request."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    asset_route_plan = router.route("hi BTC")
+    advice_route_plan = router.route("thanks, should I buy BTC now?")
+
+    assert asset_route_plan.primary_product_id == "BTC-USD"
+    assert asset_route_plan.response_style == "direct"
+    assert [planned_call.name for planned_call in asset_route_plan.planned_calls] == ["get_signal"]
+
+    assert advice_route_plan.primary_product_id == "BTC-USD"
+    assert advice_route_plan.response_style == "advice"
+    assert [planned_call.name for planned_call in advice_route_plan.planned_calls] == ["get_signal"]
+
+
 def test_router_routes_buy_discovery_to_market_overview() -> None:
     """A broad buy request should ask for BUY candidates, not RAG."""
 
@@ -239,6 +273,14 @@ def test_router_routes_buy_discovery_to_market_overview() -> None:
     assert route_plan.response_style == "advice"
     assert route_plan.intents == ("market_overview",)
     assert [planned_call.name for planned_call in route_plan.planned_calls] == ["get_market_overview"]
+
+    broad_advice_route_plan = router.route("should I buy now?")
+
+    assert broad_advice_route_plan.response_style == "advice"
+    assert broad_advice_route_plan.intents == ("market_overview",)
+    assert [planned_call.name for planned_call in broad_advice_route_plan.planned_calls] == [
+        "get_market_overview"
+    ]
 
 
 def test_chat_flow_answers_greeting_without_market_tools() -> None:
@@ -327,6 +369,73 @@ def test_overview_reply_prioritizes_buy_candidates_over_loss_lead() -> None:
 
     assert "lead BUY is SOL-USD" in reply
     assert "BIO-USD with a LOSS call" not in reply
+
+
+def test_overview_reply_uses_coin_of_day_when_no_buy_is_active() -> None:
+    """No-BUY overview replies should surface a watch-only spotlight without calling it an entry."""
+
+    router = AssistantIntentRouter(known_product_ids=("BTC-USD", "ETH-USD", "SOL-USD"))
+    route_plan = router.route("what should I buy?")
+    composer = AssistantResponseComposer(
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD", "SOL-USD"),
+        )
+    )
+
+    reply = composer.compose(
+        question="what should I buy?",
+        tool_results=[
+            {
+                "name": "get_market_overview",
+                "arguments": {"force_refresh": False},
+                "reason": "",
+                "result": {
+                    "status": "ok",
+                    "source": "published",
+                    "overview": {
+                        "marketSummary": {
+                            "actionableSignals": 2,
+                            "totalSignals": 95,
+                            "signalCounts": {
+                                "buy": 0,
+                                "loss": 1,
+                                "hold": 1,
+                                "wait": 93,
+                            },
+                        },
+                        "primarySignal": {
+                            "productId": "ICP-USD",
+                            "signal_name": "LOSS",
+                            "confidence": 0.744,
+                        },
+                        "topSignals": [
+                            {
+                                "productId": "ICP-USD",
+                                "signal_name": "LOSS",
+                                "confidence": 0.744,
+                            }
+                        ],
+                        "coinOfTheDay": {
+                            "productId": "SOL-USD",
+                            "signal_name": "HOLD",
+                            "confidence": 0.62,
+                            "coinOfDayScore": 78.0,
+                            "spotlightReason": "Momentum is improving, but the BUY gate is still closed.",
+                        },
+                    },
+                },
+            }
+        ],
+        recalled_messages=[],
+        route_plan=route_plan,
+    )
+
+    assert "does not show a fresh BUY right now" in reply
+    assert "no active BUY setup" in reply
+    assert "Watch-only coin of the day: SOL-USD" in reply
+    assert "Spotlight score: 78/100" in reply
+    assert "ICP-USD with a LOSS call" not in reply
 
 
 def test_chat_flow_routes_off_topic_questions_to_rag() -> None:

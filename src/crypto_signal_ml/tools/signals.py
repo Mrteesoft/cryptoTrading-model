@@ -101,6 +101,12 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "traderBrain": snapshot.get("traderBrain", {}),
         "topBuys": top_buys[:25],
         "topSignals": top_signals,
+        "coinOfTheDay": snapshot.get("coinOfTheDay") or (snapshot.get("marketSummary", {}) or {}).get("coinOfTheDay"),
+        "spotlightCandidates": (
+            snapshot.get("spotlightCandidates")
+            or (snapshot.get("marketSummary", {}) or {}).get("spotlightCandidates")
+            or []
+        ),
     }
 
 

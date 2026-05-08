@@ -351,6 +351,18 @@ class AssistantIntentRouter:
         """Resolve the tool plan needed for the request."""
 
         normalized_question = str(question).strip()
+        lowered_question = normalized_question.lower()
+        if self._is_social_turn(lowered_question):
+            return AssistantRoutePlan(
+                primary_product_id=None,
+                resolved_product_ids=(),
+                intents=("conversation",),
+                response_style="conversation",
+                force_refresh=False,
+                capital_override=None,
+                planned_calls=(),
+            )
+
         resolved_product_ids = tuple(
             self.resolve_product_ids(
                 question=normalized_question,
@@ -358,7 +370,6 @@ class AssistantIntentRouter:
             )
         )
         capital_override = self.resolve_capital_override(normalized_question)
-        lowered_question = normalized_question.lower()
         response_style = self._classify_response_style(lowered_question, resolved_product_ids)
         resolved_force_refresh = bool(force_refresh or self._should_force_refresh(lowered_question))
         intents = self._classify_intents(
@@ -432,7 +443,7 @@ class AssistantIntentRouter:
                 )
             )
 
-        if not planned_calls and "conversation" not in intents:
+        if not planned_calls and "conversation" not in intents and "general_knowledge" not in intents:
             planned_calls.append(
                 PlannedToolCall(
                     name="get_market_overview",
@@ -472,11 +483,15 @@ class AssistantIntentRouter:
         asks_for_research = self._contains_any_keyword(lowered_question, KNOWLEDGE_REQUEST_KEYWORDS)
         asks_for_market_overview = self._contains_any_keyword(lowered_question, MARKET_OVERVIEW_KEYWORDS)
         asks_for_comparison = self._contains_any_keyword(lowered_question, COMPARISON_KEYWORDS)
+        asks_for_advice = self._contains_any_keyword(lowered_question, ADVISORY_KEYWORDS)
         is_conversation = self._is_conversational_turn(lowered_question)
 
         if resolved_product_ids:
             intents.append("multi_asset_signal" if len(resolved_product_ids) > 1 else "single_asset_signal")
-        if asks_for_market_overview and (not resolved_product_ids or "market" in lowered_question):
+        if (
+            asks_for_market_overview
+            or (asks_for_advice and not resolved_product_ids and not asks_for_research)
+        ) and (not resolved_product_ids or "market" in lowered_question):
             intents.append("market_overview")
         if asks_for_trader_plan:
             intents.append("trader_plan")
@@ -526,19 +541,73 @@ class AssistantIntentRouter:
     def _is_conversational_turn(lowered_question: str) -> bool:
         """Return whether the prompt is chat/help text instead of a market request."""
 
+        if AssistantIntentRouter._is_social_turn(lowered_question):
+            return True
+
         normalized_question = re.sub(r"[^a-z0-9\s]", " ", str(lowered_question).lower())
         normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
         if not normalized_question:
             return True
 
+        market_like = AssistantIntentRouter._looks_like_market_or_asset_request(normalized_question)
         if any(keyword in normalized_question for keyword in HELP_REQUEST_KEYWORDS):
             return True
-        if any(keyword in normalized_question for keyword in THANKS_KEYWORDS):
+        if any(keyword in normalized_question for keyword in THANKS_KEYWORDS) and not market_like:
             return True
-        if any(keyword in normalized_question for keyword in GOODBYE_KEYWORDS):
+        if any(keyword in normalized_question for keyword in GOODBYE_KEYWORDS) and not market_like:
             return True
 
+        return normalized_question in GREETING_KEYWORDS and not market_like
+
+    @staticmethod
+    def _is_social_turn(lowered_question: str) -> bool:
+        """Return whether the user is only greeting, thanking, or closing the chat."""
+
+        normalized_question = re.sub(r"[^a-z0-9\s]", " ", str(lowered_question).lower())
+        normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
+        if not normalized_question:
+            return True
+
+        market_like = AssistantIntentRouter._looks_like_market_or_asset_request(normalized_question)
+
+        if any(keyword in normalized_question for keyword in THANKS_KEYWORDS) and not market_like:
+            return True
+        if any(keyword in normalized_question for keyword in GOODBYE_KEYWORDS) and not market_like:
+            return True
+
+        words = normalized_question.split()
+        if not words:
+            return True
+        if words[0] in GREETING_KEYWORDS and len(words) <= 3:
+            return not market_like
+
         return normalized_question in GREETING_KEYWORDS
+
+    @staticmethod
+    def _looks_like_market_or_asset_request(normalized_question: str) -> bool:
+        """Return whether a short social-looking prompt also names market work."""
+
+        if any(
+            keyword in normalized_question
+            for keyword in (
+                *MARKET_OVERVIEW_KEYWORDS,
+                *MODEL_REQUEST_KEYWORDS,
+                *TRADER_REQUEST_KEYWORDS,
+                *ADVISORY_KEYWORDS,
+                *COMPARISON_KEYWORDS,
+            )
+        ):
+            return True
+
+        if re.search(r"\b[a-z0-9]{2,10}[-/](usd|usdt|usdc)\b", normalized_question):
+            return True
+
+        asset_terms = set(COMMON_PRODUCT_ALIASES.keys())
+        asset_terms.update(symbol.lower() for symbol in COMMON_PRODUCT_ALIASES.values())
+        return any(
+            re.search(rf"\b{re.escape(asset_term)}\b", normalized_question)
+            for asset_term in asset_terms
+        )
 
     @staticmethod
     def _should_force_refresh(lowered_question: str) -> bool:
@@ -990,6 +1059,20 @@ class AssistantResponseComposer:
                     return [
                         f"The broad market read has a BUY candidate to review first: {lead_product}."
                     ]
+                spotlight_signal = self._resolve_spotlight_signal(overview)
+                if spotlight_signal is not None:
+                    spotlight_product = str(spotlight_signal.get("productId") or "the spotlight coin")
+                    spotlight_score = self._format_score(
+                        spotlight_signal.get("coinOfDayScore")
+                        or spotlight_signal.get("spotlightScore")
+                    )
+                    return [
+                        (
+                            "The broad market read does not show a fresh BUY right now. "
+                            f"The watch-only spotlight is {spotlight_product}"
+                            f"{f' at {spotlight_score}' if spotlight_score else ''}."
+                        )
+                    ]
                 return [
                     "The broad market read does not show a fresh BUY setup right now."
                 ]
@@ -1007,7 +1090,7 @@ class AssistantResponseComposer:
                 return f"I do not have an authoritative signal for {product_id} yet."
             return ""
 
-        signal_name = str(signal_summary.get("signal_name") or "HOLD").upper()
+        signal_name = self._resolve_signal_name(signal_summary)
         if signal_name == "BUY":
             return f"The {source_descriptor} tool read supports a cautious long entry setup for {product_id}."
         if signal_name == "TAKE_PROFIT":
@@ -1028,7 +1111,7 @@ class AssistantResponseComposer:
             if not isinstance(signal_summary, dict):
                 continue
             comparison_lines.append(
-                f"{signal_result.get('productId')} {signal_summary.get('signal_name')} "
+                f"{signal_result.get('productId')} {self._resolve_signal_name(signal_summary)} "
                 f"({self._format_percent(signal_summary.get('confidence'))})"
             )
 
@@ -1054,10 +1137,16 @@ class AssistantResponseComposer:
                 paragraphs.append(f"The tool fell back to cached data because the live refresh failed: {warning}")
             return paragraphs
 
-        signal_name = str(signal_summary.get("signal_name") or "UNKNOWN")
+        signal_name = self._resolve_signal_name(signal_summary)
         confidence = self._format_percent(signal_summary.get("confidence"))
         close_price = self._format_price(signal_summary.get("close"))
-        explanation = str(signal_summary.get("signalChat") or "").strip()
+        explanation = str(
+            signal_summary.get("signalChat")
+            or signal_summary.get("spotlightReason")
+            or signal_summary.get("brainSummary")
+            or signal_summary.get("reasonSummary")
+            or ""
+        ).strip()
 
         paragraphs = [
             f"{product_id} is currently a {signal_name} setup at {close_price} with {confidence} confidence from the {source} engine path."
@@ -1107,11 +1196,34 @@ class AssistantResponseComposer:
             ]
             paragraphs.append("Next BUY candidates: " + ", ".join(top_lines) + ".")
         else:
+            spotlight_signal = self._resolve_spotlight_signal(overview)
             paragraphs = [
                 f"Market overview: no active BUY setup is published across {total_signals} tracked pairs right now. "
                 f"There are {actionable_count} non-buy management signal{'s' if actionable_count != 1 else ''}, "
                 "but I would wait for the next BUY before naming a new entry."
             ]
+            if spotlight_signal is not None:
+                spotlight_product = str(spotlight_signal.get("productId") or "the spotlight coin")
+                spotlight_signal_name = self._resolve_signal_name(spotlight_signal)
+                spotlight_confidence = self._format_percent(spotlight_signal.get("confidence"))
+                spotlight_score = self._format_score(
+                    spotlight_signal.get("coinOfDayScore")
+                    or spotlight_signal.get("spotlightScore")
+                )
+                spotlight_reason = str(
+                    spotlight_signal.get("spotlightReason")
+                    or spotlight_signal.get("brainSummary")
+                    or spotlight_signal.get("reasonSummary")
+                    or ""
+                ).strip()
+                score_text = f" Spotlight score: {spotlight_score}." if spotlight_score else ""
+                reason_text = f" {spotlight_reason}" if spotlight_reason else ""
+                paragraphs.append(
+                    (
+                        f"Watch-only coin of the day: {spotlight_product} is currently {spotlight_signal_name} "
+                        f"at {spotlight_confidence} confidence.{score_text}{reason_text}"
+                    ).strip()
+                )
 
         warning = str(overview_result.get("warning") or "").strip()
         if warning:
@@ -1239,7 +1351,7 @@ class AssistantResponseComposer:
         plan_summary = dict(trader_plan.get("plan") or {})
         market_stance = str(trader_plan.get("marketStance") or "balanced")
         entry_count = int(plan_summary.get("newEntryCount") or plan_summary.get("entryCount") or 0)
-        signal_name = str(signal_summary.get("signal_name") or "HOLD").upper()
+        signal_name = self._resolve_signal_name(signal_summary)
 
         if signal_name == "BUY" and market_stance == "defensive":
             return [
@@ -1289,9 +1401,37 @@ class AssistantResponseComposer:
 
         return (
             isinstance(signal_summary, dict)
-            and str(signal_summary.get("signal_name") or signal_summary.get("signalName") or "").strip().upper()
-            == "BUY"
+            and AssistantResponseComposer._resolve_signal_name(signal_summary) == "BUY"
         )
+
+    @staticmethod
+    def _resolve_signal_name(signal_summary: dict[str, Any]) -> str:
+        """Return the stable upper-case signal name from either API casing."""
+
+        return str(
+            signal_summary.get("signal_name")
+            or signal_summary.get("signalName")
+            or "HOLD"
+        ).strip().upper()
+
+    @staticmethod
+    def _resolve_spotlight_signal(overview: dict[str, Any]) -> dict[str, Any] | None:
+        """Resolve the watch-only coin-of-the-day candidate from an overview payload."""
+
+        market_summary = dict(overview.get("marketSummary") or {})
+        candidates: list[Any] = [
+            overview.get("coinOfTheDay"),
+            market_summary.get("coinOfTheDay"),
+        ]
+        if isinstance(overview.get("spotlightCandidates"), list):
+            candidates.extend(overview.get("spotlightCandidates") or [])
+        if isinstance(market_summary.get("spotlightCandidates"), list):
+            candidates.extend(market_summary.get("spotlightCandidates") or [])
+
+        for candidate in candidates:
+            if isinstance(candidate, dict) and str(candidate.get("productId") or "").strip():
+                return dict(candidate)
+        return None
 
     @staticmethod
     def _format_percent(value: Any) -> str:
@@ -1307,9 +1447,30 @@ class AssistantResponseComposer:
         """Format numeric prices consistently."""
 
         try:
-            return f"${float(value):,.2f}"
+            numeric_value = float(value)
         except (TypeError, ValueError):
             return "-"
+
+        if numeric_value >= 1000:
+            return f"${numeric_value:,.2f}"
+        if numeric_value >= 1:
+            return f"${numeric_value:,.4f}"
+        if numeric_value >= 0.01:
+            return f"${numeric_value:,.5f}"
+        return f"${numeric_value:,.6f}"
+
+    @staticmethod
+    def _format_score(value: Any) -> str:
+        """Format a zero-to-one or zero-to-100 score as a compact 100-point score."""
+
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return ""
+
+        if numeric_value <= 1:
+            numeric_value *= 100
+        return f"{max(round(numeric_value), 0)}/100"
 
     @staticmethod
     def _trim_text(text: str, max_length: int = 220) -> str:
@@ -1462,7 +1623,7 @@ class ToolDrivenChatFlow:
         if not isinstance(signal_summary, dict):
             return False
 
-        signal_name = str(signal_summary.get("signal_name") or "HOLD").upper()
+        signal_name = AssistantResponseComposer._resolve_signal_name(signal_summary)
         confidence = self._safe_float(signal_summary.get("confidence"))
         if confidence is None:
             return False

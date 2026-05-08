@@ -385,6 +385,21 @@ class LiveSignalEngine:
             actionable_signals=actionable_visible_signals,
             trader_brain=pipeline_artifacts.enrichment.trader_brain_snapshot,
         )
+        coin_spotlight_candidates = self._select_coin_spotlight_candidates(
+            signal_summaries=pipeline_artifacts.decision.signal_summaries,
+            limit=5,
+        )
+        coin_of_the_day = coin_spotlight_candidates[0] if coin_spotlight_candidates else None
+        market_summary = dict(live_snapshot.get("marketSummary") or {})
+        if coin_of_the_day is not None:
+            market_summary.update(
+                {
+                    "coinOfTheDay": coin_of_the_day,
+                    "spotlightCandidates": coin_spotlight_candidates,
+                }
+            )
+            live_snapshot["coinOfTheDay"] = coin_of_the_day
+            live_snapshot["spotlightCandidates"] = coin_spotlight_candidates
         live_snapshot.update(
             {
                 "mode": "live",
@@ -412,6 +427,7 @@ class LiveSignalEngine:
                 "watchlistPool": watchlist_pool_summary,
                 "signalInference": dict(inference_artifacts.summary),
                 "livePolicy": live_actions,
+                "marketSummary": market_summary,
             }
         )
 
@@ -460,6 +476,214 @@ class LiveSignalEngine:
             product_id=product_id,
         )
         return snapshot["signalsByProduct"].get(str(product_id).strip().upper())
+
+    @staticmethod
+    def _clamp_score(value: float, minimum_value: float = 0.0, maximum_value: float = 1.0) -> float:
+        """Clamp one floating-point score into a stable range."""
+
+        return max(min(float(value), maximum_value), minimum_value)
+
+    @staticmethod
+    def _safe_summary_float(
+        signal_summary: Dict[str, Any],
+        key: str,
+        default_value: float = 0.0,
+    ) -> float:
+        """Read one numeric field from a signal summary without raising."""
+
+        raw_value = signal_summary.get(key, default_value)
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return default_value
+
+    @staticmethod
+    def _safe_context_float(
+        context: Any,
+        key: str,
+        default_value: float = 0.0,
+    ) -> float:
+        """Read one numeric field from an optional nested context."""
+
+        if not isinstance(context, dict):
+            return default_value
+        raw_value = context.get(key, default_value)
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return default_value
+
+    def _build_coin_spotlight_components(self, signal_summary: Dict[str, Any]) -> Dict[str, float]:
+        """Score one non-entry spotlight candidate from model, chart, and attention proxies."""
+
+        confidence_score = self._clamp_score(self._safe_summary_float(signal_summary, "confidence"))
+        setup_score = self._clamp_score(self._safe_summary_float(signal_summary, "setupScore") / 6.0)
+        policy_score = self._clamp_score(self._safe_summary_float(signal_summary, "policyScore"))
+        probability_score = self._clamp_score(self._safe_summary_float(signal_summary, "probabilityMargin") / 0.25)
+        brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
+        brain_score = self._clamp_score(self._safe_context_float(brain, "decisionScore"))
+
+        market_context = (
+            signal_summary.get("marketContext")
+            if isinstance(signal_summary.get("marketContext"), dict)
+            else {}
+        )
+        execution_context = (
+            signal_summary.get("executionContext")
+            if isinstance(signal_summary.get("executionContext"), dict)
+            else {}
+        )
+        event_context = (
+            signal_summary.get("eventContext")
+            if isinstance(signal_summary.get("eventContext"), dict)
+            else {}
+        )
+        percent_change_24h = self._safe_context_float(market_context, "cmcPercentChange24h")
+        percent_change_7d = self._safe_context_float(market_context, "cmcPercentChange7d")
+        volume_zscore = self._safe_context_float(execution_context, "volumeZscore20")
+        volume_vs_sma20 = self._safe_context_float(execution_context, "volumeVsSma20", 1.0)
+        event_bonus = 0.12 if bool(event_context.get("hasEventNext7d", False)) else 0.0
+        theme_bonus = 0.08 if list(market_context.get("themeTags") or []) else 0.0
+        attention_score = self._clamp_score(
+            (max(percent_change_24h, 0.0) / 0.08 * 0.30)
+            + (max(percent_change_7d, 0.0) / 0.18 * 0.20)
+            + (max(volume_zscore, 0.0) / 2.5 * 0.20)
+            + (max(volume_vs_sma20 - 1.0, 0.0) / 1.5 * 0.10)
+            + event_bonus
+            + theme_bonus
+        )
+
+        return {
+            "confidence": round(confidence_score, 4),
+            "setup": round(setup_score, 4),
+            "policy": round(policy_score, 4),
+            "probabilityEdge": round(probability_score, 4),
+            "attention": round(attention_score, 4),
+            "brain": round(brain_score, 4),
+        }
+
+    def _score_coin_spotlight_candidate(self, signal_summary: Dict[str, Any]) -> tuple[float, Dict[str, float]]:
+        """Return one LunarCrush-style spotlight score using the fields this app already has."""
+
+        components = self._build_coin_spotlight_components(signal_summary)
+        signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
+        model_signal_name = str(signal_summary.get("modelSignalName", "")).strip().upper()
+        trade_readiness = str(signal_summary.get("tradeReadiness", "")).strip().lower()
+        chart_status = str(
+            signal_summary.get("chartDecision")
+            or signal_summary.get("chartConfirmationStatus")
+            or ""
+        ).strip().lower()
+        brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
+        brain_decision = str(brain.get("decision", "") or "").strip().lower()
+
+        trade_readiness_bonus = {
+            "high": 0.08,
+            "medium": 0.05,
+            "standby": 0.02,
+        }.get(trade_readiness, 0.0)
+        chart_bonus = {
+            "confirmed": 0.08,
+            "early": 0.04,
+        }.get(chart_status, 0.0)
+        signal_bonus = 0.10 if signal_name == "BUY" else 0.06 if model_signal_name == "BUY" else 0.0
+        watchlist_bonus = 0.04 if brain_decision in {"watchlist", "accumulate", "monitor"} else 0.0
+        exit_penalty = 0.14 if signal_name in {"LOSS", "TAKE_PROFIT"} else 0.0
+
+        raw_score = (
+            components["confidence"] * 0.30
+            + components["setup"] * 0.18
+            + components["policy"] * 0.14
+            + components["probabilityEdge"] * 0.12
+            + components["attention"] * 0.16
+            + components["brain"] * 0.10
+            + trade_readiness_bonus
+            + chart_bonus
+            + signal_bonus
+            + watchlist_bonus
+            - exit_penalty
+        )
+        return round(self._clamp_score(raw_score) * 100.0, 2), components
+
+    @staticmethod
+    def _build_coin_spotlight_reason(signal_summary: Dict[str, Any]) -> str:
+        """Build the short reason shown when there is no active BUY signal."""
+
+        product_id = str(signal_summary.get("productId") or signal_summary.get("pairSymbol") or "This coin")
+        signal_name = str(signal_summary.get("signal_name", "")).strip().upper()
+        model_signal_name = str(signal_summary.get("modelSignalName", "")).strip().upper()
+        brain = signal_summary.get("brain") if isinstance(signal_summary.get("brain"), dict) else {}
+        existing_summary = (
+            str(brain.get("summaryLine") or "").strip()
+            or str(signal_summary.get("brainSummary") or "").strip()
+            or str(signal_summary.get("reasonSummary") or "").strip()
+            or str(signal_summary.get("signalChat") or "").strip()
+        )
+
+        if existing_summary:
+            return existing_summary
+        if signal_name == "BUY":
+            return f"{product_id} is the strongest trade-ready coin in the current live scan."
+        if model_signal_name == "BUY":
+            return (
+                f"{product_id} has the strongest watch setup right now, but the live BUY gate has not cleared yet."
+            )
+        return f"{product_id} is the strongest watch candidate while the board waits for a clean BUY."
+
+    def _select_coin_spotlight_candidates(
+        self,
+        *,
+        signal_summaries: Sequence[Dict[str, Any]],
+        limit: int = 5,
+    ) -> list[Dict[str, Any]]:
+        """Choose daily spotlight candidates from all scored coins, not only published BUY rows."""
+
+        candidates: list[Dict[str, Any]] = []
+        selected_at = datetime.now(timezone.utc).isoformat()
+        selected_for_date = selected_at.split("T", 1)[0]
+        for raw_signal_summary in signal_summaries:
+            signal_summary = dict(raw_signal_summary)
+            product_id = str(signal_summary.get("productId", "")).strip().upper()
+            if not product_id:
+                continue
+            if is_signal_product_excluded(
+                product_id=product_id,
+                base_currency=str(signal_summary.get("baseCurrency", "")),
+                config=self.config,
+            ):
+                continue
+
+            score, components = self._score_coin_spotlight_candidate(signal_summary)
+            signal_name = str(signal_summary.get("signal_name", "")).strip().upper() or "HOLD"
+            spotlight_action = "signal" if signal_name == "BUY" else "watch"
+            signal_summary.update(
+                {
+                    "productId": product_id,
+                    "coinOfDayScore": score,
+                    "spotlightScore": score,
+                    "spotlightAction": spotlight_action,
+                    "spotlightLabel": "Signal coin" if spotlight_action == "signal" else "Coin of the day",
+                    "spotlightReason": self._build_coin_spotlight_reason(signal_summary),
+                    "spotlightComponents": components,
+                    "selectedAt": selected_at,
+                    "selectedForDate": selected_for_date,
+                }
+            )
+            candidates.append(signal_summary)
+
+        non_exit_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("signal_name", "")).strip().upper() not in {"LOSS", "TAKE_PROFIT"}
+        ]
+        ranked_candidates = non_exit_candidates or candidates
+        return sorted(
+            ranked_candidates,
+            key=lambda candidate: (
+                -float(candidate.get("coinOfDayScore", 0.0) or 0.0),
+                str(candidate.get("productId", "")),
+            ),
+        )[: max(int(limit), 0)]
 
     def _apply_live_execution_policy(
         self,

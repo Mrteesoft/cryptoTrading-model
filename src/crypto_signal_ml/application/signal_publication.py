@@ -85,6 +85,12 @@ def _build_snapshot_overview(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "traderBrain": snapshot.get("traderBrain", {}),
         "topBuys": top_buys[:25],
         "topSignals": top_signals,
+        "coinOfTheDay": snapshot.get("coinOfTheDay") or (snapshot.get("marketSummary", {}) or {}).get("coinOfTheDay"),
+        "spotlightCandidates": (
+            snapshot.get("spotlightCandidates")
+            or (snapshot.get("marketSummary", {}) or {}).get("spotlightCandidates")
+            or []
+        ),
         "currentSignalStore": snapshot.get("currentSignalStore", {}),
     }
 
@@ -611,6 +617,17 @@ class PublishedSignalViewService:
         ]
         top_signals = top_buys[:3] if top_buys else actionable_signals[:3] if actionable_signals else current_signals[:3]
 
+        market_summary = {
+            "totalSignals": len(current_signals),
+            "actionableSignals": len(actionable_signals),
+            "signalCounts": signal_counts,
+        }
+        coin_of_the_day = snapshot_overview.get("coinOfTheDay")
+        spotlight_candidates = list(snapshot_overview.get("spotlightCandidates") or [])
+        if coin_of_the_day is not None:
+            market_summary["coinOfTheDay"] = coin_of_the_day
+            market_summary["spotlightCandidates"] = spotlight_candidates
+
         return {
             "generatedAt": store_status.get("generatedAt") or snapshot_overview.get("generatedAt"),
             "mode": snapshot_overview.get("mode") or "published",
@@ -619,16 +636,14 @@ class PublishedSignalViewService:
             "productsCovered": len(current_signals),
             "granularitySeconds": snapshot_overview.get("granularitySeconds"),
             "primarySignal": current_signal,
-            "marketSummary": {
-                "totalSignals": len(current_signals),
-                "actionableSignals": len(actionable_signals),
-                "signalCounts": signal_counts,
-            },
+            "marketSummary": market_summary,
             "marketState": snapshot_overview.get("marketState", {}),
             "marketIntelligence": snapshot_overview.get("marketIntelligence", {}),
             "traderBrain": snapshot_overview.get("traderBrain", {}),
             "topBuys": top_buys[:25],
             "topSignals": top_signals,
+            "coinOfTheDay": coin_of_the_day,
+            "spotlightCandidates": spotlight_candidates,
             "currentSignalStore": {
                 "status": store_status.get("status"),
                 "signalCount": len(current_signals),
