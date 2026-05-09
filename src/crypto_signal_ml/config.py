@@ -324,8 +324,9 @@ class TrainingConfig:
     live_buy_signals_only: bool = _env_bool("LIVE_BUY_SIGNALS_ONLY", True)
     live_auto_clear_loss_signals: bool = _env_bool("LIVE_AUTO_CLEAR_LOSS_SIGNALS", True)
     signal_monitor_run_initial_generation: bool = _env_bool("SIGNAL_MONITOR_RUN_INITIAL_GENERATION", True)
-    signal_monitor_refresh_interval_seconds: int = (
-        _env_optional_int("SIGNAL_MONITOR_REFRESH_INTERVAL_SECONDS", 900) or 900
+    signal_monitor_refresh_interval_seconds: int = _env_optional_int(
+        "SIGNAL_MONITOR_REFRESH_INTERVAL_SECONDS",
+        900,
     )
     market_product_batch_rotation_enabled: bool = _env_bool("MARKET_PRODUCT_BATCH_ROTATION_ENABLED", True)
     market_product_batch_state_file: Path = OUTPUTS_DIR / "marketProductBatchState.json"
