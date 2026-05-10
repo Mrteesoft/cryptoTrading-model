@@ -16,7 +16,13 @@ if str(SRC_DIR) not in sys.path:
 
 from crypto_signal_ml.chat.flow import AssistantIntentRouter, AssistantResponseComposer, ToolDrivenChatFlow  # noqa: E402
 from crypto_signal_ml.config import TrainingConfig  # noqa: E402
-from crypto_signal_ml.llm import ChatModelAdapter, LlmCompletionResponse, LlmMessage, LlmToolSpec  # noqa: E402
+from crypto_signal_ml.llm import (  # noqa: E402
+    ChatModelAdapter,
+    LlmCompletionResponse,
+    LlmMessage,
+    LlmToolSpec,
+    OpenAIChatModelAdapter,
+)
 
 
 class StubSessionStore:
@@ -33,8 +39,19 @@ class StubSessionStore:
 class StubToolRegistry:
     """Tool registry stub that records execution order."""
 
-    def __init__(self) -> None:
+    def __init__(self, knowledge_results: list[dict[str, object]] | None = None) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.knowledge_results = (
+            list(knowledge_results)
+            if knowledge_results is not None
+            else [
+                {
+                    "title": "BTC research memo",
+                    "sourceUri": "internal://btc-memo",
+                    "snippet": "Liquidity and trend support remain constructive.",
+                }
+            ]
+        )
 
     def execute(self, tool_name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
         normalized_arguments = dict(arguments or {})
@@ -112,13 +129,8 @@ class StubToolRegistry:
                 "toolName": "search_knowledge",
                 "status": "ok",
                 "query": str(normalized_arguments.get("query") or ""),
-                "results": [
-                    {
-                        "title": "BTC research memo",
-                        "sourceUri": "internal://btc-memo",
-                        "snippet": "Liquidity and trend support remain constructive.",
-                    }
-                ],
+                "count": len(self.knowledge_results),
+                "results": list(self.knowledge_results),
                 "error": "",
             }
 
@@ -235,6 +247,45 @@ def test_router_resolves_aliases_and_generic_symbols() -> None:
 
     assert router.resolve_product_id("Why is bitcoin bullish?") == "BTC-USD"
     assert router.resolve_product_id("Should I buy $BONK now?") == "BONK-USD"
+
+
+def test_router_routes_asset_definitions_to_general_knowledge() -> None:
+    """Basic coin definition prompts should not be forced through signal lookup."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    route_plan = router.route("What is bitcoin?")
+    clarification_route = router.route("I am asking what bitcoin is")
+
+    assert route_plan.primary_product_id == "BTC-USD"
+    assert route_plan.response_style == "general"
+    assert route_plan.intents == ("general_knowledge",)
+    assert [planned_call.name for planned_call in route_plan.planned_calls] == ["search_knowledge"]
+
+    assert clarification_route.primary_product_id == "BTC-USD"
+    assert clarification_route.response_style == "general"
+    assert clarification_route.intents == ("general_knowledge",)
+    assert [planned_call.name for planned_call in clarification_route.planned_calls] == ["search_knowledge"]
+
+
+def test_router_keeps_market_context_for_asset_research_questions() -> None:
+    """Market explainers about a named asset should still fetch the signal first."""
+
+    router = AssistantIntentRouter(
+        known_product_ids=("BTC-USD", "ETH-USD"),
+    )
+
+    route_plan = router.route("Why is bitcoin bullish?")
+
+    assert route_plan.primary_product_id == "BTC-USD"
+    assert route_plan.response_style == "explain"
+    assert set(route_plan.intents) >= {"single_asset_signal", "research_context", "mixed_request"}
+    assert [planned_call.name for planned_call in route_plan.planned_calls] == [
+        "get_signal",
+        "search_knowledge",
+    ]
 
 
 def test_router_keeps_greetings_conversational() -> None:
@@ -579,6 +630,96 @@ def test_chat_flow_routes_off_topic_questions_to_rag() -> None:
     assert "Based on the indexed knowledge base" in result["replyText"]
     assert "Liquidity and trend support remain constructive." in result["replyText"]
     assert [tool_name for tool_name, _ in tool_registry.calls] == ["search_knowledge"]
+
+
+def test_chat_flow_lets_llm_answer_general_questions_after_rag_lookup() -> None:
+    """A configured response model should handle broad questions after RAG is checked."""
+
+    tool_registry = StubToolRegistry(knowledge_results=[])
+    llm_adapter = StubChatModelAdapter("Hamlet was written by William Shakespeare.")
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+            assistant_use_llm=True,
+            llm_provider="stub",
+            assistant_response_model="stub-chat-model",
+        ),
+        llm_adapter=llm_adapter,
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="Who wrote Hamlet?",
+    )
+
+    assert [tool_call["name"] for tool_call in result["toolCalls"]] == ["search_knowledge"]
+    assert result["routing"]["responseStyle"] == "general"
+    assert result["replyText"] == "Hamlet was written by William Shakespeare."
+    assert result["responseLayer"]["mode"] == "llm"
+    assert [tool_name for tool_name, _ in tool_registry.calls] == ["search_knowledge"]
+    assert len(llm_adapter.calls) == 1
+
+
+def test_chat_flow_answers_asset_definition_without_signal_lookup() -> None:
+    """Definition questions about a coin should answer the concept, not report missing signal data."""
+
+    tool_registry = StubToolRegistry()
+    flow = ToolDrivenChatFlow(
+        tool_registry=tool_registry,
+        session_store=StubSessionStore(),
+        config=TrainingConfig(
+            coinmarketcap_use_context=False,
+            live_product_ids=("BTC-USD", "ETH-USD"),
+        ),
+    )
+
+    result = flow.run(
+        session_id="session-1",
+        question="What is bitcoin?",
+    )
+
+    assert [tool_call["name"] for tool_call in result["toolCalls"]] == ["search_knowledge"]
+    assert result["routing"]["responseStyle"] == "general"
+    assert "Bitcoin is a decentralized digital currency" in result["replyText"]
+    assert "No authoritative signal" not in result["replyText"]
+    assert [tool_name for tool_name, _ in tool_registry.calls] == ["search_knowledge"]
+
+
+def test_openai_adapter_normalizes_chat_completion_responses() -> None:
+    """OpenAI responses should parse into the shared chat adapter contract."""
+
+    captured_payloads = []
+
+    def request_executor(payload: dict[str, object]) -> dict[str, object]:
+        captured_payloads.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "General answer.",
+                    }
+                }
+            ]
+        }
+
+    adapter = OpenAIChatModelAdapter(
+        model="test-model",
+        api_key="test-key",
+        request_executor=request_executor,
+    )
+
+    response = adapter.complete(
+        messages=[LlmMessage(role="user", content="Who wrote Hamlet?")],
+        tools=(),
+        system_prompt="Answer normally.",
+    )
+
+    assert adapter.is_configured() is True
+    assert response.message == "General answer."
+    assert captured_payloads[0]["model"] == "test-model"
 
 
 def test_chat_flow_adds_trader_plan_follow_up_for_actionable_advice_questions() -> None:

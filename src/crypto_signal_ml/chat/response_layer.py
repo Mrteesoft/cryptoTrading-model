@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from typing import Any, Protocol, Sequence
 
 from ..config import TrainingConfig
-from ..llm import ChatModelAdapter, LlmMessage, LunatrixChatModelAdapter
+from ..llm import ChatModelAdapter, LlmMessage, LunatrixChatModelAdapter, OpenAIChatModelAdapter
 
 
 class DeterministicComposerProtocol(Protocol):
@@ -155,6 +156,16 @@ class AssistantChatResponseLayer:
         provider_name = self._configured_provider_name()
         if provider_name in {"lunatrix", "local", "internal"}:
             return LunatrixChatModelAdapter(model=self._configured_model_name())
+        if provider_name == "openai":
+            api_key_env_var = str(
+                getattr(self.config, "openai_api_key_env_var", "OPENAI_API_KEY")
+                or "OPENAI_API_KEY"
+            ).strip()
+            return OpenAIChatModelAdapter(
+                model=self._configured_model_name(),
+                api_key=os.getenv(api_key_env_var, ""),
+                base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            )
         return None
 
     def _configured_provider_name(self) -> str:
@@ -164,6 +175,13 @@ class AssistantChatResponseLayer:
 
     def _configured_model_name(self) -> str:
         """Return the configured model id, if any."""
+
+        if self._configured_provider_name() == "openai":
+            openai_model = str(getattr(self.config, "openai_model", "") or "").strip()
+            if openai_model:
+                return openai_model
+            configured_name = str(getattr(self.config, "assistant_response_model", "") or "").strip()
+            return "" if configured_name.startswith("lunatrix-") else configured_name
 
         configured_name = str(getattr(self.config, "assistant_response_model", "") or "").strip()
         return configured_name or "lunatrix-grounded-chat-v1"
@@ -175,10 +193,13 @@ class AssistantChatResponseLayer:
             "You are the Lunatrix AI chat response layer. The model-service router and tools have already run; "
             "do not request or invent additional tool data. Answer conversationally and directly from the provided "
             "route plan, tool results, memory, and deterministic draft. If the user is greeting or chatting casually, "
-            "reply naturally without mentioning market data. For trading answers, never call LOSS, TAKE_PROFIT, or HOLD "
-            "a buy entry. Only call something a BUY when a provided tool result explicitly says BUY. If no BUY is active, "
-            "say no active BUY and mention a watch-only spotlight only as observation. Keep answers concise, practical, "
-            "and clear that this is not financial advice."
+            "reply naturally without mentioning market data. For broad non-market questions, answer like a helpful "
+            "general assistant after the RAG search has run; use retrieved knowledge when present, and when no source "
+            "matched, make clear that the answer is general knowledge rather than an indexed source. Do not invent "
+            "current facts, private facts, prices, live market state, or source-backed claims that were not retrieved. "
+            "For trading answers, never call LOSS, TAKE_PROFIT, or HOLD a buy entry. Only call something a BUY when a "
+            "provided tool result explicitly says BUY. If no BUY is active, say no active BUY and mention a watch-only "
+            "spotlight only as observation. Keep answers concise, practical, and clear that this is not financial advice."
         )
 
     def _build_messages(
@@ -204,6 +225,8 @@ class AssistantChatResponseLayer:
                 "Do not mention tools unless an error or cached-data caveat matters.",
                 "Do not invent prices, signals, confidence, or sources.",
                 "For greetings, answer as a normal chat assistant.",
+                "For broad non-market questions, answer naturally from retrieved context or general knowledge.",
+                "If no retrieved source matched a broad question, do not pretend the answer came from RAG.",
             ],
         }
         return [

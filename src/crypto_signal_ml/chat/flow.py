@@ -123,6 +123,50 @@ KNOWLEDGE_REQUEST_KEYWORDS = (
     "explain",
 )
 
+DEFINITION_REQUEST_KEYWORDS = (
+    "what is",
+    "what are",
+    "what's",
+    "whats",
+    "define",
+    "definition of",
+    "meaning of",
+    "explain",
+    "tell me about",
+    "tell me what",
+    "explain what",
+    "how does",
+    "how do",
+    "in simple terms",
+)
+
+ASSET_MARKET_REQUEST_KEYWORDS = (
+    "action",
+    "bearish",
+    "breakout",
+    "bullish",
+    "candle",
+    "candles",
+    "chart",
+    "confidence",
+    "current price",
+    "forecast",
+    "hold",
+    "latest",
+    "live",
+    "momentum",
+    "price",
+    "prediction",
+    "resistance",
+    "setup",
+    "signal",
+    "support",
+    "technical",
+    "trade",
+    "trading",
+    "trend",
+)
+
 MARKET_OVERVIEW_KEYWORDS = (
     "market",
     "overview",
@@ -202,6 +246,78 @@ GOODBYE_KEYWORDS = (
     "goodbye",
     "see you",
 )
+
+COMMON_ASSET_EXPLANATIONS = {
+    "BTC": (
+        "Bitcoin is a decentralized digital currency and payment network. It lets people transfer value without "
+        "a bank or central operator by recording transactions on a public blockchain."
+        "\n\n"
+        "BTC is the native asset of the Bitcoin network. New BTC is issued through proof-of-work mining, and the "
+        "supply schedule is capped at 21 million coins. People use it as digital money, a settlement network, and "
+        "a scarce store-of-value asset, though its market price can still move sharply."
+    ),
+    "ETH": (
+        "Ethereum is a decentralized blockchain for smart contracts: programs that run on-chain without a central "
+        "operator. ETH is the network's native asset and is used to pay transaction fees, secure the network through "
+        "staking, and interact with apps such as DeFi protocols, NFT markets, and token systems."
+    ),
+    "SOL": (
+        "Solana is a high-throughput smart-contract blockchain designed for fast, low-cost transactions. SOL is the "
+        "network's native asset, used for fees, staking, and on-chain apps such as DeFi, payments, NFTs, and trading "
+        "infrastructure."
+    ),
+    "XRP": (
+        "XRP is the native asset of the XRP Ledger, a blockchain focused on fast settlement and payments. It is often "
+        "discussed in the context of cross-border transfers, exchange liquidity, and payment infrastructure."
+    ),
+    "DOGE": (
+        "Dogecoin is a cryptocurrency that started as a meme coin and later developed a large retail community. DOGE "
+        "runs on its own proof-of-work blockchain and is mostly used for speculation, tipping, and low-cost transfers."
+    ),
+    "ADA": (
+        "Cardano is a proof-of-stake smart-contract blockchain. ADA is its native asset, used for fees, staking, and "
+        "governance within the Cardano ecosystem."
+    ),
+    "LINK": (
+        "Chainlink is a decentralized oracle network that brings external data, prices, and cross-chain messages into "
+        "blockchain applications. LINK is the token used around the network's oracle services and incentives."
+    ),
+    "LTC": (
+        "Litecoin is an early Bitcoin-derived cryptocurrency designed for faster block times and simple peer-to-peer "
+        "payments. LTC is its native asset."
+    ),
+    "AVAX": (
+        "Avalanche is a smart-contract blockchain platform built for fast settlement and customizable networks. AVAX "
+        "is used for transaction fees, staking, and securing the Avalanche ecosystem."
+    ),
+    "BNB": (
+        "BNB is the native asset associated with the BNB Chain ecosystem and Binance-related utility. It is used for "
+        "fees, staking or validation flows, and applications across that ecosystem."
+    ),
+}
+
+COMMON_TOPIC_EXPLANATIONS = {
+    "blockchain": (
+        "A blockchain is a shared database that stores transactions in ordered blocks. Each block links to earlier "
+        "blocks, so changing old records is difficult without network agreement. Public blockchains use consensus "
+        "rules so many independent computers can agree on the same history."
+    ),
+    "cryptocurrency": (
+        "A cryptocurrency is a digital asset tracked by cryptographic rules on a blockchain or similar ledger. Some "
+        "cryptocurrencies are used for payments, some power smart-contract networks, and many trade mainly as risk "
+        "assets."
+    ),
+    "stablecoin": (
+        "A stablecoin is a crypto token designed to track another asset, usually the US dollar. It can be backed by "
+        "cash-like reserves, crypto collateral, or algorithmic mechanisms, so the risk depends heavily on the issuer "
+        "and design."
+    ),
+    "market cap": (
+        "Market cap is the token price multiplied by circulating supply. It is a quick size estimate for a crypto "
+        "asset, but it does not show liquidity, trading depth, token unlocks, or whether that value can actually be "
+        "sold without moving the market."
+    ),
+}
 
 
 class SessionStoreProtocol(Protocol):
@@ -380,20 +496,21 @@ class AssistantIntentRouter:
         )
 
         planned_calls: list[PlannedToolCall] = []
-        for product_id in resolved_product_ids[: self.max_direct_signals]:
-            planned_calls.append(
-                PlannedToolCall(
-                    name="get_signal",
-                    arguments={
-                        "product_id": product_id,
-                        "force_refresh": bool(resolved_force_refresh),
-                    },
-                    reason=(
-                        f"The question names {product_id}, so the assistant should fetch the authoritative "
-                        "single-asset signal first."
+        if any(intent in intents for intent in ("single_asset_signal", "multi_asset_signal")):
+            for product_id in resolved_product_ids[: self.max_direct_signals]:
+                planned_calls.append(
+                    PlannedToolCall(
+                        name="get_signal",
+                        arguments={
+                            "product_id": product_id,
+                            "force_refresh": bool(resolved_force_refresh),
+                        },
+                        reason=(
+                            f"The question names {product_id} in a market or trading context, so the assistant "
+                            "should fetch the authoritative single-asset signal first."
+                        ),
                     ),
                 )
-            )
 
         if "market_overview" in intents and (not resolved_product_ids or "market" in lowered_question):
             planned_calls.append(
@@ -440,7 +557,7 @@ class AssistantIntentRouter:
                     },
                     reason=(
                         "The question asks for supporting context, sources, explanatory background, "
-                        "or off-topic knowledge outside the trading tools."
+                        "or broader knowledge outside the trading tools."
                     ),
                 )
             )
@@ -486,10 +603,23 @@ class AssistantIntentRouter:
         asks_for_market_overview = self._contains_any_keyword(lowered_question, MARKET_OVERVIEW_KEYWORDS)
         asks_for_comparison = self._contains_any_keyword(lowered_question, COMPARISON_KEYWORDS)
         asks_for_advice = self._contains_any_keyword(lowered_question, ADVISORY_KEYWORDS)
+        asks_for_definition = self._is_definition_request(lowered_question)
+        asks_for_asset_market_context = self._asks_for_asset_market_context(lowered_question)
         is_conversation = self._is_conversational_turn(lowered_question)
 
-        if resolved_product_ids:
+        if resolved_product_ids and (not asks_for_definition or asks_for_asset_market_context):
             intents.append("multi_asset_signal" if len(resolved_product_ids) > 1 else "single_asset_signal")
+        if resolved_product_ids and asks_for_definition and not asks_for_asset_market_context:
+            intents.append("general_knowledge")
+        if (
+            not resolved_product_ids
+            and asks_for_definition
+            and not asks_for_asset_market_context
+            and not asks_for_model_status
+            and not asks_for_trader_plan
+            and not asks_for_market_overview
+        ):
+            intents.append("general_knowledge")
         if (
             asks_for_market_overview
             or (asks_for_advice and not resolved_product_ids and not asks_for_research)
@@ -506,12 +636,16 @@ class AssistantIntentRouter:
         if asks_for_comparison and "market_overview" not in intents and len(resolved_product_ids) >= 2:
             intents.append("market_overview")
 
+        has_asset_signal_intent = any(
+            intent in {"single_asset_signal", "multi_asset_signal"}
+            for intent in intents
+        )
         material_intents = [
             intent
             for intent in intents
             if intent not in {"single_asset_signal", "multi_asset_signal"}
         ]
-        if len(material_intents) + int(bool(resolved_product_ids)) > 1:
+        if len(material_intents) + int(has_asset_signal_intent) > 1:
             intents.append("mixed_request")
 
         return tuple(self._stable_unique(intents))
@@ -525,6 +659,21 @@ class AssistantIntentRouter:
 
         if not resolved_product_ids and AssistantIntentRouter._is_conversational_turn(lowered_question):
             return "conversation"
+        asks_for_tool_context = any(
+            keyword in lowered_question
+            for keyword in (
+                *MODEL_REQUEST_KEYWORDS,
+                *TRADER_REQUEST_KEYWORDS,
+                *MARKET_OVERVIEW_KEYWORDS,
+                *ADVISORY_KEYWORDS,
+            )
+        )
+        if (
+            AssistantIntentRouter._is_definition_request(lowered_question)
+            and not AssistantIntentRouter._asks_for_asset_market_context(lowered_question)
+            and not asks_for_tool_context
+        ):
+            return "general"
         if len(resolved_product_ids) >= 2 and any(keyword in lowered_question for keyword in COMPARISON_KEYWORDS):
             return "compare"
         if any(keyword in lowered_question for keyword in KNOWLEDGE_REQUEST_KEYWORDS):
@@ -538,6 +687,48 @@ class AssistantIntentRouter:
     @staticmethod
     def _contains_any_keyword(text: str, keywords: Sequence[str]) -> bool:
         return any(keyword in text for keyword in keywords)
+
+    @staticmethod
+    def _is_definition_request(lowered_question: str) -> bool:
+        """Return whether the user is asking what something is, not for a trade read."""
+
+        normalized_question = re.sub(r"[^a-z0-9\s']", " ", str(lowered_question).lower())
+        normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
+        if not normalized_question:
+            return False
+
+        if any(keyword in normalized_question for keyword in DEFINITION_REQUEST_KEYWORDS):
+            return True
+        if re.search(r"\bwhat\s+(?:exactly\s+)?(?:is|are)\b", normalized_question):
+            return True
+        if re.search(r"\bwhat\b.{1,80}\b(?:is|are)\b", normalized_question):
+            return True
+        if re.search(r"\bwhat\s+does\b.+\bmean\b", normalized_question):
+            return True
+        return False
+
+    @staticmethod
+    def _asks_for_asset_market_context(lowered_question: str) -> bool:
+        """Return whether an asset mention needs market tools rather than a basic explainer."""
+
+        normalized_question = re.sub(r"[^a-z0-9\s\-/]", " ", str(lowered_question).lower())
+        normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
+        if not normalized_question:
+            return False
+        if AssistantIntentRouter._is_definition_request(normalized_question) and any(
+            term in normalized_question
+            for term in ("market cap", "market capitalization")
+        ):
+            return False
+
+        market_keywords = (
+            *ASSET_MARKET_REQUEST_KEYWORDS,
+            *ADVISORY_KEYWORDS,
+            *TRADER_REQUEST_KEYWORDS,
+            *MARKET_OVERVIEW_KEYWORDS,
+            *FORCE_REFRESH_KEYWORDS,
+        )
+        return any(keyword in normalized_question for keyword in market_keywords)
 
     @staticmethod
     def _is_conversational_turn(lowered_question: str) -> bool:
@@ -843,6 +1034,7 @@ class AssistantResponseComposer:
                     question=question,
                     retrieval_result=retrieval_results[0] if retrieval_results else None,
                     recalled_messages=recalled_messages,
+                    route_plan=route_plan,
                 )
             )
 
@@ -974,30 +1166,43 @@ class AssistantResponseComposer:
         question: str,
         retrieval_result: dict[str, Any] | None,
         recalled_messages: Sequence[dict[str, Any]],
+        route_plan: AssistantRoutePlan,
     ) -> list[str]:
-        """Compose an off-topic answer from RAG context when available."""
+        """Compose a general answer from built-in explainers and RAG context when available."""
 
+        builtin_answer = self._compose_builtin_general_answer(
+            question=question,
+            route_plan=route_plan,
+        )
         if retrieval_result is None:
+            if builtin_answer:
+                return [builtin_answer]
             return [
-                "I can handle off-topic questions through the RAG knowledge store, but retrieval is not available for this turn."
+                "I can answer broader questions through the RAG knowledge store, but retrieval is not available for this turn."
             ]
 
         status = str(retrieval_result.get("status") or "")
         if status == "disabled":
+            if builtin_answer:
+                return [builtin_answer]
             return [
-                "I can handle off-topic questions when RAG is enabled, but the knowledge store is disabled in this runtime."
+                "I can answer broader questions when RAG is enabled, but the knowledge store is disabled in this runtime."
             ]
         if status == "error":
+            if builtin_answer:
+                return [builtin_answer, f"I could not search the knowledge store: {retrieval_result.get('error')}"]
             return [f"I could not search the knowledge store: {retrieval_result.get('error')}"]
 
         results = list(retrieval_result.get("results", []))
         if not results:
+            if builtin_answer:
+                return [builtin_answer]
             memory_note = ""
             if recalled_messages:
                 memory_note = " I checked this chat's recent context too, but it did not contain enough matching detail."
             return [
                 (
-                    "I do not have enough indexed knowledge to answer that off-topic question yet."
+                    "I do not have enough indexed knowledge to answer that broader question yet."
                     f"{memory_note} Add a URL, file, or text note to the RAG store, then ask again."
                 )
             ]
@@ -1015,14 +1220,45 @@ class AssistantResponseComposer:
                 answer_lines.append(f"{source_label}: {snippet}")
 
         if not answer_lines:
+            if builtin_answer:
+                return [builtin_answer]
             return [
                 "I found matching knowledge records, but they did not contain enough readable text to answer clearly."
             ]
 
         normalized_question = self._trim_text(str(question), max_length=160)
-        return [
-            f"Based on the indexed knowledge base for `{normalized_question}`: " + " ".join(answer_lines)
-        ]
+        knowledge_answer = f"Indexed knowledge for `{normalized_question}`: " + " ".join(answer_lines)
+        if builtin_answer:
+            return [builtin_answer, knowledge_answer]
+        return [f"Based on the indexed knowledge base for `{normalized_question}`: " + " ".join(answer_lines)]
+
+    def _compose_builtin_general_answer(
+        self,
+        *,
+        question: str,
+        route_plan: AssistantRoutePlan,
+    ) -> str:
+        """Return local explainers for common crypto basics without requiring RAG."""
+
+        normalized_question = re.sub(r"[^a-z0-9\s\-]", " ", str(question).lower())
+        normalized_question = re.sub(r"\s+", " ", normalized_question).strip()
+        product_id = str(route_plan.primary_product_id or "").upper()
+        if product_id and "-" in product_id:
+            base_symbol, quote_symbol = product_id.split("-", 1)
+            explanation = COMMON_ASSET_EXPLANATIONS.get(base_symbol)
+            if explanation:
+                return explanation
+            return (
+                f"{base_symbol} is the base asset in the {product_id} crypto market pair, quoted against "
+                f"{quote_symbol}. I do not have a built-in project explainer for {base_symbol} yet, but I can still "
+                "check its current Lunatrix signal if you ask for the live read."
+            )
+
+        for topic, explanation in COMMON_TOPIC_EXPLANATIONS.items():
+            if re.search(rf"\b{re.escape(topic)}\b", normalized_question):
+                return explanation
+
+        return ""
 
     def _compose_opening_paragraphs(
         self,
