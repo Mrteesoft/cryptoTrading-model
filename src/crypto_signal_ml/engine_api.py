@@ -1162,17 +1162,21 @@ def create_app(
         product_id: str | None = Query(default=None),
         force_refresh: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """Return the latest live market snapshot from the realtime signal engine."""
+        """Return the stable published market overview for public live reads."""
 
-        try:
-            return live_signal_engine.get_live_snapshot(
-                force_refresh=force_refresh,
-                product_id=product_id,
+        state = published_signal_view.load_tool_signal_state(
+            force_refresh=False,
+            product_id=product_id,
+        )
+        if state.get("status") != "ok":
+            raise HTTPException(
+                status_code=404,
+                detail=str(state.get("error") or "No published signal state is available yet."),
             )
-        except FileNotFoundError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except Exception as error:
-            raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+
+        overview = dict(state.get("overview") or {})
+        overview["source"] = state.get("source") or "published"
+        return overview
 
     @app.get("/api/live/signals")
     def live_signal_list(
@@ -1180,23 +1184,12 @@ def create_app(
         limit: Optional[int] = Query(default=50, ge=1, le=500),
         force_refresh: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """Return filtered live signals from the realtime signal engine."""
+        """Return the stable published signal set for public live reads."""
 
-        try:
-            signal_rows = live_signal_engine.list_signals(
-                action=action,
-                limit=limit,
-                force_refresh=force_refresh,
-            )
-            return {
-                "action": action,
-                "count": len(signal_rows),
-                "signals": signal_rows,
-            }
-        except FileNotFoundError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except Exception as error:
-            raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+        return published_signal_view.build_current_signals_response(
+            action=action,
+            limit=limit or 50,
+        )
 
     @app.post("/api/live/signals/generate")
     def generate_live_signal(request: SignalPipelineRequest) -> dict[str, Any]:
@@ -1266,20 +1259,16 @@ def create_app(
         product_id: str,
         force_refresh: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """Return one live signal row by product id."""
+        """Return one stable published signal row by product id."""
 
-        try:
-            signal_summary = live_signal_engine.get_signal_by_product(
-                product_id=product_id,
-                force_refresh=force_refresh,
-            )
-        except FileNotFoundError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except Exception as error:
-            raise HTTPException(status_code=503, detail=f"Live market refresh failed: {error}") from error
+        state = published_signal_view.load_tool_signal_state(
+            force_refresh=False,
+            product_id=product_id,
+        )
+        signal_summary = state.get("signal") if isinstance(state, dict) else None
 
         if signal_summary is None:
-            raise HTTPException(status_code=404, detail=f"No live signal found for {product_id}.")
+            raise HTTPException(status_code=404, detail=f"No published signal found for {product_id}.")
 
         return signal_summary
 
