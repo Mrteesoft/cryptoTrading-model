@@ -8,7 +8,13 @@ import os
 from typing import Any, Protocol, Sequence
 
 from ..config import TrainingConfig
-from ..llm import ChatModelAdapter, LlmMessage, LunatrixChatModelAdapter, OpenAIChatModelAdapter
+from ..llm import (
+    ChatModelAdapter,
+    LlmMessage,
+    LunatrixChatModelAdapter,
+    OllamaChatModelAdapter,
+    OpenAIChatModelAdapter,
+)
 
 
 class DeterministicComposerProtocol(Protocol):
@@ -156,6 +162,11 @@ class AssistantChatResponseLayer:
         provider_name = self._configured_provider_name()
         if provider_name in {"lunatrix", "local", "internal"}:
             return LunatrixChatModelAdapter(model=self._configured_model_name())
+        if provider_name == "ollama":
+            return OllamaChatModelAdapter(
+                model=self._configured_model_name(),
+                base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+            )
         if provider_name == "openai":
             api_key_env_var = str(
                 getattr(self.config, "openai_api_key_env_var", "OPENAI_API_KEY")
@@ -182,6 +193,10 @@ class AssistantChatResponseLayer:
                 return openai_model
             configured_name = str(getattr(self.config, "assistant_response_model", "") or "").strip()
             return "" if configured_name.startswith("lunatrix-") else configured_name
+        if self._configured_provider_name() == "ollama":
+            return os.getenv("OLLAMA_MODEL", "").strip() or str(
+                getattr(self.config, "assistant_response_model", "") or ""
+            ).strip() or "qwen2.5:3b-instruct"
 
         configured_name = str(getattr(self.config, "assistant_response_model", "") or "").strip()
         return configured_name or "lunatrix-grounded-chat-v1"

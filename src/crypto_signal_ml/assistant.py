@@ -311,22 +311,12 @@ class TradingAssistantService:
         )
 
     def create_session(self, title: str | None = None) -> Dict[str, Any]:
-        """Create a session and seed it with a welcome message."""
+        """Create a chat session without injecting canned assistant text."""
 
         session = self.session_store.create_session(title=title or self.config.assistant_system_name)
-        welcome_message = self.session_store.add_message(
-            session_id=session["sessionId"],
-            role="assistant",
-            content=(
-                f"{self.config.assistant_system_name} is ready. Ask about a coin, the live market overview, "
-                "what the model is seeing in the latest candle data, or add external sources to the knowledge base "
-                "for deeper retrieval."
-            ),
-            metadata={"type": "welcome"},
-        )
         return {
             "session": self.session_store.get_session(session["sessionId"]),
-            "messages": [welcome_message],
+            "messages": [],
         }
 
     def get_session_state(self, session_id: str) -> Dict[str, Any]:
