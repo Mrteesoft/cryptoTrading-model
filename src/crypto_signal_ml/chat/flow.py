@@ -228,6 +228,15 @@ GREETING_KEYWORDS = (
     "good afternoon",
     "good evening",
 )
+CASUAL_CHAT_KEYWORDS = (
+    "how are you",
+    "how are u",
+    "how you doing",
+    "how are things",
+    "whats up",
+    "what's up",
+    "sup",
+)
 HELP_REQUEST_KEYWORDS = (
     "help",
     "what can you do",
@@ -767,6 +776,8 @@ class AssistantIntentRouter:
             return True
         if any(keyword in normalized_question for keyword in GOODBYE_KEYWORDS) and not market_like:
             return True
+        if any(keyword in normalized_question for keyword in CASUAL_CHAT_KEYWORDS) and not market_like:
+            return True
 
         words = normalized_question.split()
         if not words:
@@ -1138,6 +1149,9 @@ class AssistantResponseComposer:
 
         if any(keyword in lowered_question for keyword in GOODBYE_KEYWORDS):
             return "See you. I will keep the chat ready for the next market check."
+
+        if any(keyword in lowered_question for keyword in CASUAL_CHAT_KEYWORDS):
+            return "I am good and ready to help. What would you like to look at?"
 
         if any(keyword in lowered_question for keyword in HELP_REQUEST_KEYWORDS):
             return (

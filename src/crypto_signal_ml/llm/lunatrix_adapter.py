@@ -100,6 +100,8 @@ class LunatrixChatModelAdapter(ChatModelAdapter):
             return "You are welcome. I am here for coin checks, market reads, model status, and knowledge-base questions."
         if any(keyword in normalized for keyword in ("bye", "goodbye", "see you")):
             return "Got it. I will be here when you want another market or model read."
+        if any(keyword in normalized for keyword in ("how are you", "how are u", "how you doing", "how are things", "what s up", "whats up", "sup")):
+            return "I am good and ready to help. What would you like to look at?"
         if any(keyword in normalized for keyword in ("help", "what can you do", "commands", "how do i use")):
             return (
                 "I can check a coin signal, compare coins, summarize the live market, explain model freshness, "
